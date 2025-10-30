@@ -2,6 +2,7 @@ package kafkax
 
 import "time"
 
+// brokers configuration
 type Config struct {
 	Brokers          []string      `env:"KAFKAX_BROKERS" env-separator:"," env-required:"true"`
 	ClientID         string        `env:"KAFKAX_CLIENT_ID" env-required:"true"`
