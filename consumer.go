@@ -180,7 +180,7 @@ func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 	c.workersMu.Lock()
 	defer c.workersMu.Unlock()
 
-	log := c.logger.With("Failed to enqueue message",
+	log := c.logger.With(
 		slog.Int("partition", int(partition)),
 		slog.String("topic", topic))
 
