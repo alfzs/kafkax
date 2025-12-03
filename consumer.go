@@ -180,6 +180,10 @@ func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 	c.workersMu.Lock()
 	defer c.workersMu.Unlock()
 
+	log := c.logger.With("Failed to enqueue message",
+		slog.Int("partition", int(partition)),
+		slog.String("topic", topic))
+
 	worker, ok := c.workers[partition]
 	if !ok {
 		workerCtx, cancel := context.WithCancel(c.ctx)
@@ -194,22 +198,16 @@ func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 		c.wg.Add(1)
 		go c.runPartitionWorker(partition, worker)
 
-		c.logger.Info("Created new partition worker",
-			slog.Int("partition", int(partition)),
-			slog.String("topic", topic))
+		log.Info("Created new partition worker")
 	}
 
 	select {
 	case worker.messageChan <- msg:
 		worker.updateActivity()
 	case <-time.After(c.maxEnqueueTimeout):
-		c.logger.Warn("Failed to enqueue message",
-			slog.Int("partition", int(partition)),
-			slog.String("topic", topic))
+		log.Warn("Failed to enqueue message")
 	case <-worker.ctx.Done():
-		c.logger.Warn("Worker context done while enqueueing",
-			slog.Int("partition", int(partition)),
-			slog.String("topic", topic))
+		log.Warn("Worker context done while enqueueing")
 	}
 }
 
