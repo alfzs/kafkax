@@ -208,7 +208,8 @@ func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 			slog.String("topic", topic))
 	case <-worker.ctx.Done():
 		c.logger.Warn("Worker context done while enqueueing",
-			slog.Int("partition", int(partition)))
+			slog.Int("partition", int(partition)),
+			slog.String("topic", topic))
 	}
 }
 
