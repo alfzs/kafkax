@@ -13,6 +13,10 @@ import (
 	"github.com/confluentinc/confluent-kafka-go/kafka"
 )
 
+type consumerHandler interface {
+	ProcessMessage(ctx context.Context, data []byte) error
+}
+
 type partitionWorker struct {
 	messageChan  chan *kafka.Message
 	ctx          context.Context
@@ -21,8 +25,9 @@ type partitionWorker struct {
 	mu           sync.Mutex
 }
 
-type consumerHandler interface {
-	ProcessMessage(ctx context.Context, data []byte) error
+type workerKey struct {
+	topic     string
+	partition int32
 }
 
 type KafkaConsumer struct {
@@ -31,7 +36,7 @@ type KafkaConsumer struct {
 	logger                *slog.Logger
 	handlers              map[string]consumerHandler
 	handlersMu            sync.RWMutex
-	workers               map[int32]*partitionWorker
+	workers               map[workerKey]*partitionWorker
 	workersMu             sync.RWMutex
 	wg                    sync.WaitGroup
 	ctx                   context.Context
@@ -86,7 +91,7 @@ func NewKafkaConsumer(config Config, logger *slog.Logger) (*KafkaConsumer, error
 		config:                config,
 		logger:                logger.With(slog.String("component", "kafka_consumer")),
 		handlers:              make(map[string]consumerHandler),
-		workers:               make(map[int32]*partitionWorker),
+		workers:               make(map[workerKey]*partitionWorker),
 		inactiveWorkerTTL:     config.Consumer.InactiveWorkerTTL,
 		cleanupWorkerInterval: config.Consumer.CleanupWorkerInterval,
 		messageReadTimeout:    config.Consumer.ReadTimeout,
@@ -184,7 +189,11 @@ func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 		slog.Int("partition", int(partition)),
 		slog.String("topic", topic))
 
-	worker, ok := c.workers[partition]
+	key := workerKey{
+		topic:     topic,
+		partition: partition,
+	}
+	worker, ok := c.workers[key]
 	if !ok {
 		workerCtx, cancel := context.WithCancel(c.ctx)
 		worker = &partitionWorker{
@@ -193,7 +202,7 @@ func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 			cancel:       cancel,
 			lastActivity: time.Now(),
 		}
-		c.workers[partition] = worker
+		c.workers[key] = worker
 
 		c.wg.Add(1)
 		go c.runPartitionWorker(partition, worker)
@@ -288,13 +297,13 @@ func (c *KafkaConsumer) cleanupInactiveWorkers() {
 	now := time.Now()
 	inactiveSince := now.Add(-c.inactiveWorkerTTL)
 
-	for partition, worker := range c.workers {
+	for key, worker := range c.workers {
 		lastActive := worker.getLastActivity()
 		if lastActive.Before(inactiveSince) {
 			worker.cancel()
-			delete(c.workers, partition)
+			delete(c.workers, key)
 			c.logger.Info("Removed inactive worker",
-				slog.Int("partition", int(partition)),
+				slog.Int("partition", int(key.partition)),
 				slog.Time("last_active", lastActive))
 		}
 	}
