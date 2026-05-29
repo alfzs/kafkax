@@ -2,6 +2,7 @@ package kafkax
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -19,7 +20,7 @@ type tenantWorker struct {
 	messageChan  chan Message
 	ctx          context.Context
 	cancel       context.CancelFunc
-	lastActivity time.Time // Время последнего использования
+	lastActivity time.Time
 	mu           sync.Mutex
 }
 
@@ -50,7 +51,6 @@ type KafkaProducer struct {
 	messageChanBuffer     int
 }
 
-// INFO: NewKafkaProducer клиент для работы с Кафка
 func NewKafkaProducer(ctx context.Context, config Config, logger *slog.Logger) (*KafkaProducer, error) {
 	const op = "new_kafka_producer"
 
@@ -110,8 +110,6 @@ func NewKafkaProducer(ctx context.Context, config Config, logger *slog.Logger) (
 }
 
 func (p *KafkaProducer) SendMessage(ctx context.Context, tenantID uuid.UUID, topic string, key, value []byte) error {
-	op := "send_message"
-
 	traceID := tracing.GetTraceID(ctx)
 	log := p.logger.With(
 		slog.String("trace_id", traceID),
@@ -131,7 +129,7 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, tenantID uuid.UUID, top
 
 	worker, err := p.getOrCreateWorker(tenantID, log)
 	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
+		return err
 	}
 
 	worker.updateActivity()
@@ -140,34 +138,33 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, tenantID uuid.UUID, top
 	case worker.messageChan <- msg:
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("%s: context canceled", op)
+			return errors.New("context canceled")
 		case err := <-resultChan:
 			return err
 		case <-time.After(p.messageTimeout):
-			return fmt.Errorf("%s: result wait timeout", op)
+			return errors.New("result wait timeout")
 		}
 	case <-ctx.Done():
-		return fmt.Errorf("%s: context canceled while queuing", op)
+		return errors.New("context canceled while queuing")
 	case <-time.After(p.messageTimeout):
-		return fmt.Errorf("%s: enqueue timeout", op)
+		return errors.New("enqueue timeout")
 	}
 }
 
 func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logger) (*tenantWorker, error) {
-	op := "get_or_create_worker"
-
+	// fast path
 	p.workerLock.RLock()
 	worker, ok := p.tenantPools[tenantID]
 	p.workerLock.RUnlock()
-
 	if ok {
 		return worker, nil
 	}
 
+	// slow path — double-checked locking
 	p.workerLock.Lock()
 	defer p.workerLock.Unlock()
 
-	if worker, ok := p.tenantPools[tenantID]; ok {
+	if worker, ok = p.tenantPools[tenantID]; ok {
 		return worker, nil
 	}
 
@@ -183,22 +180,22 @@ func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logge
 	p.wg.Add(1)
 	go p.runWorker(tenantID, worker, logger)
 
-	logger.Info("Created new worker for tenant", slog.String("op", op))
+	logger.Info("Created new worker for tenant")
 	return worker, nil
 }
 
+// runWorker обрабатывает исходящие сообщения для конкретного тенанта.
+//
+// Воркер намеренно НЕ удаляет себя из tenantPools при завершении.
+// Удалением занимается только cleanupInactiveWorkers (по TTL) и Close (при shutdown).
+// Это предотвращает race condition, когда cleanup уже удалил воркер из мапы,
+// а горутина воркера при своём defer снова лезет в мапу и случайно удаляет
+// только что созданный новый воркер для того же tenantID.
 func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker, logger *slog.Logger) {
-	op := "run_worker"
-
 	defer func() {
 		worker.cancel()
-		p.workerLock.Lock()
-		delete(p.tenantPools, tenantID)
-		p.workerLock.Unlock()
 		p.wg.Done()
-		logger.Debug("Worker terminated",
-			slog.String("tenant", tenantID.String()),
-			slog.String("op", op))
+		logger.Debug("Worker terminated", slog.String("tenant", tenantID.String()))
 	}()
 
 	for {
@@ -211,12 +208,10 @@ func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker, logg
 			case msg.Result <- err:
 			case <-msg.Ctx.Done():
 				logger.Warn("Message result not delivered - context canceled",
-					slog.String("topic", msg.Topic),
-					slog.String("op", op))
+					slog.String("topic", msg.Topic))
 			case <-time.After(msg.Timeout):
 				logger.Warn("Message result not delivered - timeout",
-					slog.String("topic", msg.Topic),
-					slog.String("op", op))
+					slog.String("topic", msg.Topic))
 			}
 
 		case <-worker.ctx.Done():
@@ -225,11 +220,15 @@ func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker, logg
 	}
 }
 
+// produce отправляет сообщение в Kafka и ожидает подтверждения доставки.
+//
+// deliveryChan намеренно не закрывается: confluent-kafka-go пишет в него
+// асинхронно из внутреннего event loop'а. Закрытие канала до получения события
+// вызвало бы панику в библиотеке при попытке записи в закрытый канал.
+// Канал буферизован на 1 элемент, поэтому утечки горутин нет — библиотека
+// запишет событие и продолжит работу независимо от того, читаем ли мы его.
 func (p *KafkaProducer) produce(msg Message, logger *slog.Logger) error {
-	op := "produce"
-
 	deliveryChan := make(chan kafka.Event, 1)
-	defer close(deliveryChan)
 
 	err := p.producer.Produce(&kafka.Message{
 		TopicPartition: kafka.TopicPartition{
@@ -241,28 +240,27 @@ func (p *KafkaProducer) produce(msg Message, logger *slog.Logger) error {
 	}, deliveryChan)
 
 	if err != nil {
-		return fmt.Errorf("%s: produce error: %w", op, err)
+		return fmt.Errorf("produce error: %w", err)
 	}
 
 	select {
 	case e := <-deliveryChan:
 		m, ok := e.(*kafka.Message)
 		if !ok {
-			return fmt.Errorf("%s: unexpected event type %T", op, e)
+			return fmt.Errorf("unexpected event type %T", e)
 		}
 		if m.TopicPartition.Error != nil {
-			return fmt.Errorf("%s: delivery error: %w", op, m.TopicPartition.Error)
+			return fmt.Errorf("delivery error: %w", m.TopicPartition.Error)
 		}
 		logger.Debug("Message delivered successfully",
 			slog.String("topic", msg.Topic),
 			slog.Int("partition", int(m.TopicPartition.Partition)),
-			slog.Int64("offset", int64(m.TopicPartition.Offset)),
-			slog.String("op", op))
+			slog.Int64("offset", int64(m.TopicPartition.Offset)))
 		return nil
 	case <-msg.Ctx.Done():
 		return msg.Ctx.Err()
 	case <-time.After(msg.Timeout):
-		return fmt.Errorf("%s: produce timeout after %v", op, msg.Timeout)
+		return fmt.Errorf("produce timeout after %v", msg.Timeout)
 	}
 }
 
@@ -282,9 +280,9 @@ func (p *KafkaProducer) manageWorkers() {
 	}
 }
 
+// cleanupInactiveWorkers — единственное место, где воркеры удаляются из tenantPools.
+// Воркеры не удаляют себя сами (см. комментарий в runWorker).
 func (p *KafkaProducer) cleanupInactiveWorkers() {
-	op := "cleanup_inactive_workers"
-
 	p.workerLock.Lock()
 	defer p.workerLock.Unlock()
 
@@ -298,21 +296,18 @@ func (p *KafkaProducer) cleanupInactiveWorkers() {
 			delete(p.tenantPools, tenantID)
 			p.logger.Info("Removed inactive worker",
 				slog.String("tenant", tenantID.String()),
-				slog.Time("last_active", lastActive),
-				slog.String("op", op))
+				slog.Time("last_active", lastActive))
 		}
 	}
 }
 
 func (p *KafkaProducer) Close() {
-	op := "close"
-
 	if !p.stopping.CompareAndSwap(false, true) {
-		p.logger.Info("Kafka producer already in stopping state", slog.String("op", op))
+		p.logger.Info("Kafka producer already in stopping state")
 		return
 	}
 
-	p.logger.Info("Starting kafka producer shutdown", slog.String("op", op))
+	p.logger.Info("Starting kafka producer shutdown")
 
 	p.cancel()
 
@@ -324,20 +319,19 @@ func (p *KafkaProducer) Close() {
 
 	select {
 	case <-done:
-		p.logger.Info("All workers finished", slog.String("op", op))
+		p.logger.Info("All workers finished")
 	case <-time.After(p.flushTimeout):
-		p.logger.Warn("Shutdown timed out", slog.String("op", op))
+		p.logger.Warn("Shutdown timed out, forcing flush")
 	}
 
 	remaining := p.producer.Flush(int(p.flushTimeout.Milliseconds()))
 	if remaining > 0 {
 		p.logger.Warn("Messages remaining in queue after flush",
-			slog.Int("count", remaining),
-			slog.String("op", op))
+			slog.Int("count", remaining))
 	}
 
 	p.producer.Close()
-	p.logger.Info("Kafka producer shutdown completed", slog.String("op", op))
+	p.logger.Info("Kafka producer shutdown completed")
 }
 
 func (w *tenantWorker) updateActivity() {

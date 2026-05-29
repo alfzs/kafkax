@@ -50,7 +50,6 @@ type KafkaConsumer struct {
 	stopCleanup           chan struct{}
 }
 
-// INFO: NewKafkaConsumer клиент для работы с Кафка
 func NewKafkaConsumer(config Config, logger *slog.Logger) (*KafkaConsumer, error) {
 	op := "new_kafka_consumer"
 
@@ -114,8 +113,8 @@ func (c *KafkaConsumer) AddHandler(topic string, handler consumerHandler) error 
 }
 
 func (c *KafkaConsumer) SubscribeAll() error {
-	c.handlersMu.Lock()
-	defer c.handlersMu.Unlock()
+	c.handlersMu.RLock()
+	defer c.handlersMu.RUnlock()
 
 	topics := make([]string, 0, len(c.handlers))
 	for t := range c.handlers {
@@ -133,11 +132,12 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 	c.ctx, c.cancel = context.WithCancel(ctx)
 
 	c.handlersMu.RLock()
-	if len(c.handlers) == 0 {
-		c.handlersMu.RUnlock()
+	noHandlers := len(c.handlers) == 0
+	c.handlersMu.RUnlock()
+
+	if noHandlers {
 		return fmt.Errorf("no kafka handlers registered")
 	}
-	c.handlersMu.RUnlock()
 
 	c.wg.Add(1)
 	go c.runConsumerLoop()
@@ -178,58 +178,94 @@ func (c *KafkaConsumer) runConsumerLoop() {
 	}
 }
 
+// processMessage находит или создаёт воркер для партиции и передаёт сообщение.
+// Лок берётся только на время поиска/создания воркера, а не на время записи в канал.
+// Это предотвращает блокировку consumer loop'а под локом на время maxEnqueueTimeout.
 func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 	partition := msg.TopicPartition.Partition
 	topic := *msg.TopicPartition.Topic
-
-	c.workersMu.Lock()
-	defer c.workersMu.Unlock()
 
 	log := c.logger.With(
 		slog.Int("partition", int(partition)),
 		slog.String("topic", topic))
 
-	key := workerKey{
-		topic:     topic,
-		partition: partition,
-	}
-	worker, ok := c.workers[key]
-	if !ok {
-		workerCtx, cancel := context.WithCancel(c.ctx)
-		worker = &partitionWorker{
-			messageChan:  make(chan *kafka.Message, c.messageChanBuffer),
-			ctx:          workerCtx,
-			cancel:       cancel,
-			lastActivity: time.Now(),
-		}
-		c.workers[key] = worker
-
-		c.wg.Add(1)
-		go c.runPartitionWorker(partition, worker)
-
-		log.Info("Created new partition worker")
-	}
+	worker := c.getOrCreateWorker(topic, partition, log)
 
 	select {
 	case worker.messageChan <- msg:
 		worker.updateActivity()
 	case <-time.After(c.maxEnqueueTimeout):
-		log.Warn("Failed to enqueue message")
+		log.Warn("Failed to enqueue message: worker channel full")
 	case <-worker.ctx.Done():
 		log.Warn("Worker context done while enqueueing")
 	}
 }
 
-func (c *KafkaConsumer) runPartitionWorker(partition int32, worker *partitionWorker) {
+func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *slog.Logger) *partitionWorker {
+	key := workerKey{topic: topic, partition: partition}
+
+	// fast path
+	c.workersMu.RLock()
+	worker, ok := c.workers[key]
+	c.workersMu.RUnlock()
+	if ok {
+		return worker
+	}
+
+	// slow path — double-checked locking
+	c.workersMu.Lock()
+	defer c.workersMu.Unlock()
+
+	if worker, ok = c.workers[key]; ok {
+		return worker
+	}
+
+	workerCtx, cancel := context.WithCancel(c.ctx)
+	worker = &partitionWorker{
+		messageChan:  make(chan *kafka.Message, c.messageChanBuffer),
+		ctx:          workerCtx,
+		cancel:       cancel,
+		lastActivity: time.Now(),
+	}
+	c.workers[key] = worker
+
+	c.wg.Add(1)
+	go c.runPartitionWorker(key, worker)
+
+	log.Info("Created new partition worker")
+	return worker
+}
+
+// runPartitionWorker обрабатывает сообщения для конкретной партиции.
+//
+// При завершении (штатном или по панике) воркер удаляется из мапы немедленно,
+// а не ждёт следующего прохода cleanupInactiveWorkers. Это гарантирует, что
+// после паники новые сообщения получат свежий воркер, а не попытаются писать
+// в мёртвый канал.
+//
+// При штатной остановке (worker.ctx.Done) канал дочитывается до конца (drain),
+// чтобы не терять сообщения, уже поставленные в очередь.
+func (c *KafkaConsumer) runPartitionWorker(key workerKey, worker *partitionWorker) {
+	defer c.wg.Done()
+	defer worker.cancel()
 	defer func() {
-		worker.cancel()
-		c.wg.Done()
 		if r := recover(); r != nil {
 			c.logger.Error("Partition worker panic",
 				slog.Any("recover", r),
 				slog.String("stack", string(debug.Stack())),
-				slog.Int("partition", int(partition)))
+				slog.String("topic", key.topic),
+				slog.Int("partition", int(key.partition)))
 		}
+		// Удаляем воркер из мапы независимо от причины завершения.
+		// Cleanup-loop удаляет только по TTL, поэтому мёртвый воркер мог бы
+		// жить в мапе до следующего тика — здесь закрываем эту дыру.
+		c.workersMu.Lock()
+		// Проверяем, что в мапе именно наш воркер, а не уже новый
+		// (теоретически возможно при очень быстром пересоздании).
+		if current, ok := c.workers[key]; ok && current == worker {
+			delete(c.workers, key)
+		}
+		c.workersMu.Unlock()
 	}()
 
 	for {
@@ -239,14 +275,31 @@ func (c *KafkaConsumer) runPartitionWorker(partition int32, worker *partitionWor
 				return
 			}
 			worker.updateActivity()
-			c.handleMessage(worker, msg)
+			c.handleMessage(worker.ctx, msg)
 		case <-worker.ctx.Done():
-			return
+			// Drain: дочитываем уже поставленные сообщения, чтобы не терять их
+			// при штатной остановке. Новые сообщения после ctx.Done() в канал
+			// не попадут (processMessage проверяет worker.ctx.Done).
+			for {
+				select {
+				case msg, ok := <-worker.messageChan:
+					if !ok {
+						return
+					}
+					// Используем фоновый контекст: worker.ctx уже отменён,
+					// но сообщение уже принято — обрабатываем до конца.
+					c.handleMessage(context.Background(), msg)
+				default:
+					return
+				}
+			}
 		}
 	}
 }
 
-func (c *KafkaConsumer) handleMessage(worker *partitionWorker, msg *kafka.Message) {
+// handleMessage вызывает зарегистрированный handler и коммитит оффсет при успехе.
+// Принимает ctx явно, чтобы при drain-фазе можно было передать незаражённый контекст.
+func (c *KafkaConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
 	topic := *msg.TopicPartition.Topic
 
 	c.handlersMu.RLock()
@@ -258,7 +311,7 @@ func (c *KafkaConsumer) handleMessage(worker *partitionWorker, msg *kafka.Messag
 		return
 	}
 
-	if err := handler.ProcessMessage(worker.ctx, msg.Value); err != nil {
+	if err := handler.ProcessMessage(ctx, msg.Value); err != nil {
 		c.logger.Error("Failed to process message",
 			slog.String("topic", topic),
 			slog.Any("error", err))
@@ -303,6 +356,7 @@ func (c *KafkaConsumer) cleanupInactiveWorkers() {
 			worker.cancel()
 			delete(c.workers, key)
 			c.logger.Info("Removed inactive worker",
+				slog.String("topic", key.topic),
 				slog.Int("partition", int(key.partition)),
 				slog.Time("last_active", lastActive))
 		}
@@ -317,6 +371,9 @@ func (c *KafkaConsumer) Stop() {
 
 	c.logger.Info("Starting kafka consumer shutdown")
 
+	// Сначала останавливаем cleanup, затем отменяем контекст воркеров.
+	// Порядок важен: если сначала cancel(), cleanup-loop может попытаться
+	// удалить воркеры, которые уже завершаются — безвредно, но избыточно.
 	close(c.stopCleanup)
 	c.cancel()
 
@@ -330,9 +387,12 @@ func (c *KafkaConsumer) Stop() {
 	case <-done:
 		c.logger.Info("Kafka consumer fully stopped")
 	case <-time.After(c.config.GracefulTimeout):
-		c.logger.Warn("Shutdown timed out")
+		c.logger.Warn("Shutdown timed out, forcing close")
 	}
 
+	// consumer.Close() вызывается после того, как runConsumerLoop завершил работу
+	// (он завершается по ctx.Done() до этой точки), поэтому ReadMessage уже
+	// не вызывается — закрытие безопасно.
 	if err := c.consumer.Close(); err != nil {
 		c.logger.Error("Failed to close consumer", slog.Any("error", err))
 	}
