@@ -63,7 +63,6 @@ type Consumer struct {
 	IsolationLevel        string        `yaml:"isolation_level"         env-default:"read_committed"`
 	MaxPollInterval       time.Duration `yaml:"max_poll_interval"       env-default:"1m"`
 	ReadTimeout           time.Duration `yaml:"read_timeout"            env-default:"2s"`
-	MaxEnqueueTimeout     time.Duration `yaml:"max_enqueue_timeout"     env-default:"1s"`
 	MessageQueueSize      int           `yaml:"message_queue_size"      env-default:"1000"`
 	InactiveWorkerTTL     time.Duration `yaml:"inactive_worker_ttl"     env-default:"1h"`
 	CleanupWorkerInterval time.Duration `yaml:"cleanup_worker_interval" env-default:"10m"`

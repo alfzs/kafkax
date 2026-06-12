@@ -21,6 +21,7 @@ type tenantWorker struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	lastActivity time.Time
+	inFlight     int64 // atomic: число SendMessage, держащих ссылку на этот воркер
 	mu           sync.Mutex
 }
 
@@ -110,6 +111,10 @@ func NewKafkaProducer(ctx context.Context, config Config, logger *slog.Logger) (
 }
 
 func (p *KafkaProducer) SendMessage(ctx context.Context, tenantID uuid.UUID, topic string, key, value []byte) error {
+	if p.stopping.Load() {
+		return errors.New("producer is shutting down")
+	}
+
 	traceID := tracing.GetTraceID(ctx)
 	log := p.logger.With(
 		slog.String("trace_id", traceID),
@@ -131,6 +136,9 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, tenantID uuid.UUID, top
 	if err != nil {
 		return err
 	}
+	// Держим воркер "занятым" на всё время отправки, чтобы cleanup не мог
+	// отменить и удалить его между получением ссылки и записью в messageChan.
+	defer atomic.AddInt64(&worker.inFlight, -1)
 
 	worker.updateActivity()
 
@@ -155,6 +163,9 @@ func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logge
 	// fast path
 	p.workerLock.RLock()
 	worker, ok := p.tenantPools[tenantID]
+	if ok {
+		atomic.AddInt64(&worker.inFlight, 1)
+	}
 	p.workerLock.RUnlock()
 	if ok {
 		return worker, nil
@@ -164,7 +175,15 @@ func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logge
 	p.workerLock.Lock()
 	defer p.workerLock.Unlock()
 
+	// Проверяем именно здесь, под Lock: Close() тоже берёт workerLock перед
+	// cancel(), поэтому если stopping уже true, wg.Add ниже гарантированно
+	// не выполнится после старта wg.Wait() в Close().
+	if p.stopping.Load() {
+		return nil, errors.New("producer is shutting down")
+	}
+
 	if worker, ok = p.tenantPools[tenantID]; ok {
+		atomic.AddInt64(&worker.inFlight, 1)
 		return worker, nil
 	}
 
@@ -174,6 +193,7 @@ func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logge
 		ctx:          workerCtx,
 		cancel:       cancel,
 		lastActivity: time.Now(),
+		inFlight:     1,
 	}
 
 	p.tenantPools[tenantID] = worker
@@ -202,21 +222,37 @@ func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker, logg
 		select {
 		case msg := <-worker.messageChan:
 			worker.updateActivity()
-			err := p.produce(msg, logger)
-
-			select {
-			case msg.Result <- err:
-			case <-msg.Ctx.Done():
-				logger.Warn("Message result not delivered - context canceled",
-					slog.String("topic", msg.Topic))
-			case <-time.After(msg.Timeout):
-				logger.Warn("Message result not delivered - timeout",
-					slog.String("topic", msg.Topic))
-			}
+			p.handleMessage(msg, logger)
 
 		case <-worker.ctx.Done():
-			return
+			// Drain: на момент отмены контекста в messageChan могут лежать
+			// уже принятые SendMessage сообщения (select там успел выбрать
+			// этот канал раньше, чем worker.ctx.Done()). Не дочитав их,
+			// мы бы тихо потеряли сообщения, по которым вызывающий код
+			// получит "result wait timeout" вместо реальной причины.
+			for {
+				select {
+				case msg := <-worker.messageChan:
+					p.handleMessage(msg, logger)
+				default:
+					return
+				}
+			}
 		}
+	}
+}
+
+func (p *KafkaProducer) handleMessage(msg Message, logger *slog.Logger) {
+	err := p.produce(msg, logger)
+
+	select {
+	case msg.Result <- err:
+	case <-msg.Ctx.Done():
+		logger.Warn("Message result not delivered - context canceled",
+			slog.String("topic", msg.Topic))
+	case <-time.After(msg.Timeout):
+		logger.Warn("Message result not delivered - timeout",
+			slog.String("topic", msg.Topic))
 	}
 }
 
@@ -227,6 +263,11 @@ func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker, logg
 // вызвало бы панику в библиотеке при попытке записи в закрытый канал.
 // Канал буферизован на 1 элемент, поэтому утечки горутин нет — библиотека
 // запишет событие и продолжит работу независимо от того, читаем ли мы его.
+//
+// Если produce() вернёт ошибку по таймауту/контексту, само сообщение могло
+// быть успешно поставлено в очередь librdkafka и доставлено позже — вызывающий
+// код должен считаться с тем, что timeout не гарантирует недоставку
+// (возможны дубликаты при retry на уровне приложения).
 func (p *KafkaProducer) produce(msg Message, logger *slog.Logger) error {
 	deliveryChan := make(chan kafka.Event, 1)
 
@@ -282,6 +323,13 @@ func (p *KafkaProducer) manageWorkers() {
 
 // cleanupInactiveWorkers — единственное место, где воркеры удаляются из tenantPools.
 // Воркеры не удаляют себя сами (см. комментарий в runWorker).
+//
+// Воркер с inFlight > 0 не трогаем независимо от lastActivity: значит, прямо
+// сейчас есть SendMessage, который получил ссылку на этот воркер и либо ещё
+// не записал updateActivity, либо пишет в messageChan. Без этой проверки
+// отмена контекста здесь могла бы гонково увести runWorker в drain/return
+// раньше, чем SendMessage успеет положить сообщение в канал, и сообщение
+// осталось бы непрочитанным.
 func (p *KafkaProducer) cleanupInactiveWorkers() {
 	p.workerLock.Lock()
 	defer p.workerLock.Unlock()
@@ -290,6 +338,10 @@ func (p *KafkaProducer) cleanupInactiveWorkers() {
 	inactiveSince := now.Add(-p.inactiveWorkerTTL)
 
 	for tenantID, worker := range p.tenantPools {
+		if atomic.LoadInt64(&worker.inFlight) > 0 {
+			continue
+		}
+
 		lastActive := worker.getLastActivity()
 		if lastActive.Before(inactiveSince) {
 			worker.cancel()
@@ -309,7 +361,12 @@ func (p *KafkaProducer) Close() {
 
 	p.logger.Info("Starting kafka producer shutdown")
 
+	// cancel() под workerLock: getOrCreateWorker проверяет stopping под тем же
+	// локом перед wg.Add, поэтому к моменту wg.Wait() ниже новые wg.Add из
+	// getOrCreateWorker уже невозможны.
+	p.workerLock.Lock()
 	p.cancel()
+	p.workerLock.Unlock()
 
 	done := make(chan struct{})
 	go func() {

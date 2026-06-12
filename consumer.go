@@ -22,6 +22,7 @@ type partitionWorker struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	lastActivity time.Time
+	inFlight     int64 // atomic: число processMessage, держащих ссылку на этот воркер
 	mu           sync.Mutex
 }
 
@@ -45,7 +46,7 @@ type KafkaConsumer struct {
 	inactiveWorkerTTL     time.Duration
 	cleanupWorkerInterval time.Duration
 	messageReadTimeout    time.Duration
-	maxEnqueueTimeout     time.Duration
+	readErrorBackoff      time.Duration
 	messageChanBuffer     int
 	stopCleanup           chan struct{}
 }
@@ -94,7 +95,7 @@ func NewKafkaConsumer(config Config, logger *slog.Logger) (*KafkaConsumer, error
 		inactiveWorkerTTL:     config.Consumer.InactiveWorkerTTL,
 		cleanupWorkerInterval: config.Consumer.CleanupWorkerInterval,
 		messageReadTimeout:    config.Consumer.ReadTimeout,
-		maxEnqueueTimeout:     config.Consumer.MaxEnqueueTimeout,
+		readErrorBackoff:      max(config.Consumer.ReadTimeout, time.Second),
 		messageChanBuffer:     config.Consumer.MessageQueueSize,
 		stopCleanup:           make(chan struct{}),
 	}, nil
@@ -164,7 +165,15 @@ func (c *KafkaConsumer) runConsumerLoop() {
 				if kafkaErr, ok := err.(kafka.Error); ok && kafkaErr.Code() == kafka.ErrTimedOut {
 					continue
 				}
+				// Не-timeout ошибка (например, недоступны все брокеры) может
+				// возвращаться немедленно и без бэкоффа превратит цикл в
+				// busy-loop с заливкой логов. Ждём перед следующей попыткой,
+				// но не дольше readErrorBackoff и с учётом отмены контекста.
 				c.logger.Error("Failed to read message", slog.Any("error", err))
+				select {
+				case <-time.After(c.readErrorBackoff):
+				case <-c.ctx.Done():
+				}
 				continue
 			}
 
@@ -180,7 +189,14 @@ func (c *KafkaConsumer) runConsumerLoop() {
 
 // processMessage находит или создаёт воркер для партиции и передаёт сообщение.
 // Лок берётся только на время поиска/создания воркера, а не на время записи в канал.
-// Это предотвращает блокировку consumer loop'а под локом на время maxEnqueueTimeout.
+// Это предотвращает блокировку consumer loop'а под локом на время записи.
+//
+// Запись в messageChan блокирующая (без отдельного enqueue-таймаута): пока
+// сообщения обрабатываются и коммитятся строго по порядку, дроп сообщения
+// "из середины" с продолжением чтения дальше привёл бы к тому, что offset
+// дропнутого сообщения окажется меньше уже закоммиченного следующего — оно
+// будет потеряно навсегда. Если воркер не успевает, обратное давление должно
+// притормозить consumer loop целиком (это ограничено max.poll.interval.ms).
 func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 	partition := msg.TopicPartition.Partition
 	topic := *msg.TopicPartition.Topic
@@ -189,35 +205,51 @@ func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 		slog.Int("partition", int(partition)),
 		slog.String("topic", topic))
 
-	worker := c.getOrCreateWorker(topic, partition, log)
+	worker, err := c.getOrCreateWorker(topic, partition, log)
+	if err != nil {
+		// Консьюмер в процессе остановки: сообщение не коммитим и не
+		// обрабатываем, оно будет переобработано после перезапуска.
+		log.Warn("Dropping message: consumer is shutting down", slog.Any("error", err))
+		return
+	}
+	defer atomic.AddInt64(&worker.inFlight, -1)
 
 	select {
 	case worker.messageChan <- msg:
 		worker.updateActivity()
-	case <-time.After(c.maxEnqueueTimeout):
-		log.Warn("Failed to enqueue message: worker channel full")
 	case <-worker.ctx.Done():
-		log.Warn("Worker context done while enqueueing")
+		log.Warn("Worker context done while enqueueing, message not committed")
+	case <-c.ctx.Done():
 	}
 }
 
-func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *slog.Logger) *partitionWorker {
+func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *slog.Logger) (*partitionWorker, error) {
 	key := workerKey{topic: topic, partition: partition}
 
 	// fast path
 	c.workersMu.RLock()
 	worker, ok := c.workers[key]
+	if ok {
+		atomic.AddInt64(&worker.inFlight, 1)
+	}
 	c.workersMu.RUnlock()
 	if ok {
-		return worker
+		return worker, nil
 	}
 
 	// slow path — double-checked locking
 	c.workersMu.Lock()
 	defer c.workersMu.Unlock()
 
+	// Stop() тоже берёт workersMu перед cancel(), поэтому если stopping уже
+	// true, wg.Add ниже гарантированно не выполнится после старта wg.Wait().
+	if c.stopping.Load() {
+		return nil, fmt.Errorf("consumer is shutting down")
+	}
+
 	if worker, ok = c.workers[key]; ok {
-		return worker
+		atomic.AddInt64(&worker.inFlight, 1)
+		return worker, nil
 	}
 
 	workerCtx, cancel := context.WithCancel(c.ctx)
@@ -226,6 +258,7 @@ func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *sl
 		ctx:          workerCtx,
 		cancel:       cancel,
 		lastActivity: time.Now(),
+		inFlight:     1,
 	}
 	c.workers[key] = worker
 
@@ -233,7 +266,7 @@ func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *sl
 	go c.runPartitionWorker(key, worker)
 
 	log.Info("Created new partition worker")
-	return worker
+	return worker, nil
 }
 
 // runPartitionWorker обрабатывает сообщения для конкретной партиции.
@@ -244,7 +277,10 @@ func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *sl
 // в мёртвый канал.
 //
 // При штатной остановке (worker.ctx.Done) канал дочитывается до конца (drain),
-// чтобы не терять сообщения, уже поставленные в очередь.
+// чтобы не терять сообщения, уже поставленные в очередь. Drain ограничен по
+// времени отдельным контекстом (а не Background), чтобы не держать обработку
+// дольше GracefulTimeout, после которого Stop() закроет c.consumer и
+// CommitMessage из drain'а станет невалидным.
 func (c *KafkaConsumer) runPartitionWorker(key workerKey, worker *partitionWorker) {
 	defer c.wg.Done()
 	defer worker.cancel()
@@ -277,18 +313,16 @@ func (c *KafkaConsumer) runPartitionWorker(key workerKey, worker *partitionWorke
 			worker.updateActivity()
 			c.handleMessage(worker.ctx, msg)
 		case <-worker.ctx.Done():
-			// Drain: дочитываем уже поставленные сообщения, чтобы не терять их
-			// при штатной остановке. Новые сообщения после ctx.Done() в канал
-			// не попадут (processMessage проверяет worker.ctx.Done).
+			drainCtx, cancel := context.WithTimeout(context.Background(), c.config.GracefulTimeout)
+			defer cancel()
+
 			for {
 				select {
 				case msg, ok := <-worker.messageChan:
 					if !ok {
 						return
 					}
-					// Используем фоновый контекст: worker.ctx уже отменён,
-					// но сообщение уже принято — обрабатываем до конца.
-					c.handleMessage(context.Background(), msg)
+					c.handleMessage(drainCtx, msg)
 				default:
 					return
 				}
@@ -298,7 +332,8 @@ func (c *KafkaConsumer) runPartitionWorker(key workerKey, worker *partitionWorke
 }
 
 // handleMessage вызывает зарегистрированный handler и коммитит оффсет при успехе.
-// Принимает ctx явно, чтобы при drain-фазе можно было передать незаражённый контекст.
+// Принимает ctx явно, чтобы при drain-фазе можно было передать ограниченный
+// по времени контекст вместо отменённого worker.ctx.
 func (c *KafkaConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
 	topic := *msg.TopicPartition.Topic
 
@@ -343,6 +378,11 @@ func (c *KafkaConsumer) runCleanupLoop() {
 	}
 }
 
+// cleanupInactiveWorkers — единственное место, где воркеры удаляются из мапы
+// по TTL. Воркер с inFlight > 0 не трогаем: значит, прямо сейчас есть
+// processMessage, который получил ссылку на воркер и либо ещё не обновил
+// lastActivity, либо пишет в messageChan — отмена контекста сейчас могла бы
+// увести воркер в drain раньше, чем сообщение попадёт в канал.
 func (c *KafkaConsumer) cleanupInactiveWorkers() {
 	c.workersMu.Lock()
 	defer c.workersMu.Unlock()
@@ -351,6 +391,10 @@ func (c *KafkaConsumer) cleanupInactiveWorkers() {
 	inactiveSince := now.Add(-c.inactiveWorkerTTL)
 
 	for key, worker := range c.workers {
+		if atomic.LoadInt64(&worker.inFlight) > 0 {
+			continue
+		}
+
 		lastActive := worker.getLastActivity()
 		if lastActive.Before(inactiveSince) {
 			worker.cancel()
@@ -375,7 +419,13 @@ func (c *KafkaConsumer) Stop() {
 	// Порядок важен: если сначала cancel(), cleanup-loop может попытаться
 	// удалить воркеры, которые уже завершаются — безвредно, но избыточно.
 	close(c.stopCleanup)
+
+	// cancel() под workersMu: getOrCreateWorker проверяет stopping под тем же
+	// локом перед wg.Add, поэтому к моменту wg.Wait() ниже новые wg.Add из
+	// getOrCreateWorker уже невозможны.
+	c.workersMu.Lock()
 	c.cancel()
+	c.workersMu.Unlock()
 
 	done := make(chan struct{})
 	go func() {
@@ -392,7 +442,9 @@ func (c *KafkaConsumer) Stop() {
 
 	// consumer.Close() вызывается после того, как runConsumerLoop завершил работу
 	// (он завершается по ctx.Done() до этой точки), поэтому ReadMessage уже
-	// не вызывается — закрытие безопасно.
+	// не вызывается. Drain-фаза в runPartitionWorker ограничена тем же
+	// GracefulTimeout через drainCtx, поэтому к этому моменту CommitMessage
+	// из drain'а тоже не должен выполняться — закрытие безопасно.
 	if err := c.consumer.Close(); err != nil {
 		c.logger.Error("Failed to close consumer", slog.Any("error", err))
 	}
