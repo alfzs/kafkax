@@ -91,8 +91,8 @@ type KafkaConsumer struct {
 	wg                    sync.WaitGroup
 	ctx                   context.Context
 	cancel                context.CancelFunc
-	stopping              atomic.Bool
-	started               atomic.Bool
+	isStopping            atomic.Bool
+	isStarted             atomic.Bool
 	inactiveWorkerTTL     time.Duration
 	cleanupWorkerInterval time.Duration
 	messageReadTimeout    time.Duration
@@ -271,7 +271,7 @@ func (c *KafkaConsumer) SubscribeAll() error {
 // Идемпотентен через atomic.Bool: повторный вызов возвращает ошибку немедленно.
 // Требует наличия хотя бы одного зарегистрированного обработчика.
 func (c *KafkaConsumer) Start(ctx context.Context) error {
-	if !c.started.CompareAndSwap(false, true) {
+	if !c.isStarted.CompareAndSwap(false, true) {
 		return fmt.Errorf("consumer already started")
 	}
 
@@ -399,9 +399,9 @@ func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *sl
 	c.workersMu.Lock()
 	defer c.workersMu.Unlock()
 
-	// Stop() берёт workersMu перед cancel(), поэтому если stopping уже true,
+	// Stop() берёт workersMu перед cancel(), поэтому если isStopping уже true,
 	// wg.Add ниже гарантированно не выполнится после wg.Wait() в Stop().
-	if c.stopping.Load() {
+	if c.isStopping.Load() {
 		return nil, fmt.Errorf("consumer is shutting down")
 	}
 
@@ -662,7 +662,7 @@ func (c *KafkaConsumer) cleanupInactiveWorkers() {
 //
 // Безопасен для повторного вызова: последующие вызовы логируют предупреждение и возвращаются немедленно.
 func (c *KafkaConsumer) Stop() {
-	if !c.stopping.CompareAndSwap(false, true) {
+	if !c.isStopping.CompareAndSwap(false, true) {
 		c.logger.Warn("Already in stopping state")
 		return
 	}
@@ -674,7 +674,7 @@ func (c *KafkaConsumer) Stop() {
 	// удалить воркеры, которые уже завершаются — безвредно, но избыточно.
 	close(c.stopCleanup)
 
-	// cancel() под workersMu: getOrCreateWorker проверяет stopping под тем же
+	// cancel() под workersMu: getOrCreateWorker проверяет isStopping под тем же
 	// локом перед wg.Add, поэтому к моменту wg.Wait() новые wg.Add невозможны.
 	c.workersMu.Lock()
 	c.cancel()

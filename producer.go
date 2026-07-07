@@ -76,7 +76,7 @@ type KafkaProducer struct {
 	wg                    sync.WaitGroup
 	ctx                   context.Context
 	cancel                context.CancelFunc
-	stopping              atomic.Bool
+	isStopping            atomic.Bool
 	inactiveWorkerTTL     time.Duration
 	cleanupWorkerInterval time.Duration
 	flushTimeout          time.Duration
@@ -233,7 +233,7 @@ type PublishRequest struct {
 //   - "timeout waiting for delivery ack" — брокер не ответил за MessageTimeout
 //   - "tenant worker unavailable" — воркер завершился во время постановки в очередь
 func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) error {
-	if p.stopping.Load() {
+	if p.isStopping.Load() {
 		return errors.New("producer is shutting down")
 	}
 
@@ -315,9 +315,9 @@ func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logge
 	p.workerLock.Lock()
 	defer p.workerLock.Unlock()
 
-	// Close() берёт workerLock перед cancel(), поэтому если stopping уже true,
+	// Close() берёт workerLock перед cancel(), поэтому если isStopping уже true,
 	// wg.Add ниже гарантированно не выполнится после wg.Wait() в Close().
-	if p.stopping.Load() {
+	if p.isStopping.Load() {
 		return nil, errors.New("producer is shutting down")
 	}
 
@@ -573,14 +573,14 @@ func (p *KafkaProducer) cleanupInactiveWorkers() {
 //
 // Безопасен для повторного вызова: последующие вызовы логируют предупреждение и возвращаются немедленно.
 func (p *KafkaProducer) Close() {
-	if !p.stopping.CompareAndSwap(false, true) {
+	if !p.isStopping.CompareAndSwap(false, true) {
 		p.logger.Warn("Kafka producer already in stopping state")
 		return
 	}
 
 	p.logger.Info("Starting kafka producer shutdown")
 
-	// cancel() под workerLock: getOrCreateWorker проверяет stopping под тем же
+	// cancel() под workerLock: getOrCreateWorker проверяет isStopping под тем же
 	// локом перед wg.Add, поэтому к моменту wg.Wait() новые wg.Add невозможны.
 	// p.ctx.Done() также прерывает ожидание delivery в produce(), позволяя
 	// воркерам завершиться до истечения flushTimeout.
