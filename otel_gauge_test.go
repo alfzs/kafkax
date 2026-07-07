@@ -75,7 +75,7 @@ func TestNewKafkaProducer_GaugeRegistrationError(t *testing.T) {
 
 	otel.SetMeterProvider(failingGaugeMeterProvider{})
 
-	_, err := NewKafkaProducer(context.Background(), testConfig())
+	_, err := NewKafkaProducer(t.Context(), testConfig())
 	if err == nil {
 		fmt.Fprintln(os.Stderr, "NewKafkaProducer() с MeterProvider, форсирующим ошибку gauge, вернул nil, ожидалась ошибка")
 		os.Exit(1)

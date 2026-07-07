@@ -3,7 +3,6 @@
 package kafkax
 
 import (
-	"context"
 	"testing"
 
 	"github.com/google/uuid"
@@ -19,12 +18,12 @@ func TestKafkaProducer_SendMessage_BrokerUnavailable(t *testing.T) {
 	p := mustNewProducer(t)
 	t.Logf("отправляем сообщение на недоступный брокер (ждём таймаут ~%s)", testConfig().Producer.MessageTimeout)
 
-	err := p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: "test-topic", Value: []byte("hello")})
-
+	err := p.SendMessage(t.Context(), PublishRequest{TenantID: uuid.New(), Topic: "test-topic", Value: []byte("hello")})
 	if err == nil {
 		// Если брокер случайно оказался доступен — тест некорректен.
 		t.Log("брокер оказался доступен: сообщение доставлено (пропускаем проверку таймаута)")
 		return
 	}
+
 	t.Logf("сообщение не доставлено при недоступном брокере: %q ✓", err.Error())
 }

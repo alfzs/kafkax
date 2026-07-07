@@ -104,7 +104,7 @@ func (h *mockHandler) lastMessage() IncomingMessage {
 func mustNewProducer(t *testing.T) *KafkaProducer {
 	t.Helper()
 
-	p, err := NewKafkaProducer(context.Background(), testConfig())
+	p, err := NewKafkaProducer(t.Context(), testConfig())
 	if err != nil {
 		t.Skipf("пропуск: не удалось создать продюсер (librdkafka): %v", err)
 	}

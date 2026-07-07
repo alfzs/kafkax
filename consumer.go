@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,6 +57,9 @@ type partitionWorker struct {
 	cancel       context.CancelFunc
 	lastActivity time.Time
 	mu           sync.Mutex
+	// logger декорирован topic/partition один раз при создании воркера, а не
+	// на каждое сообщение — см. docs/performance-audit.md.
+	logger *slog.Logger
 }
 
 func (w *partitionWorker) updateActivity() {
@@ -266,10 +271,7 @@ func (c *KafkaConsumer) SubscribeAll() error {
 	c.handlersMu.RLock()
 	defer c.handlersMu.RUnlock()
 
-	topics := make([]string, 0, len(c.handlers))
-	for t := range c.handlers {
-		topics = append(topics, t)
-	}
+	topics := slices.Collect(maps.Keys(c.handlers))
 
 	if len(topics) == 0 {
 		return errors.New("no topics to subscribe")
@@ -298,10 +300,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 
 	c.handlersMu.RLock()
 
-	topics := make([]string, 0, len(c.handlers))
-	for t := range c.handlers {
-		topics = append(topics, t)
-	}
+	topics := slices.Collect(maps.Keys(c.handlers))
 
 	c.handlersMu.RUnlock()
 
@@ -309,11 +308,8 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 		return errors.New("no kafka handlers registered")
 	}
 
-	c.wg.Add(1)
-	go c.runConsumerLoop()
-
-	c.wg.Add(1)
-	go c.runCleanupLoop()
+	c.wg.Go(c.runConsumerLoop)
+	c.wg.Go(c.runCleanupLoop)
 
 	c.logger.Info("Kafka consumer started", slog.Any("topics", topics))
 
@@ -324,7 +320,6 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 // Таймаут ReadTimeout предотвращает вечную блокировку — при ErrTimedOut цикл продолжается,
 // что обеспечивает отзывчивость на ctx.Done при отсутствии новых сообщений.
 func (c *KafkaConsumer) runConsumerLoop() {
-	defer c.wg.Done()
 	defer c.cancel()
 
 	for {
@@ -335,8 +330,7 @@ func (c *KafkaConsumer) runConsumerLoop() {
 		default:
 			msg, err := c.consumer.ReadMessage(c.messageReadTimeout)
 			if err != nil {
-				var kafkaErr kafka.Error
-				if errors.As(err, &kafkaErr) {
+				if _, ok := errors.AsType[kafka.Error](err); ok {
 					continue
 				}
 
@@ -393,15 +387,15 @@ func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 	partition := msg.TopicPartition.Partition
 	topic := *msg.TopicPartition.Topic
 
-	log := c.logger.With(
-		slog.Int("partition", int(partition)),
-		slog.String("topic", topic))
-
-	worker, err := c.getOrCreateWorker(topic, partition, log)
+	worker, err := c.getOrCreateWorker(topic, partition)
 	if err != nil {
 		// Consumer в процессе остановки: сообщение не коммитим,
 		// оно будет переобработано после перезапуска.
-		log.Warn("Dropping message: consumer is shutting down", slog.Any("error", err))
+		c.logger.Warn("Dropping message: consumer is shutting down",
+			slog.Int("partition", int(partition)),
+			slog.String("topic", topic),
+			slog.Any("error", err))
+
 		return
 	}
 	defer worker.inFlight.Add(-1)
@@ -410,7 +404,7 @@ func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 	case worker.messageChan <- msg:
 		worker.updateActivity()
 	case <-worker.ctx.Done():
-		log.Warn("Worker context done while enqueueing, message not committed")
+		worker.logger.Warn("Worker context done while enqueueing, message not committed")
 	case <-c.ctx.Done():
 	}
 }
@@ -419,7 +413,7 @@ func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 // Использует double-checked locking: сначала RLock (fast path), затем Lock (slow path).
 // Атомарно инкрементирует inFlight, чтобы cleanup не уничтожил воркер между
 // получением ссылки и записью в messageChan.
-func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *slog.Logger) (*partitionWorker, error) {
+func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32) (*partitionWorker, error) {
 	key := workerKey{topic: topic, partition: partition}
 
 	// fast path
@@ -451,21 +445,26 @@ func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *sl
 		return worker, nil
 	}
 
+	// logger декорируется topic/partition один раз здесь, а не на каждое
+	// сообщение: processMessage в fast path (воркер уже существует, самый
+	// частый случай) логгер не использует вовсе.
+	logger := c.logger.With(slog.Int("partition", int(partition)), slog.String("topic", topic))
+
 	workerCtx, cancel := context.WithCancel(c.ctx)
 	worker = &partitionWorker{
 		messageChan:  make(chan *kafka.Message, c.messageChanBuffer),
 		ctx:          workerCtx,
 		cancel:       cancel,
 		lastActivity: time.Now(),
+		logger:       logger,
 	}
 	worker.inFlight.Store(1)
 	c.workers[key] = worker
 
-	c.wg.Add(1)
-	go c.runPartitionWorker(key, worker)
+	c.wg.Go(func() { c.runPartitionWorker(key, worker) })
 
 	c.metrics.workersActive.Add(context.Background(), 1)
-	log.Info("Created new partition worker")
+	logger.Info("Created new partition worker")
 
 	return worker, nil
 }
@@ -479,7 +478,6 @@ func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *sl
 // ограниченный drainCtx с тем же GracefulTimeout, что используется в Stop().
 // Это гарантирует, что CommitMessage не вызывается после consumer.Close().
 func (c *KafkaConsumer) runPartitionWorker(key workerKey, worker *partitionWorker) {
-	defer c.wg.Done()
 	defer worker.cancel()
 	defer func() {
 		if r := recover(); r != nil {
@@ -657,8 +655,6 @@ func (c *KafkaConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
 // runCleanupLoop — фоновая горутина, периодически вызывающая cleanupInactiveWorkers.
 // Завершается либо по ctx.Done (штатная остановка), либо по stopCleanup (вызов Stop).
 func (c *KafkaConsumer) runCleanupLoop() {
-	defer c.wg.Done()
-
 	ticker := time.NewTicker(c.cleanupWorkerInterval)
 	defer ticker.Stop()
 

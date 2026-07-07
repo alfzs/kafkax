@@ -177,7 +177,7 @@ func TestKafkaConsumer_Start_Errors(t *testing.T) {
 		c := mustNewConsumer(t)
 		t.Log("вызываем Start() без предварительного AddHandler")
 
-		err := c.Start(context.Background())
+		err := c.Start(t.Context())
 		if err == nil {
 			t.Fatal("Start() без обработчиков вернул nil, ожидалась ошибка")
 		}
@@ -193,13 +193,13 @@ func TestKafkaConsumer_Start_Errors(t *testing.T) {
 
 		t.Log("первый вызов Start()")
 
-		if err := c.Start(context.Background()); err != nil {
+		if err := c.Start(t.Context()); err != nil {
 			t.Skipf("пропуск: первый Start() завершился с ошибкой: %v", err)
 		}
 
 		t.Log("второй вызов Start() — должен вернуть ошибку")
 
-		err := c.Start(context.Background())
+		err := c.Start(t.Context())
 		if err == nil {
 			t.Fatal("второй Start() вернул nil, ожидалась ошибка 'already started'")
 		}
@@ -264,7 +264,7 @@ func TestKafkaConsumer_HandleMessage_RetriesAndSkipsAfterMaxRetries(t *testing.T
 	done := make(chan struct{})
 
 	go func() {
-		c.handleMessage(context.Background(), msg)
+		c.handleMessage(t.Context(), msg)
 		close(done)
 	}()
 
@@ -310,7 +310,7 @@ func TestKafkaConsumer_HandleMessage_HeadersRoundTrip(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		c.handleMessage(context.Background(), msg)
+		c.handleMessage(t.Context(), msg)
 		close(done)
 	}()
 

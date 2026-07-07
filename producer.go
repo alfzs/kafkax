@@ -36,6 +36,9 @@ type tenantWorker struct {
 	cancel       context.CancelFunc
 	lastActivity time.Time
 	mu           sync.Mutex
+	// logger декорирован tenant_id один раз при создании воркера, а не на
+	// каждый SendMessage — см. docs/performance-audit.md.
+	logger *slog.Logger
 }
 
 func (w *tenantWorker) updateActivity() {
@@ -226,8 +229,7 @@ func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error
 		return nil, fmt.Errorf("%s: registering queue depth gauge: %w", op, err)
 	}
 
-	p.wg.Add(1)
-	go p.manageWorkers()
+	p.wg.Go(p.manageWorkers)
 
 	// Наблюдатель за отменой ctx, переданного вызывающим кодом: доводит
 	// отмену до полноценного Close (Flush + закрытие соединения с брокером).
@@ -277,11 +279,6 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) err
 		return err
 	}
 
-	log := p.logger.With(slog.String("tenant_id", req.TenantID.String()))
-	if sc := trace.SpanFromContext(ctx).SpanContext(); sc.IsValid() {
-		log = log.With(slog.String("trace_id", sc.TraceID().String()))
-	}
-
 	resultChan := make(chan error, 1)
 
 	msg := message{
@@ -295,7 +292,7 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) err
 		Timeout:  p.messageTimeout,
 	}
 
-	worker, err := p.getOrCreateWorker(req.TenantID, log)
+	worker, err := p.getOrCreateWorker(req.TenantID)
 	if err != nil {
 		return err
 	}
@@ -336,7 +333,7 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) err
 // Использует double-checked locking: сначала RLock (fast path), затем Lock (slow path).
 // Атомарно инкрементирует inFlight, чтобы cleanup не уничтожил воркер между
 // получением ссылки и записью в messageChan.
-func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logger) (*tenantWorker, error) {
+func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID) (*tenantWorker, error) {
 	// fast path
 	p.workerLock.RLock()
 
@@ -366,19 +363,24 @@ func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logge
 		return worker, nil
 	}
 
+	// logger декорируется tenant_id один раз здесь, а не на каждый вызов
+	// SendMessage: getOrCreateWorker в fast path (воркер уже существует,
+	// самый частый случай) логгер не использует вовсе.
+	logger := p.logger.With(slog.String("tenant_id", tenantID.String()))
+
 	workerCtx, cancel := context.WithCancel(p.ctx)
 	worker = &tenantWorker{
 		messageChan:  make(chan message, p.messageChanBuffer),
 		ctx:          workerCtx,
 		cancel:       cancel,
 		lastActivity: time.Now(),
+		logger:       logger,
 	}
 	worker.inFlight.Store(1)
 
 	p.tenantPools[tenantID] = worker
 
-	p.wg.Add(1)
-	go p.runWorker(tenantID, worker, logger)
+	p.wg.Go(func() { p.runWorker(tenantID, worker) })
 
 	p.metrics.workersActive.Add(context.Background(), 1)
 	logger.Info("Created new worker for tenant")
@@ -392,7 +394,7 @@ func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logge
 // Удалением занимается только cleanupInactiveWorkers (TTL) и Close (shutdown).
 // Это предотвращает race condition при быстром пересоздании воркера для того
 // же tenantID.
-func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker, logger *slog.Logger) {
+func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker) {
 	defer func() {
 		if r := recover(); r != nil {
 			p.logger.Error("Worker panic",
@@ -403,15 +405,14 @@ func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker, logg
 
 		worker.cancel()
 		p.metrics.workersActive.Add(context.Background(), -1)
-		p.wg.Done()
-		logger.Debug("Worker terminated", slog.String("tenant_id", tenantID.String()))
+		worker.logger.Debug("Worker terminated", slog.String("tenant_id", tenantID.String()))
 	}()
 
 	for {
 		select {
 		case msg := <-worker.messageChan:
 			worker.updateActivity()
-			p.handleMessage(msg, logger)
+			p.handleMessage(msg, worker.logger)
 
 		case <-worker.ctx.Done():
 			// Drain: сообщения, записанные в messageChan до отмены контекста,
@@ -423,7 +424,7 @@ func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker, logg
 			for {
 				select {
 				case msg := <-worker.messageChan:
-					p.handleMessage(msg, logger)
+					p.handleMessage(msg, worker.logger)
 				default:
 					if worker.inFlight.Load() > 0 {
 						runtime.Gosched()
@@ -440,6 +441,11 @@ func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker, logg
 // handleMessage вызывает produce и доставляет результат в msg.Result.
 // Если вызывающая сторона не читает resultChan (контекст отменён или таймаут),
 // результат отбрасывается с предупреждением — produce уже завершился.
+//
+// logger декорирован только tenant_id (общий для воркера, см. getOrCreateWorker).
+// trace_id добавляется здесь, а не заранее в SendMessage: он специфичен для
+// конкретного сообщения, а не для воркера, и нужен только в этих (редких)
+// ветках предупреждений — не на каждый вызов SendMessage.
 func (p *KafkaProducer) handleMessage(msg message, logger *slog.Logger) {
 	err := p.produce(msg)
 
@@ -449,12 +455,21 @@ func (p *KafkaProducer) handleMessage(msg message, logger *slog.Logger) {
 	select {
 	case msg.Result <- err:
 	case <-msg.Ctx.Done():
-		logger.Warn("Message result not delivered - context canceled",
+		traceLogger(msg.Ctx, logger).Warn("Message result not delivered - context canceled",
 			slog.String("topic", msg.Topic))
 	case <-timer.C:
-		logger.Warn("Message result not delivered - timeout",
+		traceLogger(msg.Ctx, logger).Warn("Message result not delivered - timeout",
 			slog.String("topic", msg.Topic))
 	}
+}
+
+// traceLogger добавляет trace_id к логгеру, если ctx содержит валидный OTel-span.
+func traceLogger(ctx context.Context, logger *slog.Logger) *slog.Logger {
+	if sc := trace.SpanFromContext(ctx).SpanContext(); sc.IsValid() {
+		return logger.With(slog.String("trace_id", sc.TraceID().String()))
+	}
+
+	return logger
 }
 
 // produce отправляет сообщение в Kafka и ожидает подтверждения доставки.
@@ -580,8 +595,6 @@ func (p *KafkaProducer) produce(msg message) (err error) {
 
 // manageWorkers — фоновая горутина, периодически вызывающая cleanupInactiveWorkers.
 func (p *KafkaProducer) manageWorkers() {
-	defer p.wg.Done()
-
 	ticker := time.NewTicker(p.cleanupWorkerInterval)
 	defer ticker.Stop()
 

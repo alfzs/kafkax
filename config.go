@@ -3,6 +3,7 @@
 package kafkax
 
 import (
+	"cmp"
 	"fmt"
 	"strings"
 	"time"
@@ -123,11 +124,7 @@ func (t TLS) endpointIdentAlgorithm() string {
 		return tlsIdentAlgorithmNone
 	}
 
-	if t.IdentificationAlgorithm == "" {
-		return tlsIdentAlgorithmHTTPS
-	}
-
-	return t.IdentificationAlgorithm
+	return cmp.Or(t.IdentificationAlgorithm, tlsIdentAlgorithmHTTPS)
 }
 
 // Producer содержит параметры Kafka-продюсера.

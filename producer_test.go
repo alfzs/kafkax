@@ -52,7 +52,7 @@ func TestNewKafkaProducer_InvalidConfig(t *testing.T) {
 			t.Parallel()
 			t.Logf("попытка создать продюсер с невалидным конфигом: %s", tc.name)
 
-			p, err := NewKafkaProducer(context.Background(), tc.config)
+			p, err := NewKafkaProducer(t.Context(), tc.config)
 			if err == nil {
 				p.Close()
 				t.Fatalf("NewKafkaProducer() вернул nil-ошибку, ожидалась ошибка, содержащая %q", tc.errContains)
@@ -73,7 +73,7 @@ func TestNewKafkaProducer_Success(t *testing.T) {
 	t.Parallel()
 	t.Log("создаём продюсер с валидным конфигом (брокер может быть недоступен)")
 
-	p, err := NewKafkaProducer(context.Background(), testConfig())
+	p, err := NewKafkaProducer(t.Context(), testConfig())
 	if err != nil {
 		t.Skipf("пропуск: librdkafka не может инициализировать продюсер: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestKafkaProducer_SendMessage_WhenStopping(t *testing.T) {
 
 	t.Log("пытаемся отправить сообщение в остановленный продюсер")
 
-	err := p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: testTopic, Value: []byte("data")})
+	err := p.SendMessage(t.Context(), PublishRequest{TenantID: uuid.New(), Topic: testTopic, Value: []byte("data")})
 	if err == nil {
 		t.Fatal("SendMessage() в остановленный продюсер вернул nil, ожидалась ошибка")
 	}
@@ -116,7 +116,7 @@ func TestKafkaProducer_SendMessage_ReservedHeaderKey(t *testing.T) {
 
 	p := mustNewProducer(t)
 
-	err := p.SendMessage(context.Background(), PublishRequest{
+	err := p.SendMessage(t.Context(), PublishRequest{
 		TenantID: uuid.New(),
 		Topic:    testTopic,
 		Value:    []byte("data"),
@@ -196,7 +196,7 @@ func TestKafkaProducer_ContextCancel_TriggersShutdown(t *testing.T) {
 
 	var lastErr error
 	for time.Now().Before(deadline) {
-		lastErr = p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: testTopic, Value: []byte("x")})
+		lastErr = p.SendMessage(t.Context(), PublishRequest{TenantID: uuid.New(), Topic: testTopic, Value: []byte("x")})
 		if lastErr != nil && strings.Contains(lastErr.Error(), "shutting down") {
 			t.Logf("SendMessage после cancel(ctx) вернул: %q ✓", lastErr.Error())
 			return
@@ -219,7 +219,7 @@ func TestKafkaProducer_ConcurrentCloseAndSendMessage(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 20 {
 		wg.Go(func() {
-			_ = p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: "concurrent-topic", Value: []byte("x")})
+			_ = p.SendMessage(t.Context(), PublishRequest{TenantID: uuid.New(), Topic: "concurrent-topic", Value: []byte("x")})
 		})
 	}
 

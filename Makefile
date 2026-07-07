@@ -19,11 +19,11 @@ benchmark:
 
 ## lint: Run golangci-lint
 lint:
-	golangci-lint run ./...
+	$(GO) tool golangci-lint run ./...
 
 ## lint-fix: Run golangci-lint and auto-fix issues
 lint-fix:
-	golangci-lint run --fix ./...
+	$(GO) tool golangci-lint run --fix ./...
 
 ## fmt: Check gofmt formatting
 fmt:
@@ -35,7 +35,7 @@ vet:
 
 ## audit: Check dependencies for known vulnerabilities
 audit:
-	govulncheck ./...
+	$(GO) tool govulncheck ./...
 
 ## tidy: Tidy go.mod/go.sum
 tidy:

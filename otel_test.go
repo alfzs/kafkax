@@ -1,7 +1,6 @@
 package kafkax
 
 import (
-	"context"
 	"strings"
 	"testing"
 
@@ -179,7 +178,7 @@ func TestKafkaHeaderCarrier_PropagationRoundTrip(t *testing.T) {
 	})
 
 	// Inject: вставляем trace context в заголовки Kafka.
-	injectCtx := trace.ContextWithSpanContext(context.Background(), sc)
+	injectCtx := trace.ContextWithSpanContext(t.Context(), sc)
 	headers := make([]kafka.Header, 0, 2)
 	carrier := newKafkaHeaderCarrier(&headers)
 	prop.Inject(injectCtx, carrier)
@@ -207,7 +206,7 @@ func TestKafkaHeaderCarrier_PropagationRoundTrip(t *testing.T) {
 	t.Logf("trace_id и span_id корректно закодированы в traceparent ✓")
 
 	// Extract: восстанавливаем trace context из заголовков.
-	extractCtx := prop.Extract(context.Background(), carrier)
+	extractCtx := prop.Extract(t.Context(), carrier)
 	extractedSC := trace.SpanContextFromContext(extractCtx)
 
 	if !extractedSC.IsValid() {

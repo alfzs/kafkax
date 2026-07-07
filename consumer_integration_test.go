@@ -3,7 +3,6 @@
 package kafkax
 
 import (
-	"context"
 	"testing"
 	"time"
 )
@@ -20,18 +19,21 @@ func TestKafkaConsumer_FullLifecycle(t *testing.T) {
 	c := mustNewConsumer(t)
 
 	t.Log("шаг 2: регистрируем обработчик для топика 'lifecycle-test'")
+
 	handler := &mockHandler{}
 	if err := c.AddHandler("lifecycle-test", handler); err != nil {
 		t.Fatalf("AddHandler() завершился с ошибкой: %v", err)
 	}
 
 	t.Log("шаг 3: подписываемся на топики")
+
 	if err := c.SubscribeAll(); err != nil {
 		t.Fatalf("SubscribeAll() завершился с ошибкой: %v", err)
 	}
 
 	t.Log("шаг 4: запускаем consumer loop")
-	if err := c.Start(context.Background()); err != nil {
+
+	if err := c.Start(t.Context()); err != nil {
 		t.Fatalf("Start() завершился с ошибкой: %v", err)
 	}
 
@@ -42,7 +44,9 @@ func TestKafkaConsumer_FullLifecycle(t *testing.T) {
 	time.Sleep(pause)
 
 	t.Log("шаг 6: останавливаем консьюмер")
+
 	done := make(chan struct{})
+
 	go func() {
 		c.Stop()
 		close(done)
