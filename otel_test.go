@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/confluentinc/confluent-kafka-go/kafka"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -131,8 +131,7 @@ func TestKafkaHeaderCarrier_Keys(t *testing.T) {
 
 	t.Run("возвращает пустой срез для пустого носителя", func(t *testing.T) {
 		t.Parallel()
-		headers := make([]kafka.Header, 0)
-		carrier := newKafkaHeaderCarrier(&headers)
+		carrier := newKafkaHeaderCarrier(new(make([]kafka.Header, 0)))
 
 		keys := carrier.Keys()
 

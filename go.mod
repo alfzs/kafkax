@@ -1,10 +1,9 @@
 module github.com/alfzs/kafkax
 
-go 1.25.0
-
-require github.com/confluentinc/confluent-kafka-go v1.9.2
+go 1.26.4
 
 require (
+	github.com/confluentinc/confluent-kafka-go/v2 v2.15.0
 	github.com/google/uuid v1.6.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/metric v1.44.0

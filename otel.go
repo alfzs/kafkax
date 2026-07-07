@@ -1,6 +1,6 @@
 package kafkax
 
-import "github.com/confluentinc/confluent-kafka-go/kafka"
+import "github.com/confluentinc/confluent-kafka-go/v2/kafka"
 
 // kafkaHeaderCarrier реализует propagation.TextMapCarrier для передачи
 // trace context через Kafka message headers (W3C TraceContext / Baggage).

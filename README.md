@@ -11,7 +11,7 @@ go get github.com/alfzs/kafkax
 Требует CGO и установленной librdkafka. confluent-kafka-go поставляет prebuilt-версию:
 
 ```bash
-go get github.com/confluentinc/confluent-kafka-go
+go get github.com/confluentinc/confluent-kafka-go/v2
 ```
 
 ## Быстрый старт
