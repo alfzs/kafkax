@@ -24,10 +24,12 @@ import (
 )
 
 type tenantWorker struct {
-	// inFlight — первое поле умышленно: atomic.AddInt64/LoadInt64 требуют
-	// 64-битного выравнивания, которое рантайм Go гарантирует только для
-	// первого слова аллоцированной структуры на 32-битных платформах.
-	inFlight    int64 // atomic: число SendMessage, держащих ссылку на этот воркер
+	// inFlight — число SendMessage, держащих ссылку на этот воркер.
+	// atomic.Int64 вместо atomic.AddInt64/LoadInt64 на обычном int64:
+	// содержит компилятороспознаваемый align64-маркер, гарантирующий
+	// 8-байтовое выравнивание независимо от позиции поля в структуре
+	// (актуально на 32-битных платформах).
+	inFlight    atomic.Int64
 	messageChan chan message
 	//nolint:containedctx // lifecycle-контекст воркера (аналог BaseContext), не запросный — см. docs/context-audit.md
 	ctx          context.Context
@@ -299,7 +301,7 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) err
 	}
 	// inFlight держит воркер "занятым" на всё время SendMessage, чтобы cleanup
 	// не отменил его между получением ссылки и записью в messageChan.
-	defer atomic.AddInt64(&worker.inFlight, -1)
+	defer worker.inFlight.Add(-1)
 
 	worker.updateActivity()
 
@@ -340,7 +342,7 @@ func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logge
 
 	worker, ok := p.tenantPools[tenantID]
 	if ok {
-		atomic.AddInt64(&worker.inFlight, 1)
+		worker.inFlight.Add(1)
 	}
 
 	p.workerLock.RUnlock()
@@ -360,7 +362,7 @@ func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logge
 	}
 
 	if worker, ok = p.tenantPools[tenantID]; ok {
-		atomic.AddInt64(&worker.inFlight, 1)
+		worker.inFlight.Add(1)
 		return worker, nil
 	}
 
@@ -370,8 +372,8 @@ func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logge
 		ctx:          workerCtx,
 		cancel:       cancel,
 		lastActivity: time.Now(),
-		inFlight:     1,
 	}
+	worker.inFlight.Store(1)
 
 	p.tenantPools[tenantID] = worker
 
@@ -423,7 +425,7 @@ func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker, logg
 				case msg := <-worker.messageChan:
 					p.handleMessage(msg, logger)
 				default:
-					if atomic.LoadInt64(&worker.inFlight) > 0 {
+					if worker.inFlight.Load() > 0 {
 						runtime.Gosched()
 						continue
 					}
@@ -606,7 +608,7 @@ func (p *KafkaProducer) cleanupInactiveWorkers() {
 	inactiveSince := now.Add(-p.inactiveWorkerTTL)
 
 	for tenantID, worker := range p.tenantPools {
-		if atomic.LoadInt64(&worker.inFlight) > 0 {
+		if worker.inFlight.Load() > 0 {
 			continue
 		}
 

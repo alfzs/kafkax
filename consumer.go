@@ -43,10 +43,12 @@ type consumerHandler interface {
 }
 
 type partitionWorker struct {
-	// inFlight — первое поле умышленно: atomic.AddInt64/LoadInt64 требуют
-	// 64-битного выравнивания, которое рантайм Go гарантирует только для
-	// первого слова аллоцированной структуры на 32-битных платформах.
-	inFlight    int64 // atomic: число processMessage, держащих ссылку на этот воркер
+	// inFlight — число processMessage, держащих ссылку на этот воркер.
+	// atomic.Int64 вместо atomic.AddInt64/LoadInt64 на обычном int64:
+	// содержит компилятороспознаваемый align64-маркер, гарантирующий
+	// 8-байтовое выравнивание независимо от позиции поля в структуре
+	// (актуально на 32-битных платформах).
+	inFlight    atomic.Int64
 	messageChan chan *kafka.Message
 	//nolint:containedctx // lifecycle-контекст воркера (аналог BaseContext), не запросный — см. docs/context-audit.md
 	ctx          context.Context
@@ -388,7 +390,7 @@ func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 		log.Warn("Dropping message: consumer is shutting down", slog.Any("error", err))
 		return
 	}
-	defer atomic.AddInt64(&worker.inFlight, -1)
+	defer worker.inFlight.Add(-1)
 
 	select {
 	case worker.messageChan <- msg:
@@ -411,7 +413,7 @@ func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *sl
 
 	worker, ok := c.workers[key]
 	if ok {
-		atomic.AddInt64(&worker.inFlight, 1)
+		worker.inFlight.Add(1)
 	}
 
 	c.workersMu.RUnlock()
@@ -431,7 +433,7 @@ func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *sl
 	}
 
 	if worker, ok = c.workers[key]; ok {
-		atomic.AddInt64(&worker.inFlight, 1)
+		worker.inFlight.Add(1)
 		return worker, nil
 	}
 
@@ -441,8 +443,8 @@ func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *sl
 		ctx:          workerCtx,
 		cancel:       cancel,
 		lastActivity: time.Now(),
-		inFlight:     1,
 	}
+	worker.inFlight.Store(1)
 	c.workers[key] = worker
 
 	c.wg.Add(1)
@@ -671,7 +673,7 @@ func (c *KafkaConsumer) cleanupInactiveWorkers() {
 	inactiveSince := now.Add(-c.inactiveWorkerTTL)
 
 	for key, worker := range c.workers {
-		if atomic.LoadInt64(&worker.inFlight) > 0 {
+		if worker.inFlight.Load() > 0 {
 			continue
 		}
 
