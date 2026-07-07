@@ -24,12 +24,15 @@ import (
 )
 
 type tenantWorker struct {
+	// inFlight — первое поле умышленно: atomic.AddInt64/LoadInt64 требуют
+	// 64-битного выравнивания, которое рантайм Go гарантирует только для
+	// первого слова аллоцированной структуры на 32-битных платформах.
+	inFlight    int64 // atomic: число SendMessage, держащих ссылку на этот воркер
 	messageChan chan message
 	//nolint:containedctx // lifecycle-контекст воркера (аналог BaseContext), не запросный — см. docs/context-audit.md
 	ctx          context.Context
 	cancel       context.CancelFunc
 	lastActivity time.Time
-	inFlight     int64 // atomic: число SendMessage, держащих ссылку на этот воркер
 	mu           sync.Mutex
 }
 
