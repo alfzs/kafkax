@@ -183,7 +183,7 @@ kafkax использует глобальные провайдеры `otel.GetT
 | `TLS.CaCertPath` | — | Путь к CA-сертификату брокера. Пустое — системный trust store |
 | `TLS.ClientCertPath` | — | Клиентский сертификат для mTLS |
 | `TLS.ClientKeyPath` | — | Клиентский ключ для mTLS |
-| `TLS.IdentificationAlgorithm` | `none` | `ssl.endpoint.identification.algorithm`. Для проверки hostname брокера: `https` |
+| `TLS.IdentificationAlgorithm` | `https` | `ssl.endpoint.identification.algorithm`. Secure by default (совпадает с умолчанием librdkafka); `none` — только через `InsecureSkipVerify` |
 | `TLS.InsecureSkipVerify` | `false` | Отключить проверку сертификата. Только для разработки |
 
 ### Продюсер

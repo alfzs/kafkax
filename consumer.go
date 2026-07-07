@@ -370,7 +370,21 @@ func (c *KafkaConsumer) runConsumerLoop() {
 // "из середины" привёл бы к тому, что offset дропнутого окажется меньше
 // закоммиченного следующего — сообщение потеряно навсегда. Обратное давление
 // притормаживает consumer loop (ограничено max.poll.interval.ms).
+//
+// security: восстановление после паники — defense-in-depth. processMessage —
+// единственная точка в runConsumerLoop (у которого нет собственного recover),
+// зависящая от содержимого сообщения из Kafka; необработанная паника здесь
+// уронила бы весь процесс, а не только чтение из одного топика/партиции,
+// что превращает баг обработки одного сообщения в DoS против всего сервиса.
 func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.logger.Error("Panic in processMessage",
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())))
+		}
+	}()
+
 	if msg.TopicPartition.Topic == nil {
 		c.logger.Error("Received message with nil topic, skipping")
 		return
@@ -665,7 +679,21 @@ func (c *KafkaConsumer) runCleanupLoop() {
 // который получил ссылку на воркер и либо ещё не обновил lastActivity,
 // либо пишет в messageChan — отмена контекста сейчас увела бы воркер в drain
 // до записи сообщения.
+//
+// security: восстановление после паники — defense-in-depth. Без него необработанная
+// паника здесь (единственный вызов — из тикера runCleanupLoop) уронила бы весь
+// процесс, а не только это одно фоновое обслуживание, что превращает баг в этой
+// функции в DoS против всего сервиса. Тот же паттерн уже используется в
+// runWorker/runPartitionWorker для паник в пользовательском коде обработчика.
 func (c *KafkaConsumer) cleanupInactiveWorkers() {
+	defer func() {
+		if r := recover(); r != nil {
+			c.logger.Error("Panic in cleanupInactiveWorkers",
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())))
+		}
+	}()
+
 	c.workersMu.Lock()
 	defer c.workersMu.Unlock()
 

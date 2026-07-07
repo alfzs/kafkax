@@ -600,7 +600,21 @@ func (p *KafkaProducer) manageWorkers() {
 //
 // Воркер с inFlight > 0 не трогаем: значит прямо сейчас есть SendMessage,
 // который получил ссылку на воркер и ещё не записал сообщение в messageChan.
+//
+// security: восстановление после паники — defense-in-depth. Без него необработанная
+// паника здесь (единственный вызов — из тикера manageWorkers) уронила бы весь
+// процесс, а не только это одно фоновое обслуживание, что превращает баг в этой
+// функции в DoS против всего сервиса. Тот же паттерн уже используется в
+// runWorker/runPartitionWorker для паник в пользовательском коде обработчика.
 func (p *KafkaProducer) cleanupInactiveWorkers() {
+	defer func() {
+		if r := recover(); r != nil {
+			p.logger.Error("Panic in cleanupInactiveWorkers",
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())))
+		}
+	}()
+
 	p.workerLock.Lock()
 	defer p.workerLock.Unlock()
 

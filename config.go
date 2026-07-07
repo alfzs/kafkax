@@ -25,9 +25,16 @@ const (
 	envKeySASLPassword = "KAFKAX_SASL_PASSWORD"
 )
 
-// tlsIdentAlgorithmNone — значение ssl.endpoint.identification.algorithm,
-// отключающее проверку hostname (librdkafka запрещает пустую строку).
-const tlsIdentAlgorithmNone = "none"
+// Значения ssl.endpoint.identification.algorithm.
+const (
+	// tlsIdentAlgorithmHTTPS включает проверку hostname брокера по RFC 2818 —
+	// это же значение librdkafka использует как собственное умолчание.
+	tlsIdentAlgorithmHTTPS = "https"
+	// tlsIdentAlgorithmNone отключает проверку hostname. Должно возвращаться
+	// только при явном TLS.InsecureSkipVerify=true — никогда как следствие
+	// того, что TLS.IdentificationAlgorithm просто не задан.
+	tlsIdentAlgorithmNone = "none"
+)
 
 // Config — корневая конфигурация клиента Kafka.
 // Используется как продюсером, так и консьюмером; секции Producer и Consumer
@@ -90,8 +97,10 @@ type TLS struct {
 	ClientCertPath string `yaml:"client_cert_path"`
 	ClientKeyPath  string `yaml:"client_key_path"`
 	// IdentificationAlgorithm — алгоритм проверки hostname в сертификате брокера
-	// (ssl.endpoint.identification.algorithm). Стандартное значение: "https".
-	// При InsecureSkipVerify = true переопределяется в "none".
+	// (ssl.endpoint.identification.algorithm). Пустое значение равносильно "https"
+	// (secure by default — совпадает с собственным умолчанием librdkafka).
+	// При InsecureSkipVerify = true всегда используется "none", независимо от
+	// этого поля.
 	IdentificationAlgorithm string `yaml:"identification_algorithm"`
 	// InsecureSkipVerify отключает проверку TLS-сертификата сервера.
 	// Допустимо только в среде разработки; в продакшене недопустимо.
@@ -99,11 +108,23 @@ type TLS struct {
 }
 
 // endpointIdentAlgorithm возвращает значение ssl.endpoint.identification.algorithm.
-// При InsecureSkipVerify=true возвращает "none" независимо от IdentificationAlgorithm.
-// При пустом IdentificationAlgorithm возвращает "none" — librdkafka запрещает пустое значение.
+//
+// security: librdkafka отклоняет пустую строку для этого enum-параметра, поэтому
+// при незаданном IdentificationAlgorithm сюда нужно подставлять какое-то
+// конкретное значение — но отсутствие явной настройки НЕ должно молча отключать
+// проверку hostname (CWE-295). Раньше пустое значение резолвилось в "none" ровно
+// так же, как и явный InsecureSkipVerify=true, из-за чего TLS без явно
+// прописанного IdentificationAlgorithm="https" был уязвим к MITM (см.
+// docs/security-audit.md). Теперь по умолчанию используется "https" —
+// собственное умолчание librdkafka — и "none" возвращается только при явном
+// InsecureSkipVerify=true.
 func (t TLS) endpointIdentAlgorithm() string {
-	if t.InsecureSkipVerify || t.IdentificationAlgorithm == "" {
+	if t.InsecureSkipVerify {
 		return tlsIdentAlgorithmNone
+	}
+
+	if t.IdentificationAlgorithm == "" {
+		return tlsIdentAlgorithmHTTPS
 	}
 
 	return t.IdentificationAlgorithm

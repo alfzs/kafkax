@@ -52,6 +52,25 @@ func TestBuildProducerKafkaConfig(t *testing.T) {
 			t.Fatalf("sasl.username/password=%v/%v, ожидалось user/secret", got["sasl.username"], got["sasl.password"])
 		}
 	})
+
+	t.Run("незаданный TLS.IdentificationAlgorithm не отключает проверку hostname в реальном ConfigMap", func(t *testing.T) {
+		t.Parallel()
+
+		// security: buildProducerKafkaConfig — точка, где TLS.endpointIdentAlgorithm()
+		// реально попадает в kafka.ConfigMap, передаваемый librdkafka. Юнит-теста
+		// самого endpointIdentAlgorithm() недостаточно — регрессия могла бы
+		// произойти и здесь (например, если кто-то захардкодит "none" при рефакторинге).
+		cfg := testConfig()
+		cfg.SecurityProtocol = SecurityProtocolSASLSSL
+		cfg.SASL = SASL{Username: testSASLUser, Password: testSASLPassword, Mechanism: "PLAIN"}
+
+		got := buildProducerKafkaConfig(cfg)
+
+		if got["ssl.endpoint.identification.algorithm"] != tlsIdentAlgorithmHTTPS {
+			t.Fatalf("ssl.endpoint.identification.algorithm=%v, ожидалось %q (secure by default)",
+				got["ssl.endpoint.identification.algorithm"], tlsIdentAlgorithmHTTPS)
+		}
+	})
 }
 
 // TestBuildConsumerKafkaConfig проверяет прямой маппинг Config в kafka.ConfigMap
@@ -250,7 +269,7 @@ func TestTLS_EndpointIdentAlgorithm(t *testing.T) {
 	t.Run("InsecureSkipVerify=true переопределяет алгоритм в none", func(t *testing.T) {
 		t.Parallel()
 
-		tls := TLS{IdentificationAlgorithm: "https", InsecureSkipVerify: true}
+		tls := TLS{IdentificationAlgorithm: tlsIdentAlgorithmHTTPS, InsecureSkipVerify: true}
 
 		got := tls.endpointIdentAlgorithm()
 
@@ -264,28 +283,45 @@ func TestTLS_EndpointIdentAlgorithm(t *testing.T) {
 	t.Run("InsecureSkipVerify=false возвращает IdentificationAlgorithm", func(t *testing.T) {
 		t.Parallel()
 
-		tls := TLS{IdentificationAlgorithm: "https", InsecureSkipVerify: false}
+		tls := TLS{IdentificationAlgorithm: tlsIdentAlgorithmHTTPS, InsecureSkipVerify: false}
 
 		got := tls.endpointIdentAlgorithm()
 
-		if got != "https" {
-			t.Fatalf("endpointIdentAlgorithm()=%q, ожидалось %q", got, "https")
+		if got != tlsIdentAlgorithmHTTPS {
+			t.Fatalf("endpointIdentAlgorithm()=%q, ожидалось %q", got, tlsIdentAlgorithmHTTPS)
 		}
 
 		t.Logf("InsecureSkipVerify=false: IdentificationAlgorithm=%q возвращён без изменений", got)
 	})
 
-	t.Run("пустой IdentificationAlgorithm возвращает none (librdkafka запрещает пустое значение)", func(t *testing.T) {
+	t.Run("пустой IdentificationAlgorithm возвращает https (secure by default)", func(t *testing.T) {
 		t.Parallel()
 
 		tls := TLS{InsecureSkipVerify: false}
 
 		got := tls.endpointIdentAlgorithm()
 
-		if got != "none" {
-			t.Fatalf("endpointIdentAlgorithm()=%q, ожидалось %q (librdkafka запрещает пустую строку)", got, "none")
+		// security: пустое значение НЕ должно молча отключать проверку hostname
+		// (CWE-295) — см. docs/security-audit.md. "https" совпадает с
+		// собственным умолчанием librdkafka для ssl.endpoint.identification.algorithm.
+		if got != tlsIdentAlgorithmHTTPS {
+			t.Fatalf("endpointIdentAlgorithm()=%q, ожидалось %q (secure-by-default, как в librdkafka)", got, tlsIdentAlgorithmHTTPS)
 		}
 
-		t.Log("пустой IdentificationAlgorithm → \"none\" (безопасное умолчание) ✓")
+		t.Log("пустой IdentificationAlgorithm → \"https\" (secure by default) ✓")
+	})
+
+	t.Run("InsecureSkipVerify=true возвращает none даже при пустом IdentificationAlgorithm", func(t *testing.T) {
+		t.Parallel()
+
+		tls := TLS{InsecureSkipVerify: true}
+
+		got := tls.endpointIdentAlgorithm()
+
+		if got != "none" {
+			t.Fatalf("endpointIdentAlgorithm()=%q, ожидалось %q", got, "none")
+		}
+
+		t.Log("InsecureSkipVerify=true явно отключает проверку hostname ✓")
 	})
 }
