@@ -76,6 +76,7 @@ type KafkaProducer struct {
 	wg                    sync.WaitGroup
 	ctx                   context.Context
 	cancel                context.CancelFunc
+	closed                chan struct{}
 	isStopping            atomic.Bool
 	inactiveWorkerTTL     time.Duration
 	cleanupWorkerInterval time.Duration
@@ -90,7 +91,10 @@ type KafkaProducer struct {
 // NewKafkaProducer создаёт и запускает продюсер Kafka.
 //
 // ctx используется как родительский контекст продюсера: его отмена эквивалентна
-// вызову Close. Для управляемого завершения предпочтительнее явный вызов Close.
+// вызову Close (запускается та же горутина graceful shutdown). Для управляемого
+// завершения по-прежнему предпочтительнее явный вызов Close — так вызывающий
+// код может дождаться его завершения синхронно, а не полагаться на фоновую
+// горутину-наблюдателя.
 //
 // Инициализирует OTel-инструменты (счётчики, гистограммы, gauge) и запускает
 // фоновую горутину сборщика неактивных воркеров. Возвращает ошибку при невалидной
@@ -162,7 +166,7 @@ func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
+	lifecycleCtx, cancel := context.WithCancel(ctx)
 
 	meter := otel.Meter("github.com/alfzs/kafkax/producer")
 
@@ -171,8 +175,9 @@ func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error
 		config:                config,
 		logger:                slog.Default().With(slog.String("component", "kafka_producer")),
 		tenantPools:           make(map[uuid.UUID]*tenantWorker),
-		ctx:                   ctx,
+		ctx:                   lifecycleCtx,
 		cancel:                cancel,
+		closed:                make(chan struct{}),
 		inactiveWorkerTTL:     config.Producer.InactiveWorkerTTL,
 		cleanupWorkerInterval: config.Producer.CleanupWorkerInterval,
 		flushTimeout:          config.Producer.FlushTimeout,
@@ -209,6 +214,20 @@ func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error
 
 	p.wg.Add(1)
 	go p.manageWorkers()
+
+	// Наблюдатель за отменой ctx, переданного вызывающим кодом: доводит
+	// отмену до полноценного Close (Flush + закрытие соединения с брокером).
+	// Не входит в p.wg — иначе wg.Wait() в Close() ждал бы эту же горутину,
+	// которая сама вызывает Close() (self-deadlock/ложный timeout).
+	// Слушает p.closed, а не p.ctx, чтобы не запускать повторный Close()
+	// каждый раз, когда explicit Close() сам отменяет p.ctx.
+	go func() {
+		select {
+		case <-ctx.Done():
+			p.Close()
+		case <-p.closed:
+		}
+	}()
 
 	return p, nil
 }
@@ -281,7 +300,7 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) err
 		defer resultTimer.Stop()
 		select {
 		case <-ctx.Done():
-			return errors.New("context canceled")
+			return fmt.Errorf("context canceled: %w", ctx.Err())
 		case err := <-resultChan:
 			return err
 		case <-resultTimer.C:
@@ -292,7 +311,7 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) err
 	case <-worker.ctx.Done():
 		return errors.New("tenant worker unavailable")
 	case <-ctx.Done():
-		return errors.New("context canceled while queuing")
+		return fmt.Errorf("context canceled while queuing: %w", ctx.Err())
 	case <-enqueueTimer.C:
 		return errors.New("timeout queuing message to worker")
 	}
@@ -580,6 +599,9 @@ func (p *KafkaProducer) Close() {
 		p.logger.Warn("Kafka producer already in stopping state")
 		return
 	}
+	// Сигнализирует наблюдателю за ctx (см. NewKafkaProducer), что Close уже
+	// в процессе — второй вызов Close ему не нужен.
+	close(p.closed)
 
 	p.logger.Info("Starting kafka producer shutdown")
 

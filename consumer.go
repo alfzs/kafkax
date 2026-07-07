@@ -469,7 +469,7 @@ func (c *KafkaConsumer) runPartitionWorker(key workerKey, worker *partitionWorke
 			worker.updateActivity()
 			c.handleMessage(worker.ctx, msg)
 		case <-worker.ctx.Done():
-			drainCtx, cancel := context.WithTimeout(context.Background(), c.config.GracefulTimeout)
+			drainCtx, cancel := context.WithTimeout(context.WithoutCancel(worker.ctx), c.config.GracefulTimeout)
 			defer cancel()
 
 			for {
