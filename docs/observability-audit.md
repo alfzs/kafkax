@@ -1,6 +1,6 @@
 # Аудит observability (2026-07-07)
 
-> **Статус: все находки исправлены (2026-07-07).**
+> **Статус: все находки исправлены (2026-07-07, дополнено 2026-07-07).**
 
 Аудит покрытия пяти сигналов observability (логи, метрики, трейсинг, профилирование, RUM)
 для `consumer.go`, `producer.go`, `otel.go`, `config.go`.
@@ -81,3 +81,32 @@ RUM не применим — kafkax это backend-библиотека, а н�
   кардинальности (`topic`, `partition`, `offset`, `consumer_group`).
 - Ошибка не логируется и не возвращается одновременно — top-level логирование
   соблюдено.
+
+## Дополнение (2026-07-07): повторный аудит после находок 1-4
+
+### 5. ✅ Таблица метрик в README разошлась с именами инструментов в коде — исправлено
+
+Находки 2-4 выше переименовали/добавили OTel-инструменты
+(`newProducerMetrics`/`newConsumerMetrics`), но таблица метрик в `README.md`
+не была обновлена вслед за этим. Три строки называли не тот инструмент, три
+инструмента не были документированы вовсе:
+
+| В README (было) | На самом деле в коде |
+|---|---|
+| `kafkax.producer.active_workers` | `kafkax.producer.workers.active` |
+| `kafkax.consumer.active_workers` | `kafkax.consumer.workers.active` |
+| `kafkax.consumer.handler.duration` | `kafkax.consumer.processing.duration` |
+| — (не было) | `kafkax.producer.queue.depth` (Gauge) |
+| — (не было) | `kafkax.consumer.queue.depth` (Gauge) |
+| — (не было) | `kafkax.consumer.messages.retried` (Counter) |
+| — (не было) | `kafkax.consumer.commit.errors` (Counter) |
+
+Пользователь, ищущий метрику по README для PromQL-запроса или
+Grafana-дашборда, получил бы `no such metric`.
+
+**Фикс:** таблица метрик в README приведена в соответствие с
+`newProducerMetrics`/`newConsumerMetrics` (`producer.go:139`, `consumer.go:158`)
+— единственным источником истины для имён инструментов.
+
+Остальные сигналы (трейсинг, корреляция логов, кардинальность лейблов)
+перепроверены — без новых замечаний.

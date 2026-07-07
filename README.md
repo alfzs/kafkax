@@ -149,11 +149,15 @@ kafkax использует глобальные провайдеры `otel.GetT
 | `kafkax.producer.messages.sent` | Counter | Сообщения, успешно доставленные в Kafka |
 | `kafkax.producer.messages.failed` | Counter | Сообщения с ошибкой доставки |
 | `kafkax.producer.message.duration` | Histogram | Latency от `SendMessage` до delivery ack, мс |
-| `kafkax.producer.active_workers` | Gauge | Активные воркеры тенантов |
+| `kafkax.producer.workers.active` | UpDownCounter | Активные воркеры тенантов |
+| `kafkax.producer.queue.depth` | Gauge | Сообщения, ожидающие в очередях воркеров тенантов |
 | `kafkax.consumer.messages.processed` | Counter | Успешно обработанные и закоммиченные сообщения |
 | `kafkax.consumer.messages.failed` | Counter | Сообщения, пропущенные после исчерпания попыток |
-| `kafkax.consumer.handler.duration` | Histogram | Latency `ProcessMessage`, мс |
-| `kafkax.consumer.active_workers` | Gauge | Активные воркеры партиций |
+| `kafkax.consumer.messages.retried` | Counter | Повторные попытки обработчика |
+| `kafkax.consumer.processing.duration` | Histogram | Latency `ProcessMessage`, мс |
+| `kafkax.consumer.commit.errors` | Counter | Неудачные вызовы `CommitMessage` |
+| `kafkax.consumer.workers.active` | UpDownCounter | Активные воркеры партиций |
+| `kafkax.consumer.queue.depth` | Gauge | Сообщения, ожидающие в очередях воркеров партиций |
 
 ## Конфигурация
 
