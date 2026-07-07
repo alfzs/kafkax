@@ -63,7 +63,7 @@ type mockHandler struct {
 	returnErr error
 }
 
-func (h *mockHandler) ProcessMessage(_ context.Context, _ []byte) error {
+func (h *mockHandler) ProcessMessage(_ context.Context, _ IncomingMessage) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.calls++

@@ -1,3 +1,5 @@
+// Package kafkax предоставляет продюсер и консьюмер Kafka с изоляцией по
+// тенантам/партициям, OpenTelemetry-трейсингом и метриками "из коробки".
 package kafkax
 
 import (
@@ -35,10 +37,10 @@ func (c Config) Validate() error {
 	proto := strings.ToUpper(c.SecurityProtocol)
 	if proto == "SASL_PLAINTEXT" || proto == "SASL_SSL" {
 		if c.SASL.Username == "" {
-			return fmt.Errorf("KAFKAX_SASL_USERNAME required for security.protocol=%s", c.SecurityProtocol)
+			return fmt.Errorf("KAFKAX_SASL_USERNAME required for security.protocol=%q", c.SecurityProtocol)
 		}
 		if c.SASL.Password == "" {
-			return fmt.Errorf("KAFKAX_SASL_PASSWORD required for security.protocol=%s", c.SecurityProtocol)
+			return fmt.Errorf("KAFKAX_SASL_PASSWORD required for security.protocol=%q", c.SecurityProtocol)
 		}
 	}
 	return nil

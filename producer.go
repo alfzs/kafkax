@@ -24,7 +24,7 @@ import (
 )
 
 type tenantWorker struct {
-	messageChan  chan Message
+	messageChan  chan message
 	ctx          context.Context
 	cancel       context.CancelFunc
 	lastActivity time.Time
@@ -32,12 +32,26 @@ type tenantWorker struct {
 	mu           sync.Mutex
 }
 
-type Message struct {
+func (w *tenantWorker) updateActivity() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.lastActivity = time.Now()
+}
+
+func (w *tenantWorker) getLastActivity() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.lastActivity
+}
+
+// message — внутренняя единица очереди воркера тенанта, не часть публичного API.
+type message struct {
 	Ctx      context.Context
 	TenantID uuid.UUID
 	Topic    string
 	Key      []byte
 	Value    []byte
+	Headers  Headers
 	Result   chan error
 	Timeout  time.Duration
 }
@@ -81,13 +95,8 @@ type KafkaProducer struct {
 // Инициализирует OTel-инструменты (счётчики, гистограммы, gauge) и запускает
 // фоновую горутину сборщика неактивных воркеров. Возвращает ошибку при невалидной
 // конфигурации или невозможности подключиться к брокеру.
-func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error) {
-	const op = "new_kafka_producer"
-
-	if err := config.Validate(); err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
-	}
-
+// buildProducerKafkaConfig транслирует Config в kafka.ConfigMap для librdkafka.
+func buildProducerKafkaConfig(config Config) kafka.ConfigMap {
 	kafkaConfig := kafka.ConfigMap{
 		"bootstrap.servers":                     strings.Join(config.Brokers, ","),
 		"client.id":                             config.ClientID,
@@ -116,16 +125,11 @@ func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error
 		kafkaConfig["sasl.username"] = config.SASL.Username
 		kafkaConfig["sasl.password"] = config.SASL.Password
 	}
+	return kafkaConfig
+}
 
-	producer, err := kafka.NewProducer(&kafkaConfig)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
-	}
-
-	ctx, cancel := context.WithCancel(ctx)
-
-	meter := otel.Meter("github.com/alfzs/kafkax/producer")
-
+// newProducerMetrics регистрирует OTel-инструменты продюсера в переданном meter.
+func newProducerMetrics(meter metric.Meter) producerMetrics {
 	sent, _ := meter.Int64Counter("kafkax.producer.messages.sent",
 		metric.WithDescription("Total messages successfully delivered to Kafka"))
 	failed, _ := meter.Int64Counter("kafkax.producer.messages.failed",
@@ -135,6 +139,32 @@ func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error
 		metric.WithUnit("ms"))
 	workersActive, _ := meter.Int64UpDownCounter("kafkax.producer.workers.active",
 		metric.WithDescription("Number of active tenant worker goroutines"))
+
+	return producerMetrics{
+		sent:           sent,
+		failed:         failed,
+		messageLatency: latency,
+		workersActive:  workersActive,
+	}
+}
+
+func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error) {
+	const op = "new_kafka_producer"
+
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	kafkaConfig := buildProducerKafkaConfig(config)
+
+	producer, err := kafka.NewProducer(&kafkaConfig)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	meter := otel.Meter("github.com/alfzs/kafkax/producer")
 
 	p := &KafkaProducer{
 		producer:              producer,
@@ -150,12 +180,7 @@ func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error
 		messageChanBuffer:     config.Producer.MessageQueueSize,
 		tracer:                otel.Tracer("github.com/alfzs/kafkax/producer"),
 		propagator:            otel.GetTextMapPropagator(),
-		metrics: producerMetrics{
-			sent:           sent,
-			failed:         failed,
-			messageLatency: latency,
-			workersActive:  workersActive,
-		},
+		metrics:               newProducerMetrics(meter),
 	}
 
 	// Observable gauge: суммарная глубина очередей всех воркеров.
@@ -185,6 +210,15 @@ func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error
 	return p, nil
 }
 
+// PublishRequest описывает сообщение для отправки через SendMessage.
+type PublishRequest struct {
+	TenantID uuid.UUID
+	Topic    string
+	Key      []byte
+	Value    []byte
+	Headers  Headers
+}
+
 // SendMessage отправляет сообщение в указанный топик Kafka и блокируется до
 // получения delivery ack от брокера или истечения Config.Producer.MessageTimeout.
 //
@@ -198,30 +232,34 @@ func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error
 //   - "timeout queuing message to worker" — воркер переполнен
 //   - "timeout waiting for delivery ack" — брокер не ответил за MessageTimeout
 //   - "tenant worker unavailable" — воркер завершился во время постановки в очередь
-func (p *KafkaProducer) SendMessage(ctx context.Context, tenantID uuid.UUID, topic string, key, value []byte) error {
+func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) error {
 	if p.stopping.Load() {
 		return errors.New("producer is shutting down")
 	}
 
-	sc := trace.SpanFromContext(ctx).SpanContext()
-	log := p.logger.With(slog.String("tenant_id", tenantID.String()))
-	if sc.IsValid() {
+	if err := validateHeaders(req.Headers); err != nil {
+		return err
+	}
+
+	log := p.logger.With(slog.String("tenant_id", req.TenantID.String()))
+	if sc := trace.SpanFromContext(ctx).SpanContext(); sc.IsValid() {
 		log = log.With(slog.String("trace_id", sc.TraceID().String()))
 	}
 
 	resultChan := make(chan error, 1)
 
-	msg := Message{
+	msg := message{
 		Ctx:      ctx,
-		TenantID: tenantID,
-		Topic:    topic,
-		Key:      key,
-		Value:    value,
+		TenantID: req.TenantID,
+		Topic:    req.Topic,
+		Key:      req.Key,
+		Value:    req.Value,
+		Headers:  req.Headers,
 		Result:   resultChan,
 		Timeout:  p.messageTimeout,
 	}
 
-	worker, err := p.getOrCreateWorker(tenantID, log)
+	worker, err := p.getOrCreateWorker(req.TenantID, log)
 	if err != nil {
 		return err
 	}
@@ -290,7 +328,7 @@ func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logge
 
 	workerCtx, cancel := context.WithCancel(p.ctx)
 	worker = &tenantWorker{
-		messageChan:  make(chan Message, p.messageChanBuffer),
+		messageChan:  make(chan message, p.messageChanBuffer),
 		ctx:          workerCtx,
 		cancel:       cancel,
 		lastActivity: time.Now(),
@@ -358,7 +396,7 @@ func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker, logg
 // handleMessage вызывает produce и доставляет результат в msg.Result.
 // Если вызывающая сторона не читает resultChan (контекст отменён или таймаут),
 // результат отбрасывается с предупреждением — produce уже завершился.
-func (p *KafkaProducer) handleMessage(msg Message, logger *slog.Logger) {
+func (p *KafkaProducer) handleMessage(msg message, logger *slog.Logger) {
 	err := p.produce(msg)
 
 	timer := time.NewTimer(msg.Timeout)
@@ -390,8 +428,8 @@ func (p *KafkaProducer) handleMessage(msg Message, logger *slog.Logger) {
 // и завершить воркеры до вызова producer.Close(). Сообщение при этом могло
 // уже попасть в очередь librdkafka и будет доставлено через Flush() —
 // возврат ошибки не гарантирует недоставку.
-func (p *KafkaProducer) produce(msg Message) (err error) {
-	headers := make([]kafka.Header, 0, 4)
+func (p *KafkaProducer) produce(msg message) (err error) {
+	headers := toKafkaHeaders(msg.Headers)
 
 	// Создаём producer-span и инжектируем trace context в headers.
 	ctx, span := p.tracer.Start(msg.Ctx, msg.Topic+" publish",
@@ -572,16 +610,4 @@ func (p *KafkaProducer) Close() {
 
 	p.producer.Close()
 	p.logger.Info("Kafka producer shutdown completed")
-}
-
-func (w *tenantWorker) updateActivity() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.lastActivity = time.Now()
-}
-
-func (w *tenantWorker) getLastActivity() time.Time {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.lastActivity
 }

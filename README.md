@@ -8,11 +8,29 @@ Go-клиент Kafka с изоляцией по тенантам (продюс�
 go get github.com/alfzs/kafkax
 ```
 
-Требует CGO и установленной librdkafka. confluent-kafka-go поставляет prebuilt-версию:
+Требует CGO (`CGO_ENABLED=1` и C-компилятор) для сборки — зависимость тянет
+`github.com/confluentinc/confluent-kafka-go/v2`:
 
 ```bash
 go get github.com/confluentinc/confluent-kafka-go/v2
 ```
+
+Отдельно устанавливать `librdkafka` в системе **не нужно**: по умолчанию
+confluent-kafka-go линкует в бинарник собственную бандлированную статическую
+сборку librdkafka. Поэтому C-компилятор и заголовки нужны только на этапе
+сборки (build-стадия multi-stage Dockerfile) — в рантайм-образ их тащить не
+надо.
+
+Нюансы:
+- Финальный образ всё равно должен быть на glibc-дистрибутиве (Debian/Ubuntu
+  и т.п.) — часть функций cgo (`getaddrinfo` и т.п.) требует shared glibc
+  даже при статической линковке librdkafka. `FROM scratch` не подойдёт.
+- Для Alpine (musl) добавьте `-tags musl` к `go build`/`go get` — без него
+  бинарник, собранный под glibc, на musl не запустится.
+- `-tags dynamic` переключает на динамическую линковку системной
+  librdkafka — в этом случае она должна быть установлена отдельно
+  (`apt-get install librdkafka-dev` и т.п.), но по умолчанию kafkax этот
+  тег не использует.
 
 ## Быстрый старт
 
@@ -36,17 +54,31 @@ if err != nil {
 }
 defer producer.Close()
 
-err = producer.SendMessage(ctx, tenantID, "orders", nil, payload)
+err = producer.SendMessage(ctx, kafkax.PublishRequest{
+    TenantID: tenantID,
+    Topic:    "orders",
+    Value:    payload,
+    Headers: kafkax.Headers{
+        {Key: "signature", Value: signature},
+    },
+})
 ```
+
+Ключи `traceparent`, `tracestate`, `baggage` зарезервированы под W3C trace
+propagation — `SendMessage` вернёт ошибку, если один из них встретится в
+`PublishRequest.Headers`.
 
 ### Консьюмер
 
 ```go
 type orderHandler struct{}
 
-func (h *orderHandler) ProcessMessage(ctx context.Context, data []byte) error {
+func (h *orderHandler) ProcessMessage(ctx context.Context, msg kafkax.IncomingMessage) error {
     // ctx содержит OTel-span — используй его для дочерних операций
-    order, err := encoding.UnmarshalProto[pb.Order](data)
+    if sig, ok := msg.Headers.Get("signature"); ok {
+        // проверка подписи
+    }
+    order, err := encoding.UnmarshalProto[pb.Order](msg.Value)
     if err != nil {
         return err
     }
@@ -224,8 +256,8 @@ KAFKAX_SASL_PASSWORD=secret
 ```go
 import "github.com/alfzs/kafkax/encoding"
 
-func (h *handler) ProcessMessage(_ context.Context, data []byte) error {
-    order, err := encoding.UnmarshalProto[pb.OrderCreated](data)
+func (h *handler) ProcessMessage(_ context.Context, msg kafkax.IncomingMessage) error {
+    order, err := encoding.UnmarshalProto[pb.OrderCreated](msg.Value)
     if err != nil {
         return err
     }

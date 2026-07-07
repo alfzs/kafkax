@@ -91,13 +91,36 @@ func TestKafkaProducer_SendMessage_WhenStopping(t *testing.T) {
 	p.Close()
 
 	t.Log("пытаемся отправить сообщение в остановленный продюсер")
-	err := p.SendMessage(context.Background(), uuid.New(), "test-topic", nil, []byte("data"))
+	err := p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: "test-topic", Value: []byte("data")})
 
 	if err == nil {
 		t.Fatal("SendMessage() в остановленный продюсер вернул nil, ожидалась ошибка")
 	}
 	if !strings.Contains(err.Error(), "shutting down") {
 		t.Fatalf("SendMessage() error=%q, ожидалась ошибка с 'shutting down'", err.Error())
+	}
+	t.Logf("получена ожидаемая ошибка: %q ✓", err.Error())
+}
+
+// TestKafkaProducer_SendMessage_ReservedHeaderKey проверяет, что SendMessage
+// отклоняет заголовки с именами, зарезервированными под trace propagation.
+func TestKafkaProducer_SendMessage_ReservedHeaderKey(t *testing.T) {
+	t.Parallel()
+
+	p := mustNewProducer(t)
+
+	err := p.SendMessage(context.Background(), PublishRequest{
+		TenantID: uuid.New(),
+		Topic:    "test-topic",
+		Value:    []byte("data"),
+		Headers:  Headers{{Key: "traceparent", Value: []byte("x")}},
+	})
+
+	if err == nil {
+		t.Fatal("SendMessage() с заголовком 'traceparent' вернул nil, ожидалась ошибка")
+	}
+	if !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("SendMessage() error=%q, ожидалась ошибка про зарезервированный ключ", err.Error())
 	}
 	t.Logf("получена ожидаемая ошибка: %q ✓", err.Error())
 }
@@ -113,7 +136,7 @@ func TestKafkaProducer_SendMessage_ContextCanceled(t *testing.T) {
 	t.Log("отменяем контекст до вызова SendMessage")
 	cancel()
 
-	err := p.SendMessage(ctx, uuid.New(), "test-topic", nil, []byte("data"))
+	err := p.SendMessage(ctx, PublishRequest{TenantID: uuid.New(), Topic: "test-topic", Value: []byte("data")})
 
 	if err == nil {
 		t.Fatal("SendMessage() с отменённым контекстом вернул nil, ожидалась ошибка")
@@ -132,7 +155,7 @@ func TestKafkaProducer_SendMessage_BrokerUnavailable(t *testing.T) {
 	p := mustNewProducer(t)
 	t.Logf("отправляем сообщение на недоступный брокер (ждём таймаут ~%s)", testConfig().Producer.MessageTimeout)
 
-	err := p.SendMessage(context.Background(), uuid.New(), "test-topic", nil, []byte("hello"))
+	err := p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: "test-topic", Value: []byte("hello")})
 
 	if err == nil {
 		// Если брокер случайно оказался доступен — тест некорректен.
@@ -174,8 +197,7 @@ func TestKafkaProducer_ContextCancel_TriggersShutdown(t *testing.T) {
 	cancel()
 
 	t.Log("проверяем, что SendMessage возвращает ошибку после отмены контекста")
-	sendErr := p.SendMessage(context.Background(), uuid.New(), "test-topic", nil, []byte("x"))
-	if sendErr == nil {
+	if sendErr := p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: "test-topic", Value: []byte("x")}); sendErr == nil {
 		t.Log("предупреждение: SendMessage не вернул ошибку немедленно после cancel() — возможна гонка")
 	} else {
 		t.Logf("SendMessage после cancel() вернул: %q ✓", sendErr.Error())

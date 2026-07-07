@@ -20,6 +20,16 @@ import (
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
 
+// IncomingMessage — сообщение Kafka, переданное в consumerHandler.
+type IncomingMessage struct {
+	Topic     string
+	Partition int32
+	Offset    int64
+	Key       []byte
+	Value     []byte
+	Headers   Headers
+}
+
 // consumerHandler — интерфейс обработчика сообщений Kafka.
 // Реализуется пользователем библиотеки и регистрируется через AddHandler.
 // ctx содержит OTel-span (SpanKind=Consumer) и может быть отменён при остановке консьюмера.
@@ -28,7 +38,7 @@ type consumerHandler interface {
 	// При возврате ошибки вызов будет повторён до HandlerMaxRetries раз.
 	// Если сообщение не может быть обработано, следует вернуть ошибку —
 	// после исчерпания попыток offset будет закоммичен и сообщение пропущено.
-	ProcessMessage(ctx context.Context, data []byte) error
+	ProcessMessage(ctx context.Context, msg IncomingMessage) error
 }
 
 type partitionWorker struct {
@@ -38,6 +48,18 @@ type partitionWorker struct {
 	lastActivity time.Time
 	inFlight     int64 // atomic: число processMessage, держащих ссылку на этот воркер
 	mu           sync.Mutex
+}
+
+func (w *partitionWorker) updateActivity() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.lastActivity = time.Now()
+}
+
+func (w *partitionWorker) getLastActivity() time.Time {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.lastActivity
 }
 
 type workerKey struct {
@@ -88,13 +110,8 @@ type KafkaConsumer struct {
 // Инициализирует соединение с брокером, OTel-инструменты и внутренний контекст.
 // Горутины запускаются только при вызове Start; NewKafkaConsumer безопасен сам по себе.
 // Возвращает ошибку при невалидной конфигурации или невозможности инициализировать клиент Kafka.
-func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
-	op := "new_kafka_consumer"
-
-	if err := config.Validate(); err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
-	}
-
+// buildConsumerKafkaConfig транслирует Config в kafka.ConfigMap для librdkafka.
+func buildConsumerKafkaConfig(config Config) kafka.ConfigMap {
 	kafkaConfig := kafka.ConfigMap{
 		"bootstrap.servers":                     strings.Join(config.Brokers, ","),
 		"client.id":                             config.ClientID,
@@ -123,18 +140,11 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 		kafkaConfig["sasl.username"] = config.SASL.Username
 		kafkaConfig["sasl.password"] = config.SASL.Password
 	}
+	return kafkaConfig
+}
 
-	consumer, err := kafka.NewConsumer(&kafkaConfig)
-	if err != nil {
-		return nil, fmt.Errorf("%s: kafka consumer failed init: %w", op, err)
-	}
-
-	// ctx/cancel инициализируются здесь, а не только в Start(),
-	// чтобы Stop() не паниковал при вызове без предшествующего Start().
-	ctx, cancel := context.WithCancel(context.Background())
-
-	meter := otel.Meter("github.com/alfzs/kafkax/consumer")
-
+// newConsumerMetrics регистрирует OTel-инструменты консьюмера в переданном meter.
+func newConsumerMetrics(meter metric.Meter) consumerMetrics {
 	processed, _ := meter.Int64Counter("kafkax.consumer.messages.processed",
 		metric.WithDescription("Total messages successfully processed and committed"))
 	failed, _ := meter.Int64Counter("kafkax.consumer.messages.failed",
@@ -148,6 +158,36 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 		metric.WithDescription("Total failed CommitMessage calls"))
 	workersActive, _ := meter.Int64UpDownCounter("kafkax.consumer.workers.active",
 		metric.WithDescription("Number of active partition worker goroutines"))
+
+	return consumerMetrics{
+		processed:      processed,
+		failed:         failed,
+		retried:        retried,
+		processingTime: procTime,
+		commitErrors:   commitErrors,
+		workersActive:  workersActive,
+	}
+}
+
+func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
+	op := "new_kafka_consumer"
+
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	kafkaConfig := buildConsumerKafkaConfig(config)
+
+	consumer, err := kafka.NewConsumer(&kafkaConfig)
+	if err != nil {
+		return nil, fmt.Errorf("%s: kafka consumer failed init: %w", op, err)
+	}
+
+	// ctx/cancel инициализируются здесь, а не только в Start(),
+	// чтобы Stop() не паниковал при вызове без предшествующего Start().
+	ctx, cancel := context.WithCancel(context.Background())
+
+	meter := otel.Meter("github.com/alfzs/kafkax/consumer")
 
 	c := &KafkaConsumer{
 		consumer:              consumer,
@@ -166,14 +206,7 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 		stopCleanup:           make(chan struct{}),
 		tracer:                otel.Tracer("github.com/alfzs/kafkax/consumer"),
 		propagator:            otel.GetTextMapPropagator(),
-		metrics: consumerMetrics{
-			processed:      processed,
-			failed:         failed,
-			retried:        retried,
-			processingTime: procTime,
-			commitErrors:   commitErrors,
-			workersActive:  workersActive,
-		},
+		metrics:               newConsumerMetrics(meter),
 	}
 
 	// Observable gauge: глубина очередей по партициям.
@@ -203,7 +236,7 @@ func (c *KafkaConsumer) AddHandler(topic string, handler consumerHandler) error 
 	defer c.handlersMu.Unlock()
 
 	if _, ok := c.handlers[topic]; ok {
-		return fmt.Errorf("handler for topic %s already registered", topic)
+		return fmt.Errorf("handler for topic %q already registered", topic)
 	}
 
 	c.handlers[topic] = handler
@@ -498,12 +531,21 @@ func (c *KafkaConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
 		attribute.String("topic", topic),
 		attribute.String("consumer_group", c.config.Consumer.Group))
 
+	incoming := IncomingMessage{
+		Topic:     topic,
+		Partition: msg.TopicPartition.Partition,
+		Offset:    int64(msg.TopicPartition.Offset),
+		Key:       msg.Key,
+		Value:     msg.Value,
+		Headers:   fromKafkaHeaders(msg.Headers),
+	}
+
 	maxRetries := c.config.Consumer.HandlerMaxRetries
 	start := time.Now()
 	var handlerErr error
 
 	for attempt := 1; ; attempt++ {
-		if err := handler.ProcessMessage(ctx, msg.Value); err != nil {
+		if err := handler.ProcessMessage(ctx, incoming); err != nil {
 			handlerErr = err
 
 			if maxRetries > 0 && attempt >= maxRetries {
@@ -659,16 +701,4 @@ func (c *KafkaConsumer) Stop() {
 	}
 
 	c.logger.Info("Kafka consumer shutdown completed")
-}
-
-func (w *partitionWorker) updateActivity() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.lastActivity = time.Now()
-}
-
-func (w *partitionWorker) getLastActivity() time.Time {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.lastActivity
 }
