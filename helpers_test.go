@@ -7,6 +7,17 @@ import (
 	"time"
 )
 
+// Общие тестовые значения для конфигов с невалидным/минимальным набором полей
+// (TestNewKafkaProducer_InvalidConfig, TestNewKafkaConsumer_InvalidConfig,
+// TestConfig_Validate, TestBuildProducerKafkaConfig/TestBuildConsumerKafkaConfig).
+const (
+	testInvalidBroker   = "localhost:9092"
+	testInvalidClientID = "test"
+	testSASLUser        = "user"
+	testSASLPassword    = "secret"
+	testTopic           = "test-topic"
+)
+
 // testConfig возвращает конфигурацию с короткими таймаутами для unit-тестов.
 // Указывает несуществующий брокер — librdkafka подключается лениво, поэтому
 // структурные и поведенческие тесты не требуют работающего Kafka.
@@ -14,7 +25,7 @@ func testConfig() Config {
 	return Config{
 		Brokers:          []string{"localhost:29092"},
 		ClientID:         "kafkax-unit-test",
-		SecurityProtocol: "PLAINTEXT",
+		SecurityProtocol: SecurityProtocolPlaintext,
 		GracefulTimeout:  2 * time.Second,
 		Producer: Producer{
 			RequiredAcks:          1,
@@ -67,20 +78,24 @@ type mockHandler struct {
 func (h *mockHandler) ProcessMessage(_ context.Context, msg IncomingMessage) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
 	h.calls++
 	h.lastMsg = msg
+
 	return h.returnErr
 }
 
 func (h *mockHandler) callCount() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
 	return h.calls
 }
 
 func (h *mockHandler) lastMessage() IncomingMessage {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
 	return h.lastMsg
 }
 
@@ -88,12 +103,15 @@ func (h *mockHandler) lastMessage() IncomingMessage {
 // Пропускает тест, если librdkafka не может инициализировать клиент.
 func mustNewProducer(t *testing.T) *KafkaProducer {
 	t.Helper()
+
 	p, err := NewKafkaProducer(context.Background(), testConfig())
 	if err != nil {
 		t.Skipf("пропуск: не удалось создать продюсер (librdkafka): %v", err)
 	}
+
 	t.Cleanup(p.Close)
 	t.Logf("продюсер создан: client_id=%s broker=%s", testConfig().ClientID, testConfig().Brokers[0])
+
 	return p
 }
 
@@ -107,6 +125,7 @@ func fastCommitConfig() Config {
 	cfg.Consumer.SessionTimeout = time.Second
 	cfg.Consumer.SocketTimeout = time.Second
 	cfg.Consumer.HeartbeatInterval = 300 * time.Millisecond
+
 	return cfg
 }
 
@@ -114,12 +133,15 @@ func fastCommitConfig() Config {
 // Пропускает тест, если librdkafka не может инициализировать клиент.
 func mustNewConsumer(t *testing.T) *KafkaConsumer {
 	t.Helper()
+
 	c, err := NewKafkaConsumer(testConfig())
 	if err != nil {
 		t.Skipf("пропуск: не удалось создать консьюмер (librdkafka): %v", err)
 	}
+
 	t.Cleanup(c.Stop)
 	t.Logf("консьюмер создан: group=%s broker=%s", testConfig().Consumer.Group, testConfig().Brokers[0])
+
 	return c
 }
 
@@ -127,11 +149,14 @@ func mustNewConsumer(t *testing.T) *KafkaConsumer {
 // (например, fastCommitConfig() для тестов, вызывающих handleMessage напрямую).
 func mustNewConsumerWithConfig(t *testing.T, cfg Config) *KafkaConsumer {
 	t.Helper()
+
 	c, err := NewKafkaConsumer(cfg)
 	if err != nil {
 		t.Skipf("пропуск: не удалось создать консьюмер (librdkafka): %v", err)
 	}
+
 	t.Cleanup(c.Stop)
 	t.Logf("консьюмер создан: group=%s broker=%s", cfg.Consumer.Group, cfg.Brokers[0])
+
 	return c
 }

@@ -58,6 +58,7 @@ func runGaugeFailureSubprocess(t *testing.T, testName string) {
 	if err != nil {
 		t.Fatalf("subprocess %s завершился с ошибкой: %v\nвывод:\n%s", testName, err, out)
 	}
+
 	t.Logf("subprocess %s вывод:\n%s", testName, out)
 }
 
@@ -66,6 +67,7 @@ func runGaugeFailureSubprocess(t *testing.T, testName string) {
 // обёрнутую ошибку.
 func TestNewKafkaProducer_GaugeRegistrationError(t *testing.T) {
 	t.Parallel()
+
 	if os.Getenv(gaugeFailureSubprocessEnv) != "TestNewKafkaProducer_GaugeRegistrationError" {
 		runGaugeFailureSubprocess(t, "TestNewKafkaProducer_GaugeRegistrationError")
 		return
@@ -78,10 +80,12 @@ func TestNewKafkaProducer_GaugeRegistrationError(t *testing.T) {
 		fmt.Fprintln(os.Stderr, "NewKafkaProducer() с MeterProvider, форсирующим ошибку gauge, вернул nil, ожидалась ошибка")
 		os.Exit(1)
 	}
+
 	if !strings.Contains(err.Error(), "registering queue depth gauge") {
 		fmt.Fprintf(os.Stderr, "NewKafkaProducer() error=%q не содержит ожидаемый контекст про gauge\n", err.Error())
 		os.Exit(1)
 	}
+
 	fmt.Printf("NewKafkaProducer() корректно вернул ошибку регистрации gauge: %v\n", err)
 }
 
@@ -89,6 +93,7 @@ func TestNewKafkaProducer_GaugeRegistrationError(t *testing.T) {
 // errors.Join(err, consumer.Close()) в NewKafkaConsumer.
 func TestNewKafkaConsumer_GaugeRegistrationError(t *testing.T) {
 	t.Parallel()
+
 	if os.Getenv(gaugeFailureSubprocessEnv) != "TestNewKafkaConsumer_GaugeRegistrationError" {
 		runGaugeFailureSubprocess(t, "TestNewKafkaConsumer_GaugeRegistrationError")
 		return
@@ -101,9 +106,11 @@ func TestNewKafkaConsumer_GaugeRegistrationError(t *testing.T) {
 		fmt.Fprintln(os.Stderr, "NewKafkaConsumer() с MeterProvider, форсирующим ошибку gauge, вернул nil, ожидалась ошибка")
 		os.Exit(1)
 	}
+
 	if !strings.Contains(err.Error(), "registering queue depth gauge") {
 		fmt.Fprintf(os.Stderr, "NewKafkaConsumer() error=%q не содержит ожидаемый контекст про gauge\n", err.Error())
 		os.Exit(1)
 	}
+
 	fmt.Printf("NewKafkaConsumer() корректно вернул ошибку регистрации gauge: %v\n", err)
 }

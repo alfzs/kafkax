@@ -1,3 +1,5 @@
+// Package encoding предоставляет обёртки десериализации сообщений поверх
+// стандартных форматов кодирования, используемых kafkax.
 package encoding
 
 import (
@@ -18,5 +20,6 @@ func UnmarshalProto[T any, PT interface {
 	if err := proto.Unmarshal(data, msg); err != nil {
 		return nil, fmt.Errorf("proto unmarshal: %w", err)
 	}
+
 	return msg, nil
 }

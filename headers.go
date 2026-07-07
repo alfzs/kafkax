@@ -23,17 +23,25 @@ func (h Headers) Get(key string) ([]byte, bool) {
 			return kv.Value, true
 		}
 	}
+
 	return nil, false
 }
 
-// reservedHeaderKeys — имена заголовков, которыми управляет OTel-propagator
-// (см. produce() в producer.go). Пользовательские заголовки с этими именами
-// запрещены, чтобы не терять данные при молчаливой перезаписи в
-// kafkaHeaderCarrier.Set.
+// Имена заголовков W3C Trace Context/Baggage, которыми управляет
+// OTel-propagator (см. produce() в producer.go).
+const (
+	headerKeyTraceparent = "traceparent"
+	headerKeyTracestate  = "tracestate"
+	headerKeyBaggage     = "baggage"
+)
+
+// reservedHeaderKeys — имена заголовков, которыми управляет OTel-propagator.
+// Пользовательские заголовки с этими именами запрещены, чтобы не терять
+// данные при молчаливой перезаписи в kafkaHeaderCarrier.Set.
 var reservedHeaderKeys = map[string]struct{}{
-	"traceparent": {},
-	"tracestate":  {},
-	"baggage":     {},
+	headerKeyTraceparent: {},
+	headerKeyTracestate:  {},
+	headerKeyBaggage:     {},
 }
 
 // validateHeaders возвращает ошибку, если headers содержат зарезервированное
@@ -44,6 +52,7 @@ func validateHeaders(headers Headers) error {
 			return fmt.Errorf("header key %q is reserved for trace propagation", h.Key)
 		}
 	}
+
 	return nil
 }
 
@@ -54,6 +63,7 @@ func toKafkaHeaders(headers Headers) []kafka.Header {
 	for _, h := range headers {
 		out = append(out, kafka.Header{Key: h.Key, Value: h.Value})
 	}
+
 	return out
 }
 
@@ -64,5 +74,6 @@ func fromKafkaHeaders(headers []kafka.Header) Headers {
 	for _, h := range headers {
 		out = append(out, Header{Key: h.Key, Value: h.Value})
 	}
+
 	return out
 }

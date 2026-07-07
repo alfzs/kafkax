@@ -24,23 +24,23 @@ func TestNewKafkaConsumer_InvalidConfig(t *testing.T) {
 		{
 			name: "SASL_PLAINTEXT без credentials",
 			config: Config{
-				Brokers:          []string{"localhost:9092"},
-				ClientID:         "test",
-				SecurityProtocol: "SASL_PLAINTEXT",
+				Brokers:          []string{testInvalidBroker},
+				ClientID:         testInvalidClientID,
+				SecurityProtocol: SecurityProtocolSASLPlaintext,
 				Consumer:         testConfig().Consumer,
 			},
-			errContains: "KAFKAX_SASL_USERNAME",
+			errContains: envKeySASLUsername,
 		},
 		{
 			name: "SASL_SSL только с username",
 			config: Config{
-				Brokers:          []string{"localhost:9092"},
-				ClientID:         "test",
-				SecurityProtocol: "SASL_SSL",
-				SASL:             SASL{Username: "user"},
+				Brokers:          []string{testInvalidBroker},
+				ClientID:         testInvalidClientID,
+				SecurityProtocol: SecurityProtocolSASLSSL,
+				SASL:             SASL{Username: testSASLUser},
 				Consumer:         testConfig().Consumer,
 			},
-			errContains: "KAFKAX_SASL_PASSWORD",
+			errContains: envKeySASLPassword,
 		},
 	}
 
@@ -50,14 +50,15 @@ func TestNewKafkaConsumer_InvalidConfig(t *testing.T) {
 			t.Logf("попытка создать консьюмер с невалидным конфигом: %s", tc.name)
 
 			c, err := NewKafkaConsumer(tc.config)
-
 			if err == nil {
 				c.Stop()
 				t.Fatalf("NewKafkaConsumer() вернул nil-ошибку, ожидалась ошибка содержащая %q", tc.errContains)
 			}
+
 			if !strings.Contains(err.Error(), tc.errContains) {
 				t.Fatalf("NewKafkaConsumer() error=%q не содержит %q", err.Error(), tc.errContains)
 			}
+
 			t.Logf("получена ожидаемая ошибка: %v ✓", err)
 		})
 	}
@@ -77,6 +78,7 @@ func TestNewKafkaConsumer_Success(t *testing.T) {
 	if c == nil {
 		t.Fatal("NewKafkaConsumer() вернул nil без ошибки")
 	}
+
 	t.Log("консьюмер создан успешно ✓")
 }
 
@@ -90,10 +92,10 @@ func TestKafkaConsumer_AddHandler(t *testing.T) {
 		handler := &mockHandler{}
 
 		err := c.AddHandler("orders", handler)
-
 		if err != nil {
 			t.Fatalf("AddHandler(orders) вернул неожиданную ошибку: %v", err)
 		}
+
 		t.Log("AddHandler(orders) успешно зарегистрировал обработчик ✓")
 	})
 
@@ -103,16 +105,18 @@ func TestKafkaConsumer_AddHandler(t *testing.T) {
 		handler := &mockHandler{}
 
 		_ = c.AddHandler("payments", handler)
+
 		t.Log("первая регистрация payments выполнена")
 
 		err := c.AddHandler("payments", handler)
-
 		if err == nil {
 			t.Fatal("AddHandler(payments) повторно вернул nil, ожидалась ошибка дублирования")
 		}
+
 		if !strings.Contains(err.Error(), "payments") {
 			t.Fatalf("ошибка дублирования %q не упоминает топик %q", err.Error(), "payments")
 		}
+
 		t.Logf("повторная регистрация вернула ожидаемую ошибку: %v ✓", err)
 	})
 
@@ -126,6 +130,7 @@ func TestKafkaConsumer_AddHandler(t *testing.T) {
 				t.Fatalf("AddHandler(%q) вернул неожиданную ошибку: %v", topic, err)
 			}
 		}
+
 		t.Logf("все %d обработчиков зарегистрированы без ошибок ✓", len(topics))
 	})
 }
@@ -140,24 +145,25 @@ func TestKafkaConsumer_SubscribeAll(t *testing.T) {
 		t.Log("вызываем SubscribeAll без предварительного AddHandler")
 
 		err := c.SubscribeAll()
-
 		if err == nil {
 			t.Fatal("SubscribeAll() без обработчиков вернул nil, ожидалась ошибка")
 		}
+
 		t.Logf("получена ожидаемая ошибка: %v ✓", err)
 	})
 
 	t.Run("с зарегистрированными обработчиками не возвращает ошибку", func(t *testing.T) {
 		t.Parallel()
 		c := mustNewConsumer(t)
-		_ = c.AddHandler("test-topic", &mockHandler{})
+		_ = c.AddHandler(testTopic, &mockHandler{})
+
 		t.Log("вызываем SubscribeAll после AddHandler")
 
 		err := c.SubscribeAll()
-
 		if err != nil {
 			t.Fatalf("SubscribeAll() вернул неожиданную ошибку: %v", err)
 		}
+
 		t.Log("SubscribeAll() успешно подписался на зарегистрированные топики ✓")
 	})
 }
@@ -172,10 +178,10 @@ func TestKafkaConsumer_Start_Errors(t *testing.T) {
 		t.Log("вызываем Start() без предварительного AddHandler")
 
 		err := c.Start(context.Background())
-
 		if err == nil {
 			t.Fatal("Start() без обработчиков вернул nil, ожидалась ошибка")
 		}
+
 		t.Logf("Start() без обработчиков вернул ожидаемую ошибку: %v ✓", err)
 	})
 
@@ -186,19 +192,22 @@ func TestKafkaConsumer_Start_Errors(t *testing.T) {
 		_ = c.SubscribeAll()
 
 		t.Log("первый вызов Start()")
+
 		if err := c.Start(context.Background()); err != nil {
 			t.Skipf("пропуск: первый Start() завершился с ошибкой: %v", err)
 		}
 
 		t.Log("второй вызов Start() — должен вернуть ошибку")
-		err := c.Start(context.Background())
 
+		err := c.Start(context.Background())
 		if err == nil {
 			t.Fatal("второй Start() вернул nil, ожидалась ошибка 'already started'")
 		}
+
 		if !strings.Contains(err.Error(), "already started") {
 			t.Fatalf("второй Start() error=%q, ожидалось 'already started'", err.Error())
 		}
+
 		t.Logf("второй Start() вернул ожидаемую ошибку: %q ✓", err.Error())
 	})
 }
@@ -241,6 +250,7 @@ func TestKafkaConsumer_HandleMessage_RetriesAndSkipsAfterMaxRetries(t *testing.T
 	c := mustNewConsumerWithConfig(t, fastCommitConfig())
 
 	handler := &mockHandler{returnErr: errors.New("boom")}
+
 	topic := "retry-topic"
 	if err := c.AddHandler(topic, handler); err != nil {
 		t.Fatalf("AddHandler() вернул неожиданную ошибку: %v", err)
@@ -252,6 +262,7 @@ func TestKafkaConsumer_HandleMessage_RetriesAndSkipsAfterMaxRetries(t *testing.T
 	}
 
 	done := make(chan struct{})
+
 	go func() {
 		c.handleMessage(context.Background(), msg)
 		close(done)
@@ -269,6 +280,7 @@ func TestKafkaConsumer_HandleMessage_RetriesAndSkipsAfterMaxRetries(t *testing.T
 	if calls := handler.callCount(); calls != maxRetries {
 		t.Fatalf("ProcessMessage вызван %d раз(а), ожидалось ровно HandlerMaxRetries=%d", calls, maxRetries)
 	}
+
 	t.Logf("handleMessage() вызвал ProcessMessage ровно %d раз перед skip ✓", maxRetries)
 }
 
@@ -282,6 +294,7 @@ func TestKafkaConsumer_HandleMessage_HeadersRoundTrip(t *testing.T) {
 	c := mustNewConsumerWithConfig(t, fastCommitConfig())
 
 	handler := &mockHandler{}
+
 	topic := "headers-roundtrip"
 	if err := c.AddHandler(topic, handler); err != nil {
 		t.Fatalf("AddHandler() вернул неожиданную ошибку: %v", err)
@@ -295,6 +308,7 @@ func TestKafkaConsumer_HandleMessage_HeadersRoundTrip(t *testing.T) {
 	}
 
 	done := make(chan struct{})
+
 	go func() {
 		c.handleMessage(context.Background(), msg)
 		close(done)
@@ -312,6 +326,7 @@ func TestKafkaConsumer_HandleMessage_HeadersRoundTrip(t *testing.T) {
 	if !ok || string(got) != "order-123" {
 		t.Fatalf("IncomingMessage.Headers.Get(%q) = %q, %v, ожидалось %q, true", "x-order-id", got, ok, "order-123")
 	}
+
 	t.Log("пользовательский заголовок дошёл до handler через toKafkaHeaders → fromKafkaHeaders ✓")
 }
 
@@ -330,6 +345,7 @@ func TestKafkaConsumer_StartContextCancel_StopsLoopsWithoutClose(t *testing.T) {
 	if err := c.AddHandler("ctx-cancel-topic", handler); err != nil {
 		t.Fatalf("AddHandler() вернул неожиданную ошибку: %v", err)
 	}
+
 	if err := c.SubscribeAll(); err != nil {
 		t.Fatalf("SubscribeAll() вернул неожиданную ошибку: %v", err)
 	}
@@ -343,6 +359,7 @@ func TestKafkaConsumer_StartContextCancel_StopsLoopsWithoutClose(t *testing.T) {
 	cancel()
 
 	done := make(chan struct{})
+
 	go func() {
 		c.Stop()
 		close(done)
@@ -370,6 +387,7 @@ func TestKafkaConsumer_ConcurrentStop(t *testing.T) {
 			c.Stop()
 		})
 	}
+
 	wg.Wait()
 
 	t.Log("конкурентные Stop() завершились без гонок и паник ✓")

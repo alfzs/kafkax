@@ -43,7 +43,8 @@ type consumerHandler interface {
 }
 
 type partitionWorker struct {
-	messageChan  chan *kafka.Message
+	messageChan chan *kafka.Message
+	//nolint:containedctx // lifecycle-контекст воркера (аналог BaseContext), не запросный — см. docs/context-audit.md
 	ctx          context.Context
 	cancel       context.CancelFunc
 	lastActivity time.Time
@@ -54,12 +55,14 @@ type partitionWorker struct {
 func (w *partitionWorker) updateActivity() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
 	w.lastActivity = time.Now()
 }
 
 func (w *partitionWorker) getLastActivity() time.Time {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
 	return w.lastActivity
 }
 
@@ -82,14 +85,15 @@ type consumerMetrics struct {
 // параллельную обработку сообщений из разных партиций при сохранении порядка внутри одной.
 // Безопасен для конкурентного использования из нескольких горутин.
 type KafkaConsumer struct {
-	consumer              *kafka.Consumer
-	config                Config
-	logger                *slog.Logger
-	handlers              map[string]consumerHandler
-	handlersMu            sync.RWMutex
-	workers               map[workerKey]*partitionWorker
-	workersMu             sync.RWMutex
-	wg                    sync.WaitGroup
+	consumer   *kafka.Consumer
+	config     Config
+	logger     *slog.Logger
+	handlers   map[string]consumerHandler
+	handlersMu sync.RWMutex
+	workers    map[workerKey]*partitionWorker
+	workersMu  sync.RWMutex
+	wg         sync.WaitGroup
+	//nolint:containedctx // lifecycle-контекст компонента (аналог BaseContext), не запросный — см. docs/context-audit.md
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	isStopping            atomic.Bool
@@ -106,11 +110,6 @@ type KafkaConsumer struct {
 	metrics               consumerMetrics
 }
 
-// NewKafkaConsumer создаёт консьюмер Kafka.
-//
-// Инициализирует соединение с брокером, OTel-инструменты и внутренний контекст.
-// Горутины запускаются только при вызове Start; NewKafkaConsumer безопасен сам по себе.
-// Возвращает ошибку при невалидной конфигурации или невозможности инициализировать клиент Kafka.
 // buildConsumerKafkaConfig транслирует Config в kafka.ConfigMap для librdkafka.
 func buildConsumerKafkaConfig(config Config) kafka.ConfigMap {
 	kafkaConfig := kafka.ConfigMap{
@@ -136,11 +135,12 @@ func buildConsumerKafkaConfig(config Config) kafka.ConfigMap {
 	// SASL параметры передаются только при соответствующем протоколе;
 	// librdkafka запрещает пустое значение sasl.mechanisms.
 	proto := strings.ToUpper(config.SecurityProtocol)
-	if proto == "SASL_PLAINTEXT" || proto == "SASL_SSL" {
+	if proto == SecurityProtocolSASLPlaintext || proto == SecurityProtocolSASLSSL {
 		kafkaConfig["sasl.mechanisms"] = config.SASL.Mechanism
 		kafkaConfig["sasl.username"] = config.SASL.Username
 		kafkaConfig["sasl.password"] = config.SASL.Password
 	}
+
 	return kafkaConfig
 }
 
@@ -170,6 +170,11 @@ func newConsumerMetrics(meter metric.Meter) consumerMetrics {
 	}
 }
 
+// NewKafkaConsumer создаёт консьюмер Kafka.
+//
+// Инициализирует соединение с брокером, OTel-инструменты и внутренний контекст.
+// Горутины запускаются только при вызове Start; NewKafkaConsumer безопасен сам по себе.
+// Возвращает ошибку при невалидной конфигурации или невозможности инициализировать клиент Kafka.
 func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 	op := "new_kafka_consumer"
 
@@ -217,12 +222,14 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
 			c.workersMu.RLock()
 			defer c.workersMu.RUnlock()
+
 			for key, w := range c.workers {
 				o.Observe(int64(len(w.messageChan)),
 					metric.WithAttributes(
 						attribute.String("topic", key.topic),
 						attribute.Int("partition", int(key.partition))))
 			}
+
 			return nil
 		})); err != nil {
 		return nil, fmt.Errorf("%s: registering queue depth gauge: %w", op, errors.Join(err, consumer.Close()))
@@ -243,6 +250,7 @@ func (c *KafkaConsumer) AddHandler(topic string, handler consumerHandler) error 
 	}
 
 	c.handlers[topic] = handler
+
 	return nil
 }
 
@@ -284,10 +292,12 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 	c.ctx, c.cancel = context.WithCancel(ctx)
 
 	c.handlersMu.RLock()
+
 	topics := make([]string, 0, len(c.handlers))
 	for t := range c.handlers {
 		topics = append(topics, t)
 	}
+
 	c.handlersMu.RUnlock()
 
 	if len(topics) == 0 {
@@ -301,6 +311,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 	go c.runCleanupLoop()
 
 	c.logger.Info("Kafka consumer started", slog.Any("topics", topics))
+
 	return nil
 }
 
@@ -319,16 +330,20 @@ func (c *KafkaConsumer) runConsumerLoop() {
 		default:
 			msg, err := c.consumer.ReadMessage(c.messageReadTimeout)
 			if err != nil {
-				if kafkaErr, ok := err.(kafka.Error); ok && kafkaErr.Code() == kafka.ErrTimedOut {
+				var kafkaErr kafka.Error
+				if errors.As(err, &kafkaErr) {
 					continue
 				}
+
 				c.logger.Error("Failed to read message", slog.Any("error", err))
+
 				backoffTimer := time.NewTimer(c.readErrorBackoff)
 				select {
 				case <-backoffTimer.C:
 				case <-c.ctx.Done():
 					backoffTimer.Stop()
 				}
+
 				continue
 			}
 
@@ -355,6 +370,7 @@ func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
 		c.logger.Error("Received message with nil topic, skipping")
 		return
 	}
+
 	partition := msg.TopicPartition.Partition
 	topic := *msg.TopicPartition.Topic
 
@@ -389,11 +405,14 @@ func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *sl
 
 	// fast path
 	c.workersMu.RLock()
+
 	worker, ok := c.workers[key]
 	if ok {
 		atomic.AddInt64(&worker.inFlight, 1)
 	}
+
 	c.workersMu.RUnlock()
+
 	if ok {
 		return worker, nil
 	}
@@ -428,6 +447,7 @@ func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *sl
 
 	c.metrics.workersActive.Add(context.Background(), 1)
 	log.Info("Created new partition worker")
+
 	return worker, nil
 }
 
@@ -466,6 +486,7 @@ func (c *KafkaConsumer) runPartitionWorker(key workerKey, worker *partitionWorke
 			if !ok {
 				return
 			}
+
 			worker.updateActivity()
 			c.handleMessage(worker.ctx, msg)
 		case <-worker.ctx.Done():
@@ -478,6 +499,7 @@ func (c *KafkaConsumer) runPartitionWorker(key workerKey, worker *partitionWorke
 					if !ok {
 						return
 					}
+
 					c.handleMessage(drainCtx, msg)
 				// Прерываем drain если GracefulTimeout истёк: Stop() уже вызвал
 				// consumer.Close() — дальнейший CommitMessage недопустим.
@@ -502,6 +524,7 @@ func (c *KafkaConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
 
 	// Извлекаем trace context из Kafka headers и создаём consumer-span.
 	extractCtx := c.propagator.Extract(ctx, newKafkaHeaderCarrier(new(msg.Headers)))
+
 	ctx, span := c.tracer.Start(extractCtx, topic+" process",
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(
@@ -545,6 +568,7 @@ func (c *KafkaConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
 
 	maxRetries := c.config.Consumer.HandlerMaxRetries
 	start := time.Now()
+
 	var handlerErr error
 
 	for attempt := 1; ; attempt++ {
@@ -561,6 +585,7 @@ func (c *KafkaConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
 				span.RecordError(err)
 				span.SetStatus(codes.Error, err.Error())
 				c.metrics.failed.Add(ctx, 1, topicAttr)
+
 				break
 			}
 
@@ -582,10 +607,12 @@ func (c *KafkaConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
 				// При перезапуске сообщение будет обработано заново.
 				return
 			}
+
 			continue
 		}
 
 		handlerErr = nil
+
 		break
 	}
 
@@ -684,6 +711,7 @@ func (c *KafkaConsumer) Stop() {
 	c.workersMu.Unlock()
 
 	done := make(chan struct{})
+
 	go func() {
 		c.wg.Wait()
 		close(done)

@@ -24,26 +24,26 @@ func TestNewKafkaProducer_InvalidConfig(t *testing.T) {
 		{
 			name: "SASL_PLAINTEXT без username",
 			config: Config{
-				Brokers:          []string{"localhost:9092"},
-				ClientID:         "test",
-				SecurityProtocol: "SASL_PLAINTEXT",
-				SASL:             SASL{Password: "secret"},
+				Brokers:          []string{testInvalidBroker},
+				ClientID:         testInvalidClientID,
+				SecurityProtocol: SecurityProtocolSASLPlaintext,
+				SASL:             SASL{Password: testSASLPassword},
 				Producer:         testConfig().Producer,
 				Consumer:         testConfig().Consumer,
 			},
-			errContains: "KAFKAX_SASL_USERNAME",
+			errContains: envKeySASLUsername,
 		},
 		{
 			name: "SASL_SSL без password",
 			config: Config{
-				Brokers:          []string{"localhost:9092"},
-				ClientID:         "test",
-				SecurityProtocol: "SASL_SSL",
-				SASL:             SASL{Username: "user"},
+				Brokers:          []string{testInvalidBroker},
+				ClientID:         testInvalidClientID,
+				SecurityProtocol: SecurityProtocolSASLSSL,
+				SASL:             SASL{Username: testSASLUser},
 				Producer:         testConfig().Producer,
 				Consumer:         testConfig().Consumer,
 			},
-			errContains: "KAFKAX_SASL_PASSWORD",
+			errContains: envKeySASLPassword,
 		},
 	}
 
@@ -53,14 +53,15 @@ func TestNewKafkaProducer_InvalidConfig(t *testing.T) {
 			t.Logf("попытка создать продюсер с невалидным конфигом: %s", tc.name)
 
 			p, err := NewKafkaProducer(context.Background(), tc.config)
-
 			if err == nil {
 				p.Close()
 				t.Fatalf("NewKafkaProducer() вернул nil-ошибку, ожидалась ошибка, содержащая %q", tc.errContains)
 			}
+
 			if !strings.Contains(err.Error(), tc.errContains) {
 				t.Fatalf("NewKafkaProducer() error=%q не содержит %q", err.Error(), tc.errContains)
 			}
+
 			t.Logf("получена ожидаемая ошибка: %v", err)
 		})
 	}
@@ -81,6 +82,7 @@ func TestNewKafkaProducer_Success(t *testing.T) {
 	if p == nil {
 		t.Fatal("NewKafkaProducer() вернул nil без ошибки")
 	}
+
 	t.Log("продюсер создан успешно ✓")
 }
 
@@ -94,14 +96,16 @@ func TestKafkaProducer_SendMessage_WhenStopping(t *testing.T) {
 	p.Close()
 
 	t.Log("пытаемся отправить сообщение в остановленный продюсер")
-	err := p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: "test-topic", Value: []byte("data")})
 
+	err := p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: testTopic, Value: []byte("data")})
 	if err == nil {
 		t.Fatal("SendMessage() в остановленный продюсер вернул nil, ожидалась ошибка")
 	}
+
 	if !strings.Contains(err.Error(), "shutting down") {
 		t.Fatalf("SendMessage() error=%q, ожидалась ошибка с 'shutting down'", err.Error())
 	}
+
 	t.Logf("получена ожидаемая ошибка: %q ✓", err.Error())
 }
 
@@ -114,17 +118,18 @@ func TestKafkaProducer_SendMessage_ReservedHeaderKey(t *testing.T) {
 
 	err := p.SendMessage(context.Background(), PublishRequest{
 		TenantID: uuid.New(),
-		Topic:    "test-topic",
+		Topic:    testTopic,
 		Value:    []byte("data"),
 		Headers:  Headers{{Key: "traceparent", Value: []byte("x")}},
 	})
-
 	if err == nil {
 		t.Fatal("SendMessage() с заголовком 'traceparent' вернул nil, ожидалась ошибка")
 	}
+
 	if !strings.Contains(err.Error(), "reserved") {
 		t.Fatalf("SendMessage() error=%q, ожидалась ошибка про зарезервированный ключ", err.Error())
 	}
+
 	t.Logf("получена ожидаемая ошибка: %q ✓", err.Error())
 }
 
@@ -139,14 +144,15 @@ func TestKafkaProducer_SendMessage_ContextCanceled(t *testing.T) {
 	t.Log("отменяем контекст до вызова SendMessage")
 	cancel()
 
-	err := p.SendMessage(ctx, PublishRequest{TenantID: uuid.New(), Topic: "test-topic", Value: []byte("data")})
-
+	err := p.SendMessage(ctx, PublishRequest{TenantID: uuid.New(), Topic: testTopic, Value: []byte("data")})
 	if err == nil {
 		t.Fatal("SendMessage() с отменённым контекстом вернул nil, ожидалась ошибка")
 	}
+
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("SendMessage() error=%q не оборачивает context.Canceled (errors.Is вернул false)", err.Error())
 	}
+
 	t.Logf("SendMessage с отменённым контекстом вернул: %q, errors.Is(err, context.Canceled)=true ✓", err.Error())
 }
 
@@ -172,6 +178,7 @@ func TestKafkaProducer_ContextCancel_TriggersShutdown(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(context.Background())
+
 	p, err := NewKafkaProducer(ctx, testConfig())
 	if err != nil {
 		t.Skipf("пропуск: librdkafka: %v", err)
@@ -186,15 +193,18 @@ func TestKafkaProducer_ContextCancel_TriggersShutdown(t *testing.T) {
 	// опрашиваем с retry вместо единичной попытки (что раньше маскировало гонку
 	// через t.Log вместо реального ассерта).
 	deadline := time.Now().Add(2 * time.Second)
+
 	var lastErr error
 	for time.Now().Before(deadline) {
-		lastErr = p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: "test-topic", Value: []byte("x")})
+		lastErr = p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: testTopic, Value: []byte("x")})
 		if lastErr != nil && strings.Contains(lastErr.Error(), "shutting down") {
 			t.Logf("SendMessage после cancel(ctx) вернул: %q ✓", lastErr.Error())
 			return
 		}
+
 		time.Sleep(10 * time.Millisecond)
 	}
+
 	t.Fatalf("отмена ctx не привела к shutdown продюсера за 2s (последняя ошибка SendMessage: %v)", lastErr)
 }
 

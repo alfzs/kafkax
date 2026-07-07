@@ -18,6 +18,7 @@ func (c kafkaHeaderCarrier) Get(key string) string {
 			return string(h.Value)
 		}
 	}
+
 	return ""
 }
 
@@ -28,6 +29,7 @@ func (c kafkaHeaderCarrier) Set(key, value string) {
 			return
 		}
 	}
+
 	*c.headers = append(*c.headers, kafka.Header{Key: key, Value: []byte(value)})
 }
 
@@ -36,5 +38,6 @@ func (c kafkaHeaderCarrier) Keys() []string {
 	for i, h := range *c.headers {
 		keys[i] = h.Key
 	}
+
 	return keys
 }

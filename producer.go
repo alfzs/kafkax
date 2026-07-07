@@ -24,7 +24,8 @@ import (
 )
 
 type tenantWorker struct {
-	messageChan  chan message
+	messageChan chan message
+	//nolint:containedctx // lifecycle-контекст воркера (аналог BaseContext), не запросный — см. docs/context-audit.md
 	ctx          context.Context
 	cancel       context.CancelFunc
 	lastActivity time.Time
@@ -35,17 +36,20 @@ type tenantWorker struct {
 func (w *tenantWorker) updateActivity() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
 	w.lastActivity = time.Now()
 }
 
 func (w *tenantWorker) getLastActivity() time.Time {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
 	return w.lastActivity
 }
 
 // message — внутренняя единица очереди воркера тенанта, не часть публичного API.
 type message struct {
+	//nolint:containedctx // message — элемент очереди воркера, передаваемый через канал; см. docs/context-audit.md
 	Ctx      context.Context
 	TenantID uuid.UUID
 	Topic    string
@@ -68,12 +72,13 @@ type producerMetrics struct {
 // что обеспечивает независимую обработку очередей разных тенантов.
 // Безопасен для конкурентного использования из нескольких горутин.
 type KafkaProducer struct {
-	producer              *kafka.Producer
-	config                Config
-	logger                *slog.Logger
-	tenantPools           map[uuid.UUID]*tenantWorker
-	workerLock            sync.RWMutex
-	wg                    sync.WaitGroup
+	producer    *kafka.Producer
+	config      Config
+	logger      *slog.Logger
+	tenantPools map[uuid.UUID]*tenantWorker
+	workerLock  sync.RWMutex
+	wg          sync.WaitGroup
+	//nolint:containedctx // lifecycle-контекст компонента (аналог BaseContext), не запросный — см. docs/context-audit.md
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	closed                chan struct{}
@@ -88,17 +93,6 @@ type KafkaProducer struct {
 	metrics               producerMetrics
 }
 
-// NewKafkaProducer создаёт и запускает продюсер Kafka.
-//
-// ctx используется как родительский контекст продюсера: его отмена эквивалентна
-// вызову Close (запускается та же горутина graceful shutdown). Для управляемого
-// завершения по-прежнему предпочтительнее явный вызов Close — так вызывающий
-// код может дождаться его завершения синхронно, а не полагаться на фоновую
-// горутину-наблюдателя.
-//
-// Инициализирует OTel-инструменты (счётчики, гистограммы, gauge) и запускает
-// фоновую горутину сборщика неактивных воркеров. Возвращает ошибку при невалидной
-// конфигурации или невозможности подключиться к брокеру.
 // buildProducerKafkaConfig транслирует Config в kafka.ConfigMap для librdkafka.
 func buildProducerKafkaConfig(config Config) kafka.ConfigMap {
 	kafkaConfig := kafka.ConfigMap{
@@ -124,11 +118,12 @@ func buildProducerKafkaConfig(config Config) kafka.ConfigMap {
 	// SASL параметры передаются только при соответствующем протоколе;
 	// librdkafka запрещает пустое значение sasl.mechanisms.
 	proto := strings.ToUpper(config.SecurityProtocol)
-	if proto == "SASL_PLAINTEXT" || proto == "SASL_SSL" {
+	if proto == SecurityProtocolSASLPlaintext || proto == SecurityProtocolSASLSSL {
 		kafkaConfig["sasl.mechanisms"] = config.SASL.Mechanism
 		kafkaConfig["sasl.username"] = config.SASL.Username
 		kafkaConfig["sasl.password"] = config.SASL.Password
 	}
+
 	return kafkaConfig
 }
 
@@ -152,6 +147,17 @@ func newProducerMetrics(meter metric.Meter) producerMetrics {
 	}
 }
 
+// NewKafkaProducer создаёт и запускает продюсер Kafka.
+//
+// ctx используется как родительский контекст продюсера: его отмена эквивалентна
+// вызову Close (запускается та же горутина graceful shutdown). Для управляемого
+// завершения по-прежнему предпочтительнее явный вызов Close — так вызывающий
+// код может дождаться его завершения синхронно, а не полагаться на фоновую
+// горутину-наблюдателя.
+//
+// Инициализирует OTel-инструменты (счётчики, гистограммы, gauge) и запускает
+// фоновую горутину сборщика неактивных воркеров. Возвращает ошибку при невалидной
+// конфигурации или невозможности подключиться к брокеру.
 func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error) {
 	const op = "new_kafka_producer"
 
@@ -201,11 +207,14 @@ func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error
 		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
 			p.workerLock.RLock()
 			defer p.workerLock.RUnlock()
+
 			var total int64
 			for _, w := range p.tenantPools {
 				total += int64(len(w.messageChan))
 			}
+
 			o.Observe(total)
+
 			return nil
 		})); err != nil {
 		producer.Close()
@@ -298,6 +307,7 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) err
 	case worker.messageChan <- msg:
 		resultTimer := time.NewTimer(p.messageTimeout)
 		defer resultTimer.Stop()
+
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("context canceled: %w", ctx.Err())
@@ -324,11 +334,14 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) err
 func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logger) (*tenantWorker, error) {
 	// fast path
 	p.workerLock.RLock()
+
 	worker, ok := p.tenantPools[tenantID]
 	if ok {
 		atomic.AddInt64(&worker.inFlight, 1)
 	}
+
 	p.workerLock.RUnlock()
+
 	if ok {
 		return worker, nil
 	}
@@ -358,11 +371,13 @@ func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID, logger *slog.Logge
 	}
 
 	p.tenantPools[tenantID] = worker
+
 	p.wg.Add(1)
 	go p.runWorker(tenantID, worker, logger)
 
 	p.metrics.workersActive.Add(context.Background(), 1)
 	logger.Info("Created new worker for tenant")
+
 	return worker, nil
 }
 
@@ -380,6 +395,7 @@ func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker, logg
 				slog.String("stack", string(debug.Stack())),
 				slog.String("tenant_id", tenantID.String()))
 		}
+
 		worker.cancel()
 		p.metrics.workersActive.Add(context.Background(), -1)
 		p.wg.Done()
@@ -408,6 +424,7 @@ func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker, logg
 						runtime.Gosched()
 						continue
 					}
+
 					return
 				}
 			}
@@ -469,11 +486,13 @@ func (p *KafkaProducer) produce(msg message) (err error) {
 	// иначе отправки с ошибкой/таймаутом выпадают из распределения и p99
 	// выглядит здоровым даже при росте доли отказов.
 	start := time.Now()
+
 	defer func() {
 		status := "success"
 		if err != nil {
 			status = "error"
 		}
+
 		p.metrics.messageLatency.Record(ctx, float64(time.Since(start).Milliseconds()),
 			metric.WithAttributes(attribute.String("topic", msg.Topic), attribute.String("status", status)))
 	}()
@@ -494,7 +513,9 @@ func (p *KafkaProducer) produce(msg message) (err error) {
 		span.RecordError(produceErr)
 		span.SetStatus(codes.Error, produceErr.Error())
 		p.metrics.failed.Add(ctx, 1, topicAttr)
+
 		err = fmt.Errorf("produce error: %w", produceErr)
+
 		return err
 	}
 
@@ -509,21 +530,28 @@ func (p *KafkaProducer) produce(msg message) (err error) {
 			span.RecordError(unexpectedErr)
 			span.SetStatus(codes.Error, unexpectedErr.Error())
 			p.metrics.failed.Add(ctx, 1, topicAttr)
+
 			err = unexpectedErr
+
 			return err
 		}
+
 		if m.TopicPartition.Error != nil {
 			span.RecordError(m.TopicPartition.Error)
 			span.SetStatus(codes.Error, m.TopicPartition.Error.Error())
 			p.metrics.failed.Add(ctx, 1, topicAttr)
+
 			err = fmt.Errorf("delivery error: %w", m.TopicPartition.Error)
+
 			return err
 		}
+
 		p.metrics.sent.Add(ctx, 1, topicAttr)
 		span.SetAttributes(
 			attribute.Int("messaging.kafka.partition", int(m.TopicPartition.Partition)),
 			attribute.Int64("messaging.kafka.offset", int64(m.TopicPartition.Offset)),
 		)
+
 		return nil
 	case <-p.ctx.Done():
 		// Нормальное завершение при shutdown — не помечаем span как ошибку.
@@ -533,12 +561,14 @@ func (p *KafkaProducer) produce(msg message) (err error) {
 		span.RecordError(msg.Ctx.Err())
 		span.SetStatus(codes.Error, msg.Ctx.Err().Error())
 		err = msg.Ctx.Err()
+
 		return err
 	case <-timer.C:
 		timeoutErr := fmt.Errorf("produce timeout after %v", msg.Timeout)
 		span.RecordError(timeoutErr)
 		span.SetStatus(codes.Error, timeoutErr.Error())
 		err = timeoutErr
+
 		return err
 	}
 }
@@ -614,6 +644,7 @@ func (p *KafkaProducer) Close() {
 	p.workerLock.Unlock()
 
 	done := make(chan struct{})
+
 	go func() {
 		p.wg.Wait()
 		close(done)

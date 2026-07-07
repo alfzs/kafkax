@@ -8,6 +8,27 @@ import (
 	"time"
 )
 
+// Допустимые значения Config.SecurityProtocol.
+const (
+	SecurityProtocolPlaintext     = "PLAINTEXT"
+	SecurityProtocolSSL           = "SSL"
+	SecurityProtocolSASLPlaintext = "SASL_PLAINTEXT"
+	SecurityProtocolSASLSSL       = "SASL_SSL"
+)
+
+// Ключи env-переменных SASL, обязательных при SecurityProtocolSASLPlaintext/
+// SecurityProtocolSASLSSL — должны совпадать с тегами env на полях
+// SASL.Username/SASL.Password ниже.
+const (
+	envKeySASLUsername = "KAFKAX_SASL_USERNAME"
+	//nolint:gosec // это имя env-переменной (env-тег ниже), а не сам секрет
+	envKeySASLPassword = "KAFKAX_SASL_PASSWORD"
+)
+
+// tlsIdentAlgorithmNone — значение ssl.endpoint.identification.algorithm,
+// отключающее проверку hostname (librdkafka запрещает пустую строку).
+const tlsIdentAlgorithmNone = "none"
+
 // Config — корневая конфигурация клиента Kafka.
 // Используется как продюсером, так и консьюмером; секции Producer и Consumer
 // применяются только к соответствующему типу клиента.
@@ -35,14 +56,16 @@ type Config struct {
 // а проверка перенесена сюда.
 func (c Config) Validate() error {
 	proto := strings.ToUpper(c.SecurityProtocol)
-	if proto == "SASL_PLAINTEXT" || proto == "SASL_SSL" {
+	if proto == SecurityProtocolSASLPlaintext || proto == SecurityProtocolSASLSSL {
 		if c.SASL.Username == "" {
-			return fmt.Errorf("KAFKAX_SASL_USERNAME required for security.protocol=%q", c.SecurityProtocol)
+			return fmt.Errorf("%s required for security.protocol=%q", envKeySASLUsername, c.SecurityProtocol)
 		}
+
 		if c.SASL.Password == "" {
-			return fmt.Errorf("KAFKAX_SASL_PASSWORD required for security.protocol=%q", c.SecurityProtocol)
+			return fmt.Errorf("%s required for security.protocol=%q", envKeySASLPassword, c.SecurityProtocol)
 		}
 	}
+
 	return nil
 }
 
@@ -50,8 +73,8 @@ func (c Config) Validate() error {
 // Username и Password обязательны только при SecurityProtocol = SASL_PLAINTEXT или SASL_SSL;
 // для остальных протоколов игнорируются.
 type SASL struct {
-	Username  string `env:"KAFKAX_SASL_USERNAME"`
-	Password  string `env:"KAFKAX_SASL_PASSWORD"`
+	Username string `env:"KAFKAX_SASL_USERNAME"`
+	Password string `env:"KAFKAX_SASL_PASSWORD"`
 	// Mechanism — механизм SASL. Допустимые значения: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512.
 	Mechanism string `yaml:"mechanism"`
 }
@@ -80,8 +103,9 @@ type TLS struct {
 // При пустом IdentificationAlgorithm возвращает "none" — librdkafka запрещает пустое значение.
 func (t TLS) endpointIdentAlgorithm() string {
 	if t.InsecureSkipVerify || t.IdentificationAlgorithm == "" {
-		return "none"
+		return tlsIdentAlgorithmNone
 	}
+
 	return t.IdentificationAlgorithm
 }
 

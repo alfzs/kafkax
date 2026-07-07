@@ -17,6 +17,7 @@ func TestHeaders_Get(t *testing.T) {
 	if v, ok := headers.Get("signature"); !ok || string(v) != "\x01\x02" {
 		t.Fatalf("Get(%q) = %v, %v, ожидалось найденное бинарное значение", "signature", v, ok)
 	}
+
 	if _, ok := headers.Get("missing"); ok {
 		t.Fatal("Get() для отсутствующего ключа вернул ok=true")
 	}
@@ -39,7 +40,7 @@ func TestHeaders_Get_DuplicateKeys_ReturnsFirst(t *testing.T) {
 func TestValidateHeaders_RejectsReservedKeys(t *testing.T) {
 	t.Parallel()
 
-	for _, key := range []string{"traceparent", "tracestate", "baggage"} {
+	for _, key := range []string{headerKeyTraceparent, headerKeyTracestate, headerKeyBaggage} {
 		headers := Headers{{Key: key, Value: []byte("x")}}
 		if err := validateHeaders(headers); err == nil {
 			t.Fatalf("validateHeaders() с зарезервированным ключом %q вернул nil, ожидалась ошибка", key)
@@ -86,6 +87,7 @@ func TestFromKafkaHeaders_NeverNil(t *testing.T) {
 	if headers := fromKafkaHeaders(nil); headers == nil {
 		t.Fatal("fromKafkaHeaders(nil) вернул nil, ожидался пустой слайс")
 	}
+
 	if headers := fromKafkaHeaders([]kafka.Header{}); headers == nil {
 		t.Fatal("fromKafkaHeaders([]) вернул nil, ожидался пустой слайс")
 	}
