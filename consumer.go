@@ -2,6 +2,7 @@ package kafkax
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -210,7 +211,7 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 	}
 
 	// Observable gauge: глубина очередей по партициям.
-	_, _ = meter.Int64ObservableGauge("kafkax.consumer.queue.depth",
+	if _, err := meter.Int64ObservableGauge("kafkax.consumer.queue.depth",
 		metric.WithDescription("Messages pending in partition worker queues"),
 		metric.WithUnit("{message}"),
 		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
@@ -223,7 +224,9 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 						attribute.Int("partition", int(key.partition))))
 			}
 			return nil
-		}))
+		})); err != nil {
+		return nil, fmt.Errorf("%s: registering queue depth gauge: %w", op, errors.Join(err, consumer.Close()))
+	}
 
 	return c, nil
 }
@@ -256,7 +259,7 @@ func (c *KafkaConsumer) SubscribeAll() error {
 	}
 
 	if len(topics) == 0 {
-		return fmt.Errorf("no topics to subscribe")
+		return errors.New("no topics to subscribe")
 	}
 
 	return c.consumer.SubscribeTopics(topics, nil)
@@ -272,7 +275,7 @@ func (c *KafkaConsumer) SubscribeAll() error {
 // Требует наличия хотя бы одного зарегистрированного обработчика.
 func (c *KafkaConsumer) Start(ctx context.Context) error {
 	if !c.isStarted.CompareAndSwap(false, true) {
-		return fmt.Errorf("consumer already started")
+		return errors.New("consumer already started")
 	}
 
 	// Отменяем background-контекст из NewKafkaConsumer и подменяем его на
@@ -288,7 +291,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 	c.handlersMu.RUnlock()
 
 	if len(topics) == 0 {
-		return fmt.Errorf("no kafka handlers registered")
+		return errors.New("no kafka handlers registered")
 	}
 
 	c.wg.Add(1)
@@ -402,7 +405,7 @@ func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32, log *sl
 	// Stop() берёт workersMu перед cancel(), поэтому если isStopping уже true,
 	// wg.Add ниже гарантированно не выполнится после wg.Wait() в Stop().
 	if c.isStopping.Load() {
-		return nil, fmt.Errorf("consumer is shutting down")
+		return nil, errors.New("consumer is shutting down")
 	}
 
 	if worker, ok = c.workers[key]; ok {

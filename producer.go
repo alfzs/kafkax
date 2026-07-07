@@ -190,7 +190,7 @@ func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error
 	// tenant_id как label не используется намеренно: число тенантов неограниченно,
 	// а unbounded label взрывает кардинальность метрики в бэкенде. Поэтому глубина
 	// суммируется по всем тенантам в одно значение.
-	_, _ = meter.Int64ObservableGauge("kafkax.producer.queue.depth",
+	if _, err := meter.Int64ObservableGauge("kafkax.producer.queue.depth",
 		metric.WithDescription("Total messages pending across all tenant worker queues"),
 		metric.WithUnit("{message}"),
 		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
@@ -202,7 +202,10 @@ func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error
 			}
 			o.Observe(total)
 			return nil
-		}))
+		})); err != nil {
+		producer.Close()
+		return nil, fmt.Errorf("%s: registering queue depth gauge: %w", op, err)
+	}
 
 	p.wg.Add(1)
 	go p.manageWorkers()
@@ -505,7 +508,7 @@ func (p *KafkaProducer) produce(msg message) (err error) {
 		return nil
 	case <-p.ctx.Done():
 		// Нормальное завершение при shutdown — не помечаем span как ошибку.
-		err = fmt.Errorf("producer is shutting down")
+		err = errors.New("producer is shutting down")
 		return err
 	case <-msg.Ctx.Done():
 		span.RecordError(msg.Ctx.Err())
