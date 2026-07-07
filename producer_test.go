@@ -2,8 +2,11 @@ package kafkax
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -141,28 +144,10 @@ func TestKafkaProducer_SendMessage_ContextCanceled(t *testing.T) {
 	if err == nil {
 		t.Fatal("SendMessage() с отменённым контекстом вернул nil, ожидалась ошибка")
 	}
-	t.Logf("SendMessage с отменённым контекстом вернул: %q ✓", err.Error())
-}
-
-// TestKafkaProducer_SendMessage_BrokerUnavailable проверяет, что SendMessage
-// завершается по таймауту при недоступном брокере.
-func TestKafkaProducer_SendMessage_BrokerUnavailable(t *testing.T) {
-	if testing.Short() {
-		t.Skip("пропуск в -short режиме: тест ждёт MessageTimeout (~300ms)")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SendMessage() error=%q не оборачивает context.Canceled (errors.Is вернул false)", err.Error())
 	}
-	t.Parallel()
-
-	p := mustNewProducer(t)
-	t.Logf("отправляем сообщение на недоступный брокер (ждём таймаут ~%s)", testConfig().Producer.MessageTimeout)
-
-	err := p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: "test-topic", Value: []byte("hello")})
-
-	if err == nil {
-		// Если брокер случайно оказался доступен — тест некорректен.
-		t.Log("брокер оказался доступен: сообщение доставлено (пропускаем проверку таймаута)")
-		return
-	}
-	t.Logf("сообщение не доставлено при недоступном брокере: %q ✓", err.Error())
+	t.Logf("SendMessage с отменённым контекстом вернул: %q, errors.Is(err, context.Canceled)=true ✓", err.Error())
 }
 
 // TestKafkaProducer_Close_Idempotent проверяет, что повторный вызов Close
@@ -196,10 +181,40 @@ func TestKafkaProducer_ContextCancel_TriggersShutdown(t *testing.T) {
 	t.Log("отменяем родительский контекст продюсера")
 	cancel()
 
-	t.Log("проверяем, что SendMessage возвращает ошибку после отмены контекста")
-	if sendErr := p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: "test-topic", Value: []byte("x")}); sendErr == nil {
-		t.Log("предупреждение: SendMessage не вернул ошибку немедленно после cancel() — возможна гонка")
-	} else {
-		t.Logf("SendMessage после cancel() вернул: %q ✓", sendErr.Error())
+	// Горутина-наблюдатель за ctx (producer.go:224) вызывает Close() асинхронно —
+	// нет гарантии, что isStopping установится к моменту первой проверки, поэтому
+	// опрашиваем с retry вместо единичной попытки (что раньше маскировало гонку
+	// через t.Log вместо реального ассерта).
+	deadline := time.Now().Add(2 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		lastErr = p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: "test-topic", Value: []byte("x")})
+		if lastErr != nil && strings.Contains(lastErr.Error(), "shutting down") {
+			t.Logf("SendMessage после cancel(ctx) вернул: %q ✓", lastErr.Error())
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatalf("отмена ctx не привела к shutdown продюсера за 2s (последняя ошибка SendMessage: %v)", lastErr)
+}
+
+// TestKafkaProducer_ConcurrentCloseAndSendMessage проверяет отсутствие гонок при
+// конкурентном вызове Close() и SendMessage() на одном инстансе — isStopping
+// корректно реализован через atomic.Bool с CompareAndSwap, но раньше это
+// проверялось только последовательными вызовами Close().
+func TestKafkaProducer_ConcurrentCloseAndSendMessage(t *testing.T) {
+	t.Parallel()
+	p := mustNewProducer(t)
+
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Go(func() {
+			_ = p.SendMessage(context.Background(), PublishRequest{TenantID: uuid.New(), Topic: "concurrent-topic", Value: []byte("x")})
+		})
+	}
+
+	wg.Go(p.Close)
+
+	wg.Wait()
+	t.Log("конкурентные SendMessage()/Close() завершились без гонок и паник ✓")
 }

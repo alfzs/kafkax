@@ -2,9 +2,13 @@ package kafkax
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
 
 // TestNewKafkaConsumer_InvalidConfig проверяет, что невалидная конфигурация
@@ -228,40 +232,116 @@ func TestKafkaConsumer_Stop_Idempotent(t *testing.T) {
 	})
 }
 
-// TestKafkaConsumer_FullLifecycle проверяет полный жизненный цикл консьюмера:
-// создание → регистрация обработчика → подписка → запуск → остановка.
-func TestKafkaConsumer_FullLifecycle(t *testing.T) {
-	if testing.Short() {
-		t.Skip("пропуск в -short режиме: тест содержит временные паузы")
-	}
+// TestKafkaConsumer_HandleMessage_RetriesAndSkipsAfterMaxRetries проверяет
+// retry/skip/commit-логику handleMessage напрямую, без брокера: *kafka.Message —
+// обычная структура, поэтому handleMessage можно вызвать изнутри пакета,
+// не проходя через runConsumerLoop/processMessage.
+func TestKafkaConsumer_HandleMessage_RetriesAndSkipsAfterMaxRetries(t *testing.T) {
 	t.Parallel()
+	c := mustNewConsumerWithConfig(t, fastCommitConfig())
 
-	t.Log("шаг 1: создаём консьюмер")
+	handler := &mockHandler{returnErr: errors.New("boom")}
+	topic := "retry-topic"
+	if err := c.AddHandler(topic, handler); err != nil {
+		t.Fatalf("AddHandler() вернул неожиданную ошибку: %v", err)
+	}
+
+	msg := &kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: 0, Offset: 7},
+		Value:          []byte("payload"),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		c.handleMessage(context.Background(), msg)
+		close(done)
+	}()
+
+	// CommitMessage без брокера блокируется на "Local: Waiting for coordinator"
+	// вплоть до Consumer.SessionTimeout — fastCommitConfig() держит его коротким.
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleMessage() завис — вероятно, заблокирован на CommitMessage")
+	}
+
+	maxRetries := testConfig().Consumer.HandlerMaxRetries
+	if calls := handler.callCount(); calls != maxRetries {
+		t.Fatalf("ProcessMessage вызван %d раз(а), ожидалось ровно HandlerMaxRetries=%d", calls, maxRetries)
+	}
+	t.Logf("handleMessage() вызвал ProcessMessage ровно %d раз перед skip ✓", maxRetries)
+}
+
+// TestKafkaConsumer_HandleMessage_HeadersRoundTrip проверяет, что пользовательский
+// заголовок, сконструированный так же, как в produce() (через toKafkaHeaders),
+// доходит до IncomingMessage.Headers внутри handleMessage (через fromKafkaHeaders) —
+// то есть проверяет границу produce()/handleMessage целиком, а не только
+// toKafkaHeaders/fromKafkaHeaders по отдельности (см. headers_test.go).
+func TestKafkaConsumer_HandleMessage_HeadersRoundTrip(t *testing.T) {
+	t.Parallel()
+	c := mustNewConsumerWithConfig(t, fastCommitConfig())
+
+	handler := &mockHandler{}
+	topic := "headers-roundtrip"
+	if err := c.AddHandler(topic, handler); err != nil {
+		t.Fatalf("AddHandler() вернул неожиданную ошибку: %v", err)
+	}
+
+	custom := Headers{{Key: "x-order-id", Value: []byte("order-123")}}
+	msg := &kafka.Message{
+		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: 0, Offset: 1},
+		Value:          []byte("payload"),
+		Headers:        toKafkaHeaders(custom),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		c.handleMessage(context.Background(), msg)
+		close(done)
+	}()
+
+	// CommitMessage без брокера блокируется на "Local: Waiting for coordinator"
+	// вплоть до Consumer.SessionTimeout — fastCommitConfig() держит его коротким.
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleMessage() завис — вероятно, заблокирован на CommitMessage")
+	}
+
+	got, ok := handler.lastMessage().Headers.Get("x-order-id")
+	if !ok || string(got) != "order-123" {
+		t.Fatalf("IncomingMessage.Headers.Get(%q) = %q, %v, ожидалось %q, true", "x-order-id", got, ok, "order-123")
+	}
+	t.Log("пользовательский заголовок дошёл до handler через toKafkaHeaders → fromKafkaHeaders ✓")
+}
+
+// TestKafkaConsumer_StartContextCancel_StopsLoopsWithoutClose проверяет
+// заявленное в докстринге Start (consumer.go:270-272) поведение: в отличие от
+// KafkaProducer (см. producer.go:224-230), у консьюмера нет горутины-наблюдателя,
+// доводящей отмену ctx до полноценного Stop(). Поэтому после отмены ctx
+// consumer loop и cleanup loop останавливаются (drain), но consumer.Close() ещё
+// не вызван — последующий явный Stop() должен по-прежнему штатно завершить
+// работу в пределах GracefulTimeout, а не мгновенно вернуться как "уже остановлен".
+func TestKafkaConsumer_StartContextCancel_StopsLoopsWithoutClose(t *testing.T) {
+	t.Parallel()
 	c := mustNewConsumer(t)
 
-	t.Log("шаг 2: регистрируем обработчик для топика 'lifecycle-test'")
 	handler := &mockHandler{}
-	if err := c.AddHandler("lifecycle-test", handler); err != nil {
-		t.Fatalf("AddHandler() завершился с ошибкой: %v", err)
+	if err := c.AddHandler("ctx-cancel-topic", handler); err != nil {
+		t.Fatalf("AddHandler() вернул неожиданную ошибку: %v", err)
 	}
-
-	t.Log("шаг 3: подписываемся на топики")
 	if err := c.SubscribeAll(); err != nil {
-		t.Fatalf("SubscribeAll() завершился с ошибкой: %v", err)
+		t.Fatalf("SubscribeAll() вернул неожиданную ошибку: %v", err)
 	}
 
-	t.Log("шаг 4: запускаем consumer loop")
-	if err := c.Start(context.Background()); err != nil {
-		t.Fatalf("Start() завершился с ошибкой: %v", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start() вернул неожиданную ошибку: %v", err)
 	}
 
-	// Даём горутинам время запуститься; при недоступном брокере
-	// consumer loop будет получать ошибки ReadMessage — это штатно.
-	pause := 150 * time.Millisecond
-	t.Logf("шаг 5: ожидаем %s для запуска горутин", pause)
-	time.Sleep(pause)
+	t.Log("отменяем ctx, переданный в Start — в отличие от продюсера, это НЕ эквивалентно Stop()")
+	cancel()
 
-	t.Log("шаг 6: останавливаем консьюмер")
 	done := make(chan struct{})
 	go func() {
 		c.Stop()
@@ -270,15 +350,27 @@ func TestKafkaConsumer_FullLifecycle(t *testing.T) {
 
 	select {
 	case <-done:
-		t.Log("Stop() завершился в пределах GracefulTimeout ✓")
+		t.Log("Stop() после отмены ctx завершился штатно в пределах GracefulTimeout ✓")
 	case <-time.After(testConfig().GracefulTimeout + time.Second):
-		t.Fatalf("Stop() завис дольше GracefulTimeout=%s", testConfig().GracefulTimeout)
+		t.Fatalf("Stop() после отмены ctx завис дольше GracefulTimeout=%s", testConfig().GracefulTimeout)
 	}
+}
 
-	// ProcessMessage не должен был быть вызван — реального брокера нет.
-	if calls := handler.callCount(); calls != 0 {
-		t.Logf("информация: ProcessMessage был вызван %d раз (брокер оказался доступен)", calls)
-	} else {
-		t.Log("ProcessMessage не вызывался при недоступном брокере ✓")
+// TestKafkaConsumer_ConcurrentStop проверяет отсутствие гонок при конкурентном
+// вызове Stop() из нескольких горутин на одном инстансе — isStopping корректно
+// реализован через atomic.Bool с CompareAndSwap, но раньше это проверялось
+// только последовательными вызовами.
+func TestKafkaConsumer_ConcurrentStop(t *testing.T) {
+	t.Parallel()
+	c := mustNewConsumer(t)
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			c.Stop()
+		})
 	}
+	wg.Wait()
+
+	t.Log("конкурентные Stop() завершились без гонок и паник ✓")
 }

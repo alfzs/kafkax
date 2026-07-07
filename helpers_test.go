@@ -61,12 +61,14 @@ type mockHandler struct {
 	mu        sync.Mutex
 	calls     int
 	returnErr error
+	lastMsg   IncomingMessage
 }
 
-func (h *mockHandler) ProcessMessage(_ context.Context, _ IncomingMessage) error {
+func (h *mockHandler) ProcessMessage(_ context.Context, msg IncomingMessage) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.calls++
+	h.lastMsg = msg
 	return h.returnErr
 }
 
@@ -74,6 +76,12 @@ func (h *mockHandler) callCount() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.calls
+}
+
+func (h *mockHandler) lastMessage() IncomingMessage {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastMsg
 }
 
 // mustNewProducer создаёт продюсер для тестов.
@@ -89,6 +97,19 @@ func mustNewProducer(t *testing.T) *KafkaProducer {
 	return p
 }
 
+// fastCommitConfig возвращает testConfig() с уменьшенными SessionTimeout/
+// SocketTimeout: без брокера синхронный CommitMessage блокируется на "Local:
+// Waiting for coordinator" вплоть до SessionTimeout (10s в testConfig()) —
+// тестам, вызывающим handleMessage напрямую, не нужна точная длительность
+// таймаута группы, только его короткое и предсказуемое истечение.
+func fastCommitConfig() Config {
+	cfg := testConfig()
+	cfg.Consumer.SessionTimeout = time.Second
+	cfg.Consumer.SocketTimeout = time.Second
+	cfg.Consumer.HeartbeatInterval = 300 * time.Millisecond
+	return cfg
+}
+
 // mustNewConsumer создаёт консьюмер для тестов.
 // Пропускает тест, если librdkafka не может инициализировать клиент.
 func mustNewConsumer(t *testing.T) *KafkaConsumer {
@@ -99,5 +120,18 @@ func mustNewConsumer(t *testing.T) *KafkaConsumer {
 	}
 	t.Cleanup(c.Stop)
 	t.Logf("консьюмер создан: group=%s broker=%s", testConfig().Consumer.Group, testConfig().Brokers[0])
+	return c
+}
+
+// mustNewConsumerWithConfig — вариант mustNewConsumer с явно переданным Config
+// (например, fastCommitConfig() для тестов, вызывающих handleMessage напрямую).
+func mustNewConsumerWithConfig(t *testing.T, cfg Config) *KafkaConsumer {
+	t.Helper()
+	c, err := NewKafkaConsumer(cfg)
+	if err != nil {
+		t.Skipf("пропуск: не удалось создать консьюмер (librdkafka): %v", err)
+	}
+	t.Cleanup(c.Stop)
+	t.Logf("консьюмер создан: group=%s broker=%s", cfg.Consumer.Group, cfg.Brokers[0])
 	return c
 }

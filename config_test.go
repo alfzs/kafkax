@@ -5,6 +5,92 @@ import (
 	"testing"
 )
 
+// TestBuildProducerKafkaConfig проверяет прямой маппинг Config в kafka.ConfigMap,
+// включая условное включение SASL-параметров по протоколу.
+func TestBuildProducerKafkaConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("PLAINTEXT не добавляет SASL-ключи", func(t *testing.T) {
+		t.Parallel()
+		cfg := testConfig()
+		cfg.SecurityProtocol = "PLAINTEXT"
+
+		got := buildProducerKafkaConfig(cfg)
+
+		if _, ok := got["sasl.mechanisms"]; ok {
+			t.Fatal("buildProducerKafkaConfig() добавил sasl.mechanisms для PLAINTEXT")
+		}
+		if got["compression.type"] != cfg.Producer.CompressionType {
+			t.Fatalf("compression.type=%v, ожидалось %v", got["compression.type"], cfg.Producer.CompressionType)
+		}
+		if got["linger.ms"] != int(cfg.Producer.Linger.Milliseconds()) {
+			t.Fatalf("linger.ms=%v, ожидалось %v", got["linger.ms"], int(cfg.Producer.Linger.Milliseconds()))
+		}
+		if got["bootstrap.servers"] != strings.Join(cfg.Brokers, ",") {
+			t.Fatalf("bootstrap.servers=%v, ожидалось %v", got["bootstrap.servers"], strings.Join(cfg.Brokers, ","))
+		}
+	})
+
+	t.Run("SASL_SSL добавляет SASL-ключи", func(t *testing.T) {
+		t.Parallel()
+		cfg := testConfig()
+		cfg.SecurityProtocol = "SASL_SSL"
+		cfg.SASL = SASL{Username: "user", Password: "secret", Mechanism: "PLAIN"}
+
+		got := buildProducerKafkaConfig(cfg)
+
+		if got["sasl.mechanisms"] != "PLAIN" {
+			t.Fatalf("sasl.mechanisms=%v, ожидалось PLAIN", got["sasl.mechanisms"])
+		}
+		if got["sasl.username"] != "user" || got["sasl.password"] != "secret" {
+			t.Fatalf("sasl.username/password=%v/%v, ожидалось user/secret", got["sasl.username"], got["sasl.password"])
+		}
+	})
+}
+
+// TestBuildConsumerKafkaConfig проверяет прямой маппинг Config в kafka.ConfigMap
+// для консьюмера, включая group.id и условное включение SASL-параметров.
+func TestBuildConsumerKafkaConfig(t *testing.T) {
+	t.Parallel()
+
+	t.Run("PLAINTEXT не добавляет SASL-ключи", func(t *testing.T) {
+		t.Parallel()
+		cfg := testConfig()
+		cfg.SecurityProtocol = "PLAINTEXT"
+
+		got := buildConsumerKafkaConfig(cfg)
+
+		if _, ok := got["sasl.mechanisms"]; ok {
+			t.Fatal("buildConsumerKafkaConfig() добавил sasl.mechanisms для PLAINTEXT")
+		}
+		if got["group.id"] != cfg.Consumer.Group {
+			t.Fatalf("group.id=%v, ожидалось %v", got["group.id"], cfg.Consumer.Group)
+		}
+		if got["enable.auto.commit"] != cfg.Consumer.EnableAutoCommit {
+			t.Fatalf("enable.auto.commit=%v, ожидалось %v", got["enable.auto.commit"], cfg.Consumer.EnableAutoCommit)
+		}
+		if got["auto.offset.reset"] != cfg.Consumer.InitialOffset {
+			t.Fatalf("auto.offset.reset=%v, ожидалось %v", got["auto.offset.reset"], cfg.Consumer.InitialOffset)
+		}
+	})
+
+	t.Run("SASL_PLAINTEXT добавляет SASL-ключи", func(t *testing.T) {
+		t.Parallel()
+		cfg := testConfig()
+		cfg.SecurityProtocol = "SASL_PLAINTEXT"
+		cfg.SASL = SASL{Username: "user", Password: "secret", Mechanism: "SCRAM-SHA-256"}
+
+		got := buildConsumerKafkaConfig(cfg)
+
+		if got["sasl.mechanisms"] != "SCRAM-SHA-256" {
+			t.Fatalf("sasl.mechanisms=%v, ожидалось SCRAM-SHA-256", got["sasl.mechanisms"])
+		}
+		if got["sasl.username"] != "user" || got["sasl.password"] != "secret" {
+			t.Fatalf("sasl.username/password=%v/%v, ожидалось user/secret", got["sasl.username"], got["sasl.password"])
+		}
+	})
+}
+
 func TestConfig_Validate(t *testing.T) {
 	t.Parallel()
 
