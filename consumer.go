@@ -465,8 +465,7 @@ func (c *KafkaConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
 	topic := *msg.TopicPartition.Topic
 
 	// Извлекаем trace context из Kafka headers и создаём consumer-span.
-	headers := msg.Headers
-	extractCtx := c.propagator.Extract(ctx, newKafkaHeaderCarrier(&headers))
+	extractCtx := c.propagator.Extract(ctx, newKafkaHeaderCarrier(new(msg.Headers)))
 	ctx, span := c.tracer.Start(extractCtx, topic+" process",
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(
@@ -479,12 +478,19 @@ func (c *KafkaConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
 		))
 	defer span.End()
 
+	// trace_id прикрепляется к логгеру, чтобы можно было перейти от лога к трейсу
+	// (тот же подход, что и в producer.SendMessage).
+	log := c.logger
+	if sc := span.SpanContext(); sc.IsValid() {
+		log = log.With(slog.String("trace_id", sc.TraceID().String()))
+	}
+
 	c.handlersMu.RLock()
 	handler, ok := c.handlers[topic]
 	c.handlersMu.RUnlock()
 
 	if !ok {
-		c.logger.Error("No handler for topic", slog.String("topic", topic))
+		log.Error("No handler for topic", slog.String("topic", topic))
 		return
 	}
 
@@ -501,18 +507,19 @@ func (c *KafkaConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
 			handlerErr = err
 
 			if maxRetries > 0 && attempt >= maxRetries {
-				c.logger.Error("Skipping message after max retries",
+				log.Error("Skipping message after max retries",
 					slog.String("topic", topic),
 					slog.Int("partition", int(msg.TopicPartition.Partition)),
 					slog.Int64("offset", int64(msg.TopicPartition.Offset)),
 					slog.Int("attempts", attempt),
 					slog.Any("error", err))
+				span.RecordError(err)
 				span.SetStatus(codes.Error, err.Error())
 				c.metrics.failed.Add(ctx, 1, topicAttr)
 				break
 			}
 
-			c.logger.Warn("Handler failed, retrying",
+			log.Warn("Handler failed, retrying",
 				slog.String("topic", topic),
 				slog.Int("partition", int(msg.TopicPartition.Partition)),
 				slog.Int64("offset", int64(msg.TopicPartition.Offset)),
@@ -547,7 +554,7 @@ func (c *KafkaConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
 	// Коммитим offset в любом случае: при успехе — нормально, при провале
 	// после max retries — пропускаем сообщение (poison pill protection).
 	if _, err := c.consumer.CommitMessage(msg); err != nil {
-		c.logger.Error("Failed to commit message",
+		log.Error("Failed to commit message",
 			slog.String("topic", topic),
 			slog.Int("partition", int(msg.TopicPartition.Partition)),
 			slog.Int64("offset", int64(msg.TopicPartition.Offset)),

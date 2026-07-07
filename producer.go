@@ -161,16 +161,21 @@ func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error
 	// Observable gauge: суммарная глубина очередей всех воркеров.
 	// Захватывает p по указателю — безопасно, т.к. p живёт дольше любого тика метрик.
 	// После Close() tenantPools пуст, callback просто ничего не наблюдает.
+	//
+	// tenant_id как label не используется намеренно: число тенантов неограниченно,
+	// а unbounded label взрывает кардинальность метрики в бэкенде. Поэтому глубина
+	// суммируется по всем тенантам в одно значение.
 	_, _ = meter.Int64ObservableGauge("kafkax.producer.queue.depth",
-		metric.WithDescription("Messages pending in tenant worker queues"),
+		metric.WithDescription("Total messages pending across all tenant worker queues"),
 		metric.WithUnit("{message}"),
 		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
 			p.workerLock.RLock()
 			defer p.workerLock.RUnlock()
-			for tenantID, w := range p.tenantPools {
-				o.Observe(int64(len(w.messageChan)),
-					metric.WithAttributes(attribute.String("tenant_id", tenantID.String())))
+			var total int64
+			for _, w := range p.tenantPools {
+				total += int64(len(w.messageChan))
 			}
+			o.Observe(total)
 			return nil
 		}))
 
@@ -385,7 +390,7 @@ func (p *KafkaProducer) handleMessage(msg Message, logger *slog.Logger) {
 // и завершить воркеры до вызова producer.Close(). Сообщение при этом могло
 // уже попасть в очередь librdkafka и будет доставлено через Flush() —
 // возврат ошибки не гарантирует недоставку.
-func (p *KafkaProducer) produce(msg Message) error {
+func (p *KafkaProducer) produce(msg Message) (err error) {
 	headers := make([]kafka.Header, 0, 4)
 
 	// Создаём producer-span и инжектируем trace context в headers.
@@ -398,12 +403,26 @@ func (p *KafkaProducer) produce(msg Message) error {
 		))
 	defer span.End()
 
+	topicAttr := metric.WithAttributes(attribute.String("topic", msg.Topic))
+
+	// Гистограмма latency пишется для любого исхода (не только success),
+	// иначе отправки с ошибкой/таймаутом выпадают из распределения и p99
+	// выглядит здоровым даже при росте доли отказов.
+	start := time.Now()
+	defer func() {
+		status := "success"
+		if err != nil {
+			status = "error"
+		}
+		p.metrics.messageLatency.Record(ctx, float64(time.Since(start).Milliseconds()),
+			metric.WithAttributes(attribute.String("topic", msg.Topic), attribute.String("status", status)))
+	}()
+
 	p.propagator.Inject(ctx, newKafkaHeaderCarrier(&headers))
 
 	deliveryChan := make(chan kafka.Event, 1)
 
-	start := time.Now()
-	err := p.producer.Produce(&kafka.Message{
+	if produceErr := p.producer.Produce(&kafka.Message{
 		TopicPartition: kafka.TopicPartition{
 			Topic:     &msg.Topic,
 			Partition: kafka.PartitionAny,
@@ -411,12 +430,12 @@ func (p *KafkaProducer) produce(msg Message) error {
 		Key:     msg.Key,
 		Value:   msg.Value,
 		Headers: headers,
-	}, deliveryChan)
-
-	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
-		p.metrics.failed.Add(ctx, 1, metric.WithAttributes(attribute.String("topic", msg.Topic)))
-		return fmt.Errorf("produce error: %w", err)
+	}, deliveryChan); produceErr != nil {
+		span.RecordError(produceErr)
+		span.SetStatus(codes.Error, produceErr.Error())
+		p.metrics.failed.Add(ctx, 1, topicAttr)
+		err = fmt.Errorf("produce error: %w", produceErr)
+		return err
 	}
 
 	timer := time.NewTimer(msg.Timeout)
@@ -426,19 +445,21 @@ func (p *KafkaProducer) produce(msg Message) error {
 	case e := <-deliveryChan:
 		m, ok := e.(*kafka.Message)
 		if !ok {
-			err := fmt.Errorf("unexpected event type %T", e)
-			span.SetStatus(codes.Error, err.Error())
-			p.metrics.failed.Add(ctx, 1, metric.WithAttributes(attribute.String("topic", msg.Topic)))
+			unexpectedErr := fmt.Errorf("unexpected event type %T", e)
+			span.RecordError(unexpectedErr)
+			span.SetStatus(codes.Error, unexpectedErr.Error())
+			p.metrics.failed.Add(ctx, 1, topicAttr)
+			err = unexpectedErr
 			return err
 		}
 		if m.TopicPartition.Error != nil {
+			span.RecordError(m.TopicPartition.Error)
 			span.SetStatus(codes.Error, m.TopicPartition.Error.Error())
-			p.metrics.failed.Add(ctx, 1, metric.WithAttributes(attribute.String("topic", msg.Topic)))
-			return fmt.Errorf("delivery error: %w", m.TopicPartition.Error)
+			p.metrics.failed.Add(ctx, 1, topicAttr)
+			err = fmt.Errorf("delivery error: %w", m.TopicPartition.Error)
+			return err
 		}
-		durationMs := float64(time.Since(start).Milliseconds())
-		p.metrics.sent.Add(ctx, 1, metric.WithAttributes(attribute.String("topic", msg.Topic)))
-		p.metrics.messageLatency.Record(ctx, durationMs, metric.WithAttributes(attribute.String("topic", msg.Topic)))
+		p.metrics.sent.Add(ctx, 1, topicAttr)
 		span.SetAttributes(
 			attribute.Int("messaging.kafka.partition", int(m.TopicPartition.Partition)),
 			attribute.Int64("messaging.kafka.offset", int64(m.TopicPartition.Offset)),
@@ -446,13 +467,18 @@ func (p *KafkaProducer) produce(msg Message) error {
 		return nil
 	case <-p.ctx.Done():
 		// Нормальное завершение при shutdown — не помечаем span как ошибку.
-		return fmt.Errorf("producer is shutting down")
+		err = fmt.Errorf("producer is shutting down")
+		return err
 	case <-msg.Ctx.Done():
+		span.RecordError(msg.Ctx.Err())
 		span.SetStatus(codes.Error, msg.Ctx.Err().Error())
-		return msg.Ctx.Err()
+		err = msg.Ctx.Err()
+		return err
 	case <-timer.C:
-		err := fmt.Errorf("produce timeout after %v", msg.Timeout)
-		span.SetStatus(codes.Error, err.Error())
+		timeoutErr := fmt.Errorf("produce timeout after %v", msg.Timeout)
+		span.RecordError(timeoutErr)
+		span.SetStatus(codes.Error, timeoutErr.Error())
+		err = timeoutErr
 		return err
 	}
 }
