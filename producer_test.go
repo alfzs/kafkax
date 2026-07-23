@@ -139,7 +139,7 @@ func TestKafkaProducer_SendMessage_ContextCanceled(t *testing.T) {
 	t.Parallel()
 
 	p := mustNewProducer(t)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 
 	t.Log("отменяем контекст до вызова SendMessage")
 	cancel()
@@ -177,7 +177,7 @@ func TestKafkaProducer_Close_Idempotent(t *testing.T) {
 func TestKafkaProducer_ContextCancel_TriggersShutdown(t *testing.T) {
 	t.Parallel()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 
 	p, err := NewKafkaProducer(ctx, testConfig())
 	if err != nil {

@@ -91,7 +91,15 @@ type consumerMetrics struct {
 	workersActive  metric.Int64UpDownCounter
 }
 
-// KafkaConsumer — консьюмер Kafka с изоляцией обработки по партициям.
+// MessageConsumer — интерфейс консьюмера с partition-изоляцией.
+type MessageConsumer interface {
+	AddHandler(topic string, handler ConsumerHandler, mws ...ConsumerMiddleware) error
+	SubscribeAll() error
+	Start(ctx context.Context) error
+	Stop()
+}
+
+// KafkaConsumer — реализация MessageConsumer.
 // Для каждой активной партиции поддерживается отдельный воркер, что обеспечивает
 // параллельную обработку сообщений из разных партиций при сохранении порядка внутри одной.
 // Безопасен для конкурентного использования из нескольких горутин.

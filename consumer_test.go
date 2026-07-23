@@ -350,7 +350,7 @@ func TestKafkaConsumer_StartContextCancel_StopsLoopsWithoutClose(t *testing.T) {
 		t.Fatalf("SubscribeAll() вернул неожиданную ошибку: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	if err := c.Start(ctx); err != nil {
 		t.Fatalf("Start() вернул неожиданную ошибку: %v", err)
 	}

@@ -20,7 +20,7 @@ func TestConsumerHandlerFunc(t *testing.T) {
 		return nil
 	})
 
-	err := handler.ProcessMessage(context.Background(), IncomingMessage{})
+	err := handler.ProcessMessage(t.Context(), IncomingMessage{})
 	if err != nil {
 		t.Fatalf("ProcessMessage() вернул неожиданную ошибку: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestChain_NoMiddleware(t *testing.T) {
 	})
 
 	chained := Chain(handler)
-	_ = chained.ProcessMessage(context.Background(), IncomingMessage{})
+	_ = chained.ProcessMessage(t.Context(), IncomingMessage{})
 
 	if calls.Load() != 1 {
 		t.Fatalf("ProcessMessage() вызван %d раз, ожидалось 1", calls.Load())
@@ -70,7 +70,7 @@ func TestChain_SingleMiddleware(t *testing.T) {
 	}
 
 	chained := Chain(handler, mw)
-	_ = chained.ProcessMessage(context.Background(), IncomingMessage{})
+	_ = chained.ProcessMessage(t.Context(), IncomingMessage{})
 
 	expected := []string{"mw-start", "handler", "mw-end"}
 	if len(order) != len(expected) || order[0] != expected[0] || order[1] != expected[1] || order[2] != expected[2] {
@@ -113,7 +113,7 @@ func TestChain_MultipleMiddleware(t *testing.T) {
 	// Chain(handler, mw1, mw2) → mw1(mw2(handler))
 	// Порядок: mw1-start → mw2-start → handler → mw2-end → mw1-end
 	chained := Chain(handler, mw1, mw2)
-	_ = chained.ProcessMessage(context.Background(), IncomingMessage{})
+	_ = chained.ProcessMessage(t.Context(), IncomingMessage{})
 
 	expected := []string{"mw1-start", "mw2-start", "handler", "mw2-end", "mw1-end"}
 	if len(order) != len(expected) {
@@ -151,14 +151,14 @@ func TestChain_MiddlewareSkipsInner(t *testing.T) {
 	chained := Chain(handler, filter)
 
 	// Сообщение с пустым Key — фильтр должен скипнуть
-	_ = chained.ProcessMessage(context.Background(), IncomingMessage{})
+	_ = chained.ProcessMessage(t.Context(), IncomingMessage{})
 
 	if innerCalls.Load() != 0 {
 		t.Fatalf("inner вызван %d раз, ожидалось 0 (фильтр должен скипнуть)", innerCalls.Load())
 	}
 
 	// Сообщение с непустым Key — фильтр пропускает
-	_ = chained.ProcessMessage(context.Background(), IncomingMessage{Key: []byte("key")})
+	_ = chained.ProcessMessage(t.Context(), IncomingMessage{Key: []byte("key")})
 
 	if innerCalls.Load() != 1 {
 		t.Fatalf("inner вызван %d раз, ожидалось 1 (фильтр должен пропустить)", innerCalls.Load())

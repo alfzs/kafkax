@@ -34,7 +34,7 @@ func testConfig() Config {
 			MaxRetries:            0,
 			RetryBackoff:          100 * time.Millisecond,
 			BatchSize:             10,
-			BatchBytes:            1048576,
+			BatchBytes:            4096,
 			BatchTimeout:          10 * time.Millisecond,
 			CompressionType:       "none",
 			MaxInflight:           5,

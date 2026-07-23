@@ -30,6 +30,9 @@ type tenantWorker struct {
 	// (актуально на 32-битных платформах).
 	inFlight    atomic.Int64
 	messageChan chan message
+	// drainCh закрывается, когда все inFlight завершились во время drain.
+	// Позволяет заменить spin-wait (runtime.Gosched) на канальный сигнал.
+	drainCh chan struct{}
 	//nolint:containedctx // lifecycle-контекст воркера (аналог BaseContext), не запросный — см. sprints/context-audit.md
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -74,7 +77,13 @@ type producerMetrics struct {
 	workersActive  metric.Int64UpDownCounter
 }
 
-// KafkaProducer — продюсер Kafka с изоляцией по тенантам.
+// MessageProducer — интерфейс продюсера с tenant-изоляцией.
+type MessageProducer interface {
+	SendMessage(ctx context.Context, req PublishRequest) error
+	Close()
+}
+
+// KafkaProducer — реализация MessageProducer.
 // Для каждого уникального TenantID поддерживается отдельный воркер с буферным каналом,
 // что обеспечивает независимую обработку очередей разных тенантов.
 // Безопасен для конкурентного использования из нескольких горутин.
@@ -370,6 +379,7 @@ func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID) (*tenantWorker, er
 	workerCtx, cancel := context.WithCancel(p.ctx)
 	worker = &tenantWorker{
 		messageChan:  make(chan message, p.messageChanBuffer),
+		drainCh:      make(chan struct{}),
 		ctx:          workerCtx,
 		cancel:       cancel,
 		lastActivity: time.Now(),
@@ -419,17 +429,35 @@ func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker) {
 			//
 			// inFlight check: SendMessage мог пройти fast-path getOrCreateWorker
 			// (inFlight++) до отмены контекста, но ещё не записал в messageChan.
-			// Spin-wait гарантирует, что мы не выйдем раньше этой записи.
+			// Сигнальная горутина ждёт обнуления inFlight и закрывает drainCh,
+			// чтобы основной цикл не тратил CPU на spin-wait (runtime.Gosched).
+			//
+			// Таймаут drain (GracefulTimeout) предотвращает вечную блокировку,
+			// если inFlight не обнуляется — единообразно с consumer.
+			drainCtx, drainCancel := context.WithTimeout(
+				context.WithoutCancel(worker.ctx), p.config.GracefulTimeout)
+			defer drainCancel()
+
+			go func() {
+				for worker.inFlight.Load() > 0 {
+					select {
+					case <-drainCtx.Done():
+						return
+					default:
+						runtime.Gosched()
+					}
+				}
+
+				close(worker.drainCh)
+			}()
+
 			for {
 				select {
 				case msg := <-worker.messageChan:
 					p.handleMessage(msg, worker.logger)
-				default:
-					if worker.inFlight.Load() > 0 {
-						runtime.Gosched()
-						continue
-					}
-
+				case <-worker.drainCh:
+					return
+				case <-drainCtx.Done():
 					return
 				}
 			}
