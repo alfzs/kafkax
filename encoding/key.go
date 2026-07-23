@@ -38,13 +38,13 @@ func EncodeKey(parts ...any) ([]byte, error) {
 			}
 
 			lenBuf := make([]byte, 4)
-			binary.BigEndian.PutUint32(lenBuf, uint32(len(v)))
+			binary.BigEndian.PutUint32(lenBuf, uint32(len(v))) //nolint:gosec // length already validated above
 			buf = append(buf, lenBuf...)
 			buf = append(buf, v...)
 
 		case int64:
 			intBuf := make([]byte, 8)
-			binary.BigEndian.PutUint64(intBuf, uint64(v))
+			binary.BigEndian.PutUint64(intBuf, uint64(v)) //nolint:gosec // intentional reinterpretation for big-endian encoding
 			buf = append(buf, intBuf...)
 
 		case bool:

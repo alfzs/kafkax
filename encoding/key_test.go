@@ -47,7 +47,7 @@ func TestEncodeKey_String(t *testing.T) {
 	}
 
 	gotLen := uint32(key[0])<<24 | uint32(key[1])<<16 | uint32(key[2])<<8 | uint32(key[3])
-	if gotLen != uint32(len(s)) {
+	if gotLen != uint32(len(s)) { //nolint:gosec // test fixture, len(s) is trivially small
 		t.Fatalf("string length = %d, ожидалось %d", gotLen, len(s))
 	}
 
@@ -216,6 +216,7 @@ func TestMatchKey_Exact(t *testing.T) {
 	t.Parallel()
 
 	id := uuid.MustParse("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+
 	key, err := EncodeKey(id, "bot-1")
 	if err != nil {
 		t.Fatalf("EncodeKey() вернул ошибку: %v", err)
@@ -230,6 +231,7 @@ func TestMatchKey_WrongString(t *testing.T) {
 	t.Parallel()
 
 	id := uuid.MustParse("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+
 	key, err := EncodeKey(id, "bot-1")
 	if err != nil {
 		t.Fatalf("EncodeKey() вернул ошибку: %v", err)
@@ -245,6 +247,7 @@ func TestMatchKey_WrongUUID(t *testing.T) {
 
 	id1 := uuid.MustParse("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
 	id2 := uuid.MustParse("b2c3d4e5-f6a7-8901-bcde-f12345678901")
+
 	key, err := EncodeKey(id1, "bot-1")
 	if err != nil {
 		t.Fatalf("EncodeKey() вернул ошибку: %v", err)

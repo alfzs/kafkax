@@ -12,15 +12,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
-
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"github.com/google/uuid"
 )
 
 type tenantWorker struct {
@@ -31,13 +30,13 @@ type tenantWorker struct {
 	// (актуально на 32-битных платформах).
 	inFlight    atomic.Int64
 	messageChan chan message
-	//nolint:containedctx // lifecycle-контекст воркера (аналог BaseContext), не запросный — см. docs/context-audit.md
+	//nolint:containedctx // lifecycle-контекст воркера (аналог BaseContext), не запросный — см. sprints/context-audit.md
 	ctx          context.Context
 	cancel       context.CancelFunc
 	lastActivity time.Time
 	mu           sync.Mutex
 	// logger декорирован tenant_id один раз при создании воркера, а не на
-	// каждый SendMessage — см. docs/performance-audit.md.
+	// каждый SendMessage — см. sprints/performance-audit.md.
 	logger *slog.Logger
 }
 
@@ -57,7 +56,7 @@ func (w *tenantWorker) getLastActivity() time.Time {
 
 // message — внутренняя единица очереди воркера тенанта, не часть публичного API.
 type message struct {
-	//nolint:containedctx // message — элемент очереди воркера, передаваемый через канал; см. docs/context-audit.md
+	//nolint:containedctx // message — элемент очереди воркера, передаваемый через канал; см. sprints/context-audit.md
 	Ctx      context.Context
 	TenantID uuid.UUID
 	Topic    string
@@ -86,7 +85,7 @@ type KafkaProducer struct {
 	tenantPools map[uuid.UUID]*tenantWorker
 	workerLock  sync.RWMutex
 	wg          sync.WaitGroup
-	//nolint:containedctx // lifecycle-контекст компонента (аналог BaseContext), не запросный — см. docs/context-audit.md
+	//nolint:containedctx // lifecycle-контекст компонента (аналог BaseContext), не запросный — см. sprints/context-audit.md
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	closed                chan struct{}

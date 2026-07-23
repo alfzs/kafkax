@@ -302,7 +302,7 @@ func TestTLS_EndpointIdentAlgorithm(t *testing.T) {
 		got := tls.endpointIdentAlgorithm()
 
 		// security: пустое значение НЕ должно молча отключать проверку hostname
-		// (CWE-295) — см. docs/security-audit.md. "https" совпадает с
+		// (CWE-295) — см. sprints/security-audit.md. "https" совпадает с
 		// собственным умолчанием librdkafka для ssl.endpoint.identification.algorithm.
 		if got != tlsIdentAlgorithmHTTPS {
 			t.Fatalf("endpointIdentAlgorithm()=%q, ожидалось %q (secure-by-default, как в librdkafka)", got, tlsIdentAlgorithmHTTPS)

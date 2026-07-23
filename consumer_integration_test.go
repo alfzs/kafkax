@@ -11,7 +11,7 @@ import (
 // создание → регистрация обработчика → подписка → запуск → остановка. Помечен
 // как integration: тест содержит реальные временные паузы против настоящего
 // (недоступного) брокера, а не проверяет чистую логику — см.
-// docs/test-audit.md, находка 9.
+// sprints/test-audit.md, находка 9.
 func TestKafkaConsumer_FullLifecycle(t *testing.T) {
 	t.Parallel()
 

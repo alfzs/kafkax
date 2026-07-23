@@ -13,14 +13,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
-
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
 
 // IncomingMessage — сообщение Kafka, переданное в ConsumerHandler.
@@ -33,6 +32,19 @@ type IncomingMessage struct {
 	Headers   Headers
 }
 
+// ConsumerHandler is the interface that wraps ProcessMessage.
+type ConsumerHandler interface {
+	ProcessMessage(ctx context.Context, msg IncomingMessage) error
+}
+
+// ConsumerHandlerFunc is an adapter to allow the use of ordinary functions as ConsumerHandler.
+type ConsumerHandlerFunc func(context.Context, IncomingMessage) error
+
+// ProcessMessage calls f(ctx, msg).
+func (f ConsumerHandlerFunc) ProcessMessage(ctx context.Context, msg IncomingMessage) error {
+	return f(ctx, msg)
+}
+
 type partitionWorker struct {
 	// inFlight — число processMessage, держащих ссылку на этот воркер.
 	// atomic.Int64 вместо atomic.AddInt64/LoadInt64 на обычном int64:
@@ -41,13 +53,13 @@ type partitionWorker struct {
 	// (актуально на 32-битных платформах).
 	inFlight    atomic.Int64
 	messageChan chan *kafka.Message
-	//nolint:containedctx // lifecycle-контекст воркера (аналог BaseContext), не запросный — см. docs/context-audit.md
+	//nolint:containedctx // lifecycle-контекст воркера (аналог BaseContext), не запросный — см. sprints/context-audit.md
 	ctx          context.Context
 	cancel       context.CancelFunc
 	lastActivity time.Time
 	mu           sync.Mutex
 	// logger декорирован topic/partition один раз при создании воркера, а не
-	// на каждое сообщение — см. docs/performance-audit.md.
+	// на каждое сообщение — см. sprints/performance-audit.md.
 	logger *slog.Logger
 }
 
@@ -92,7 +104,7 @@ type KafkaConsumer struct {
 	workers    map[workerKey]*partitionWorker
 	workersMu  sync.RWMutex
 	wg         sync.WaitGroup
-	//nolint:containedctx // lifecycle-контекст компонента (аналог BaseContext), не запросный — см. docs/context-audit.md
+	//nolint:containedctx // lifecycle-контекст компонента (аналог BaseContext), не запросный — см. sprints/context-audit.md
 	ctx                   context.Context
 	cancel                context.CancelFunc
 	isStopping            atomic.Bool

@@ -14,6 +14,7 @@ func TestConsumerHandlerFunc(t *testing.T) {
 	t.Parallel()
 
 	var calls atomic.Int64
+
 	handler := ConsumerHandlerFunc(func(_ context.Context, _ IncomingMessage) error {
 		calls.Add(1)
 		return nil
@@ -23,6 +24,7 @@ func TestConsumerHandlerFunc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessMessage() вернул неожиданную ошибку: %v", err)
 	}
+
 	if calls.Load() != 1 {
 		t.Fatalf("ProcessMessage() вызван %d раз, ожидалось 1", calls.Load())
 	}
@@ -32,6 +34,7 @@ func TestChain_NoMiddleware(t *testing.T) {
 	t.Parallel()
 
 	var calls atomic.Int64
+
 	handler := ConsumerHandlerFunc(func(_ context.Context, _ IncomingMessage) error {
 		calls.Add(1)
 		return nil
@@ -59,7 +62,9 @@ func TestChain_SingleMiddleware(t *testing.T) {
 		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
 			order = append(order, "mw-start")
 			err := next.ProcessMessage(ctx, msg)
+
 			order = append(order, "mw-end")
+
 			return err
 		})
 	}
@@ -87,7 +92,9 @@ func TestChain_MultipleMiddleware(t *testing.T) {
 		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
 			order = append(order, "mw1-start")
 			err := next.ProcessMessage(ctx, msg)
+
 			order = append(order, "mw1-end")
+
 			return err
 		})
 	}
@@ -96,7 +103,9 @@ func TestChain_MultipleMiddleware(t *testing.T) {
 		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
 			order = append(order, "mw2-start")
 			err := next.ProcessMessage(ctx, msg)
+
 			order = append(order, "mw2-end")
+
 			return err
 		})
 	}
@@ -110,6 +119,7 @@ func TestChain_MultipleMiddleware(t *testing.T) {
 	if len(order) != len(expected) {
 		t.Fatalf("порядок вызовов(%d): %v, ожидалось %v", len(order), order, expected)
 	}
+
 	for i := range expected {
 		if order[i] != expected[i] {
 			t.Fatalf("позиция %d: %q, ожидалось %q; полный порядок: %v", i, order[i], expected[i], order)
@@ -133,6 +143,7 @@ func TestChain_MiddlewareSkipsInner(t *testing.T) {
 			if len(msg.Key) == 0 {
 				return nil
 			}
+
 			return next.ProcessMessage(ctx, msg)
 		})
 	}
@@ -141,12 +152,14 @@ func TestChain_MiddlewareSkipsInner(t *testing.T) {
 
 	// Сообщение с пустым Key — фильтр должен скипнуть
 	_ = chained.ProcessMessage(context.Background(), IncomingMessage{})
+
 	if innerCalls.Load() != 0 {
 		t.Fatalf("inner вызван %d раз, ожидалось 0 (фильтр должен скипнуть)", innerCalls.Load())
 	}
 
 	// Сообщение с непустым Key — фильтр пропускает
 	_ = chained.ProcessMessage(context.Background(), IncomingMessage{Key: []byte("key")})
+
 	if innerCalls.Load() != 1 {
 		t.Fatalf("inner вызван %d раз, ожидалось 1 (фильтр должен пропустить)", innerCalls.Load())
 	}
@@ -181,8 +194,10 @@ func TestKafkaConsumer_AddHandler_Middleware(t *testing.T) {
 	t.Parallel()
 	c := mustNewConsumerWithConfig(t, fastCommitConfig())
 
-	var outerCalls atomic.Int64
-	var innerCalls atomic.Int64
+	var (
+		outerCalls atomic.Int64
+		innerCalls atomic.Int64
+	)
 
 	handler := ConsumerHandlerFunc(func(_ context.Context, _ IncomingMessage) error {
 		innerCalls.Add(1)
@@ -208,6 +223,7 @@ func TestKafkaConsumer_AddHandler_Middleware(t *testing.T) {
 	}
 
 	done := make(chan struct{})
+
 	go func() {
 		c.handleMessage(t.Context(), msg)
 		close(done)
@@ -222,6 +238,7 @@ func TestKafkaConsumer_AddHandler_Middleware(t *testing.T) {
 	if outerCalls.Load() != 1 {
 		t.Fatalf("middleware вызван %d раз, ожидалось 1", outerCalls.Load())
 	}
+
 	if innerCalls.Load() != 1 {
 		t.Fatalf("handler вызван %d раз, ожидалось 1", innerCalls.Load())
 	}
@@ -245,6 +262,7 @@ func TestKafkaConsumer_AddHandler_MiddlewareFilter(t *testing.T) {
 			if len(msg.Key) == 0 {
 				return nil
 			}
+
 			return next.ProcessMessage(ctx, msg)
 		})
 	}
@@ -261,6 +279,7 @@ func TestKafkaConsumer_AddHandler_MiddlewareFilter(t *testing.T) {
 	}
 
 	done := make(chan struct{})
+
 	go func() {
 		c.handleMessage(t.Context(), msg)
 		close(done)

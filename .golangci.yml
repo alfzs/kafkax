@@ -130,17 +130,22 @@ linters:
       branch-max-lines: 2
 
 formatters:
+  # formatters are opt-in only (no `disable` key in the v2 schema) —
+  # goimports, golines and swaggo are simply left out of `enable` below.
+  # gci is enabled: gofumpt does NOT merge separate `import "x"` statements
+  # into one grouped block (verified — it leaves them untouched), so without
+  # gci that split-import style silently slips past formatting checks.
   enable:
     - gofmt
     - gofumpt
-  disable:
-    - gci        # import grouping/ordering — gofumpt already handles standard grouping
-    - goimports  # import management — redundant with gofumpt
-    - golines    # line wrapping — too opinionated, can break readability
-    - swaggo     # swaggo comment formatting — only for swaggo users
+    - gci
   settings:
     gofumpt:
       extra-rules: true
+    gci:
+      sections:
+        - standard
+        - default
   exclusions:
     generated: lax
     paths:

@@ -116,7 +116,7 @@ type TLS struct {
 // проверку hostname (CWE-295). Раньше пустое значение резолвилось в "none" ровно
 // так же, как и явный InsecureSkipVerify=true, из-за чего TLS без явно
 // прописанного IdentificationAlgorithm="https" был уязвим к MITM (см.
-// docs/security-audit.md). Теперь по умолчанию используется "https" —
+// sprints/security-audit.md). Теперь по умолчанию используется "https" —
 // собственное умолчание librdkafka — и "none" возвращается только при явном
 // InsecureSkipVerify=true.
 func (t TLS) endpointIdentAlgorithm() string {

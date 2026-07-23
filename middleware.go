@@ -1,22 +1,15 @@
 package kafkax
 
-import "context"
+import "slices"
 
-type ConsumerHandler interface {
-	ProcessMessage(ctx context.Context, msg IncomingMessage) error
-}
-
-type ConsumerHandlerFunc func(context.Context, IncomingMessage) error
-
-func (f ConsumerHandlerFunc) ProcessMessage(ctx context.Context, msg IncomingMessage) error {
-	return f(ctx, msg)
-}
-
+// ConsumerMiddleware is a function that wraps a ConsumerHandler.
 type ConsumerMiddleware func(ConsumerHandler) ConsumerHandler
 
+// Chain applies middlewares to a ConsumerHandler in reverse order.
 func Chain(handler ConsumerHandler, mws ...ConsumerMiddleware) ConsumerHandler {
-	for i := len(mws) - 1; i >= 0; i-- {
-		handler = mws[i](handler)
+	for _, v := range slices.Backward(mws) {
+		handler = v(handler)
 	}
+
 	return handler
 }
