@@ -84,5 +84,29 @@ func MatchKey(key []byte, parts ...any) bool {
 	return bytes.Equal(key, encoded)
 }
 
-// ErrInvalidKey — ключ короче минимального размера.
+// ErrInvalidKey — ключ короче размера, ожидаемого для заданных parts.
 var ErrInvalidKey = errors.New("encoding: invalid composite key")
+
+// ValidateKeyLength возвращает ErrInvalidKey, если key короче длины,
+// которую дало бы EncodeKey(parts...) — например, ключ Kafka-сообщения
+// усечён или повреждён. Декодирование не выполняется: длина ожидаемого
+// ключа вычисляется кодированием parts заново, как в MatchKey.
+//
+// Ключ длиннее ожидаемого не считается невалидным — это просто не то,
+// что закодировали бы parts, и обнаруживается сравнением в MatchKey.
+//
+// Полезно там, где важно отличить "ключ другого тенанта" (MatchKey вернёт
+// false для валидного по длине ключа) от "сообщение повреждено" — см.
+// MatchKeyMiddleware.
+func ValidateKeyLength(key []byte, parts ...any) error {
+	encoded, err := EncodeKey(parts...)
+	if err != nil {
+		return err
+	}
+
+	if len(key) < len(encoded) {
+		return fmt.Errorf("%w: got %d bytes, want at least %d", ErrInvalidKey, len(key), len(encoded))
+	}
+
+	return nil
+}

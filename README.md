@@ -97,6 +97,56 @@ consumer.Start(ctx)
 defer consumer.Stop()
 ```
 
+## Middleware консьюмера
+
+`AddHandler` принимает опциональную цепочку `ConsumerMiddleware` — обёртку над `ConsumerHandler` в духе `http.Handler`:
+
+```go
+type ConsumerMiddleware func(ConsumerHandler) ConsumerHandler
+```
+
+Middleware применяются в порядке перечисления: первый в списке — внешний (выполняется первым, может решить не звать `next` вовсе).
+
+```go
+consumer.AddHandler("orders", &orderHandler{}, loggingMiddleware, metricsMiddleware)
+```
+
+### MatchKeyMiddleware
+
+Пакет `encoding` предоставляет готовую middleware для маршрутизации сообщений с композитным ключом (см. ниже) — не тот адресат тихо пропускается, до `ProcessMessage` дело не доходит:
+
+```go
+consumer.AddHandler("events", &orderHandler{},
+    encoding.MatchKeyMiddleware(myTenantID, myExternalBotID))
+```
+
+## Композитные ключи
+
+`encoding.EncodeKey` собирает бинарный ключ Kafka-сообщения из нескольких значений (`uuid.UUID`, `string`, `int64`, `bool`) — без обратного декодирования: консьюмер знает свои значения и сравнивает, а не разбирает чужой ключ.
+
+```go
+// Продюсер
+key, err := encoding.EncodeKey(tenantID, externalBotID)
+if err != nil {
+    return err
+}
+
+producer.SendMessage(ctx, kafkax.PublishRequest{
+    Key: key,
+    ...
+})
+
+// Консьюмер — вручную, без Middleware
+func (h *handler) ProcessMessage(ctx context.Context, msg kafkax.IncomingMessage) error {
+    if !encoding.MatchKey(msg.Key, myTenantID, myExternalBotID) {
+        return nil // не наш адресат
+    }
+    ...
+}
+```
+
+`encoding.ValidateKeyLength(key, parts...)` проверяет, что `key` не короче длины, которую дал бы `EncodeKey(parts...)`, и возвращает `ErrInvalidKey`, если это не так — сигнал усечённого или повреждённого сообщения, в отличие от валидного по длине ключа другого тенанта (для него `MatchKey` просто вернёт `false`). `MatchKeyMiddleware` уже делает эту проверку сама.
+
 ## Архитектура
 
 ### Продюсер — изоляция по тенантам

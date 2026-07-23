@@ -1,6 +1,7 @@
 package encoding
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -400,5 +401,89 @@ func TestMatchKey_BoolMismatch(t *testing.T) {
 
 	if MatchKey(key, false) {
 		t.Fatal("MatchKey() true vs false = true, ожидалось false")
+	}
+}
+
+func TestValidateKeyLength_Exact(t *testing.T) {
+	t.Parallel()
+
+	id := uuid.MustParse("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+
+	key, err := EncodeKey(id, "bot-1")
+	if err != nil {
+		t.Fatalf("EncodeKey() вернул ошибку: %v", err)
+	}
+
+	if err := ValidateKeyLength(key, id, "bot-1"); err != nil {
+		t.Fatalf("ValidateKeyLength() вернул ошибку: %v", err)
+	}
+}
+
+func TestValidateKeyLength_Longer(t *testing.T) {
+	t.Parallel()
+
+	id := uuid.MustParse("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+
+	key, err := EncodeKey(id, "bot-1")
+	if err != nil {
+		t.Fatalf("EncodeKey() вернул ошибку: %v", err)
+	}
+
+	// key длиннее ожидаемого для одного uuid — не короче минимума, поэтому не ошибка.
+	if err := ValidateKeyLength(key, id); err != nil {
+		t.Fatalf("ValidateKeyLength() с более длинным key вернул ошибку: %v", err)
+	}
+}
+
+func TestValidateKeyLength_TooShort(t *testing.T) {
+	t.Parallel()
+
+	id := uuid.MustParse("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+
+	key, err := EncodeKey(id, "bot-1")
+	if err != nil {
+		t.Fatalf("EncodeKey() вернул ошибку: %v", err)
+	}
+
+	err = ValidateKeyLength(key[:len(key)-1], id, "bot-1")
+	if err == nil {
+		t.Fatal("ValidateKeyLength() вернул nil, ожидалась ошибка")
+	}
+
+	if !errors.Is(err, ErrInvalidKey) {
+		t.Fatalf("errors.Is(err, ErrInvalidKey) = false, err: %v", err)
+	}
+}
+
+func TestValidateKeyLength_NilKey(t *testing.T) {
+	t.Parallel()
+
+	id := uuid.MustParse("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+
+	err := ValidateKeyLength(nil, id, "bot-1")
+	if !errors.Is(err, ErrInvalidKey) {
+		t.Fatalf("errors.Is(err, ErrInvalidKey) = false, err: %v", err)
+	}
+}
+
+func TestValidateKeyLength_EmptyPartsNilKey(t *testing.T) {
+	t.Parallel()
+
+	// Без parts ожидаемая длина 0 — любой (в т.ч. nil) key проходит.
+	if err := ValidateKeyLength(nil); err != nil {
+		t.Fatalf("ValidateKeyLength() без parts вернул ошибку: %v", err)
+	}
+}
+
+func TestValidateKeyLength_UnsupportedType(t *testing.T) {
+	t.Parallel()
+
+	err := ValidateKeyLength([]byte{1, 2, 3}, 42) // int — не поддерживается
+	if err == nil {
+		t.Fatal("ValidateKeyLength() вернул nil, ожидалась ошибка")
+	}
+
+	if errors.Is(err, ErrInvalidKey) {
+		t.Fatal("errors.Is(err, ErrInvalidKey) = true, ожидалось false (ошибка кодирования, не длины)")
 	}
 }
