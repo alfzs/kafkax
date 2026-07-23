@@ -23,7 +23,7 @@ import (
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
 
-// IncomingMessage — сообщение Kafka, переданное в consumerHandler.
+// IncomingMessage — сообщение Kafka, переданное в ConsumerHandler.
 type IncomingMessage struct {
 	Topic     string
 	Partition int32
@@ -31,17 +31,6 @@ type IncomingMessage struct {
 	Key       []byte
 	Value     []byte
 	Headers   Headers
-}
-
-// consumerHandler — интерфейс обработчика сообщений Kafka.
-// Реализуется пользователем библиотеки и регистрируется через AddHandler.
-// ctx содержит OTel-span (SpanKind=Consumer) и может быть отменён при остановке консьюмера.
-type consumerHandler interface {
-	// ProcessMessage вызывается для каждого сообщения из топика.
-	// При возврате ошибки вызов будет повторён до HandlerMaxRetries раз.
-	// Если сообщение не может быть обработано, следует вернуть ошибку —
-	// после исчерпания попыток offset будет закоммичен и сообщение пропущено.
-	ProcessMessage(ctx context.Context, msg IncomingMessage) error
 }
 
 type partitionWorker struct {
@@ -98,7 +87,7 @@ type KafkaConsumer struct {
 	consumer   *kafka.Consumer
 	config     Config
 	logger     *slog.Logger
-	handlers   map[string]consumerHandler
+	handlers   map[string]ConsumerHandler
 	handlersMu sync.RWMutex
 	workers    map[workerKey]*partitionWorker
 	workersMu  sync.RWMutex
@@ -209,7 +198,7 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 		consumer:              consumer,
 		config:                config,
 		logger:                slog.Default().With(slog.String("component", "kafka_consumer"), slog.String("group", config.Consumer.Group)),
-		handlers:              make(map[string]consumerHandler),
+		handlers:              make(map[string]ConsumerHandler),
 		workers:               make(map[workerKey]*partitionWorker),
 		ctx:                   ctx,
 		cancel:                cancel,
@@ -248,10 +237,11 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 	return c, nil
 }
 
-// AddHandler регистрирует обработчик для указанного топика.
-// Должен вызываться до Start. Повторная регистрация одного топика возвращает ошибку.
-// Безопасен для конкурентного вызова.
-func (c *KafkaConsumer) AddHandler(topic string, handler consumerHandler) error {
+// AddHandler регистрирует обработчик для указанного топика с опциональной
+// цепочкой ConsumerMiddleware. Middleware применяются по порядку: первый —
+// внешний (выполняется первым). Должен вызываться до Start. Повторная
+// регистрация одного топика возвращает ошибку. Безопасен для конкурентного вызова.
+func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ...ConsumerMiddleware) error {
 	c.handlersMu.Lock()
 	defer c.handlersMu.Unlock()
 
@@ -259,7 +249,7 @@ func (c *KafkaConsumer) AddHandler(topic string, handler consumerHandler) error 
 		return fmt.Errorf("handler for topic %q already registered", topic)
 	}
 
-	c.handlers[topic] = handler
+	c.handlers[topic] = Chain(handler, mws...)
 
 	return nil
 }
