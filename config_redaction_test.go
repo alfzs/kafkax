@@ -21,10 +21,12 @@ import (
 // утечки, который автор теста предвидел; поиск канарейки ловит любой — включая
 // новое поле, которое кто-нибудь добавит в SASL завтра.
 //
-// Часть тестов здесь фиксирует НЕбезопасное поведение (%#v и json.Marshal —
-// находка У1 в docs/audit/05-security.md). Они намеренно утверждают утечку:
-// пока дыра открыта, тест держит её видимой, а когда её закроют — упадёт и
-// потребует переписать себя на противоположное утверждение.
+// Часть тестов здесь была написана перевёрнутой: пока находка У1
+// (docs/audit/05-security.md) оставалась открытой, они утверждали НАЛИЧИЕ
+// утечки через %#v и json.Marshal — чтобы дыра была видна, а её закрытие стало
+// заметным событием. Находка закрыта (SASL.GoString, SASL.MarshalJSON,
+// Config.LogValue), и те же тесты теперь утверждают обратное. Форма ассертов не
+// изменилась: ищется подстрока самого пароля.
 
 const (
 	// redactionCanary — пароль-канарейка: строка, которую невозможно
@@ -189,28 +191,30 @@ func TestSASLStringShowsUnsetPassword(t *testing.T) {
 	unset := redactionSASL()
 	unset.Password = ""
 
-	if got, want := unset.String(), "SASL{Mechanism:PLAIN Username:svc-user Password:}"; got != want {
+	if got, want := unset.String(),
+		"SASL{Mechanism:PLAIN Username:svc-user Password: AllowPlaintext:false}"; got != want {
 		t.Errorf("String() без пароля = %q, want %q", got, want)
 	}
 
 	if got, want := redactionSASL().String(),
-		"SASL{Mechanism:PLAIN Username:svc-user Password:[REDACTED]}"; got != want {
+		"SASL{Mechanism:PLAIN Username:svc-user Password:[REDACTED] AllowPlaintext:false}"; got != want {
 		t.Errorf("String() с паролем = %q, want %q", got, want)
 	}
 }
 
-// TestSASLGoStringLeaksPassword фиксирует ДЕЙСТВУЮЩУЮ УТЕЧКУ: %#v печатает
-// пароль открытым текстом (находка У1 в docs/audit/05-security.md).
+// TestSASLGoStringRedactsPassword — перевёрнутый сенсор У1: %#v больше не
+// печатает пароль.
 //
-// fmt при флаге # спрашивает только GoStringer и полностью игнорирует
-// Stringer, а GoString у SASL нет. Достаточно одного `log.Printf("%#v", cfg)`
-// в чужом отладочном коде, чтобы вся защита оказалась ни при чём.
+// Тест был написан наоборот и утверждал утечку, пока находка была открыта. Она
+// закрыта методом GoString, и причина, по которой он понадобился отдельно от
+// String, никуда не делась: fmt при флаге # спрашивает ТОЛЬКО GoStringer и
+// Stringer игнорирует полностью. Снимут GoString — `log.Printf("%#v", cfg)` в
+// чужом отладочном коде снова вынесет пароль наружу мимо всей остальной защиты.
 //
-// Ассерт утверждает утечку намеренно: тест — не одобрение поведения, а датчик.
-// Пока дыра открыта, он держит её задокументированной; как только появится
-// GoString или Format, тест упадёт и потребует переписать себя на
-// redactionWantSafe.
-func TestSASLGoStringLeaksPassword(t *testing.T) {
+// Config проверяется наравне с SASL: %#v обходит поля рекурсивно и спрашивает
+// GoStringer у каждого, но держится это на приёмнике-значении — смена его на
+// *SASL компилируется и молча возвращает пароль в вывод от Config.
+func TestSASLGoStringRedactsPassword(t *testing.T) {
 	t.Parallel()
 
 	cfg := testConfig(t)
@@ -220,48 +224,56 @@ func TestSASLGoStringLeaksPassword(t *testing.T) {
 		"SASL %#v":   fmt.Sprintf("%#v", cfg.SASL),
 		"Config %#v": fmt.Sprintf("%#v", cfg),
 	} {
-		if !strings.Contains(got, redactionCanary) {
-			t.Errorf("%s больше не печатает пароль — похоже, добавили GoString/Format. "+
-				"Находка У1 закрыта: перепиши ассерт на redactionWantSafe.\n%s", where, got)
-		}
+		redactionWantSafe(t, where, got)
 	}
 }
 
-// TestSASLJSONMarshalLeaksPassword фиксирует вторую половину У1: у SASL нет ни
-// json-тегов, ни MarshalJSON, поэтому пароль уходит в JSON как есть.
+// TestSASLJSONMarshalRedactsPassword — вторая половина У1, тоже перевёрнутая:
+// json.Marshal(SASL) отдаёт маркер вместо пароля.
 //
-// Значимость не теоретическая: `json.Marshal(cfg.SASL)` — обычный способ
-// положить конфигурацию в отладочный ответ ручки /debug или в дамп состояния.
-// Ассерт, как и в тесте на %#v, утверждает утечку, чтобы её закрытие стало
-// заметным событием, а не тихим изменением.
-func TestSASLJSONMarshalLeaksPassword(t *testing.T) {
+// До MarshalJSON пароль уходил в JSON как есть: encoding/json не знает ни о
+// Stringer, ни о LogValuer, а json-тегов у SASL нет. Значимость не
+// теоретическая — `json.Marshal(cfg.SASL)` это обычный способ положить
+// конфигурацию в ответ отладочной ручки или в дамп состояния.
+//
+// Проверяется и вложенный случай: encoding/json ищет Marshaler у каждого поля,
+// но только пока метод объявлен на значении, — а Config сериализуют чаще, чем
+// одну секцию.
+func TestSASLJSONMarshalRedactsPassword(t *testing.T) {
 	t.Parallel()
 
-	//nolint:gosec // G117 («сериализуется поле, похожее на секрет») — не побочный эффект, а ровно
-	// тот дефект, который тест удерживает задокументированным.
 	got, err := json.Marshal(redactionSASL())
 	if err != nil {
 		t.Fatalf("json.Marshal(SASL): %v", err)
 	}
 
-	if !strings.Contains(string(got), redactionCanary) {
-		t.Errorf("json.Marshal(SASL) больше не печатает пароль — похоже, появился MarshalJSON. "+
-			"Находка У1 закрыта: перепиши ассерт на redactionWantSafe.\n%s", got)
+	redactionWantSafe(t, "json.Marshal(SASL)", string(got))
+
+	nested, err := json.Marshal(struct {
+		SASL SASL `json:"sasl"`
+	}{redactionSASL()})
+	if err != nil {
+		t.Fatalf("json.Marshal(вложенный SASL): %v", err)
 	}
+
+	redactionWantSafe(t, "json.Marshal(вложенный SASL)", string(nested))
 }
 
-// TestConfigJSONMarshalFailsOnFuncFields — пароль не утекает через
-// json.Marshal(Config) только потому, что encoding/json спотыкается о поля-функции.
+// TestConfigJSONMarshalDoesNotDependOnFuncFields — пароль не утекает через
+// json.Marshal(Config), и держится это больше не на случайности.
 //
-// Это не редакция, а случайность, и тест устроен так, чтобы это было видно из
-// его падения. Проверяется не «пароля нет», а конкретная причина, по которой
-// его нет: UnsupportedTypeError на типе функции. Ошибка возникает от типа поля,
-// а не от значения — OnPanic и OnMessageSkipped здесь nil, и это не помогает.
+// Раньше тест назывался ...FailsOnFuncFields и проверял ровно причину:
+// UnsupportedTypeError на типе поля-функции. Причина верна и сегодня —
+// encoding/json по-прежнему спотыкается об OnPanic, OnMessageSkipped и
+// TLSConfig.Time, и ошибка возникает из ТИПА поля, а не из значения, так что
+// нулевые хуки не помогают. Но вывод «это единственное, что защищает пароль»
+// после появления SASL.MarshalJSON неверен, и тест переписан под новый вывод.
 //
-// Если однажды хуки переедут в интерфейс или обзаведутся тегом `json:"-"`,
-// Marshal начнёт проходить и вынесет пароль наружу. Упадёт при этом именно этот
-// тест — и именно там, где написано, что делать.
-func TestConfigJSONMarshalFailsOnFuncFields(t *testing.T) {
+// Отсюда вторая половина: Config без полей-функций собрать нельзя, поэтому
+// сценарий «хуки переехали в интерфейс, Marshal начал проходить» проверяется на
+// структуре-двойнике с тем же вложенным SASL. Ассерт на саму ошибку сохранён —
+// но теперь как констатация, а не как гарантия.
+func TestConfigJSONMarshalDoesNotDependOnFuncFields(t *testing.T) {
 	t.Parallel()
 
 	cfg := testConfig(t)
@@ -271,72 +283,95 @@ func TestConfigJSONMarshalFailsOnFuncFields(t *testing.T) {
 	// Это и есть проверяемое утверждение; молчание staticcheck здесь означало бы, что тест устарел.
 	got, err := json.Marshal(cfg)
 
-	unsupported, ok := errors.AsType[*json.UnsupportedTypeError](err)
-	if !ok {
-		t.Fatalf("json.Marshal(Config) = (%s, %v), ожидалась UnsupportedTypeError. "+
-			"Поля-функции перестали блокировать сериализацию — единственное, что до сих пор "+
-			"удерживало пароль от попадания в JSON. Нужен SASL.MarshalJSON (находка У1).", got, err)
-	}
-
-	// Тип из ошибки проверяется отдельно: UnsupportedTypeError на чём-нибудь
-	// другом (канал, комплексное число) означал бы, что срабатывает уже иная
-	// случайность, и вывод «пароль защищён полями-функциями» перестал быть верным.
-	if !strings.HasPrefix(unsupported.Type.String(), "func(") {
-		t.Errorf("Marshal провалился не на поле-функции, а на %s — причина отсутствия утечки изменилась",
-			unsupported.Type)
-	}
-
 	if strings.Contains(string(got), redactionCanary) {
-		t.Errorf("json.Marshal(Config) вернул пароль вместе с ошибкой:\n%s", got)
+		t.Fatalf("json.Marshal(Config) вернул пароль:\n%s", got)
 	}
+
+	// Ошибка ожидается, но её отсутствие само по себе больше не дефект: если
+	// хуки однажды уедут в интерфейс, Marshal пройдёт — и обязан отдать
+	// отредактированный SASL. Ровно это проверяет двойник ниже, поэтому здесь
+	// достаточно зафиксировать, на чём именно спотыкается encoding/json сейчас.
+	if unsupported, ok := errors.AsType[*json.UnsupportedTypeError](err); ok {
+		if !strings.HasPrefix(unsupported.Type.String(), "func(") {
+			t.Errorf("Marshal провалился не на поле-функции, а на %s — причина изменилась",
+				unsupported.Type)
+		}
+	}
+
+	// Двойник Config без полей-функций: то, чем Config станет, если хуки
+	// когда-нибудь перестанут блокировать сериализацию. Пароль обязан остаться
+	// отредактированным и в этом случае.
+	twin := struct {
+		ClientID string `json:"client_id"`
+		SASL     SASL   `json:"sasl"`
+	}{cfg.ClientID, cfg.SASL}
+
+	marshalled, err := json.Marshal(twin)
+	if err != nil {
+		t.Fatalf("json.Marshal(двойник Config): %v", err)
+	}
+
+	redactionWantSafe(t, "json.Marshal(двойник Config без полей-функций)", string(marshalled))
 }
 
 // TestConfigLoggedWholeRedactsPassword — обещание godoc у LogValue
-// («при логировании Config целиком») выполняется на TextHandler.
+// («при логировании Config целиком») выполняется на обоих штатных хендлерах.
 //
-// Держится оно не на Config: LogValue у Config нет, TextHandler печатает
-// незнакомое значение через %+v, и редактирует пароль всё тот же SASL.String().
-// Тест закрывает самый вероятный сценарий на практике — приложение пишет
-// конфигурацию в лог один раз на старте, целиком.
+// Раньше JSONHandler был отдельным тестом с перевёрнутым ассертом: у Config не
+// было LogValue, хендлер пытался сериализовать структуру целиком, спотыкался о
+// поля-функции и писал «!ERROR:json: unsupported type: func(...)». Пароль при
+// этом не утекал, но и конфигурации в логе не было. С Config.LogValue оба
+// хендлера идут одним путём, так что и проверяются вместе.
+//
+// Сценарий самый частый на практике: приложение пишет конфигурацию в лог один
+// раз на старте, целиком.
 func TestConfigLoggedWholeRedactsPassword(t *testing.T) {
 	t.Parallel()
 
-	var buf bytes.Buffer
-
-	cfg := testConfig(t)
-	cfg.SASL = redactionSASL()
-
-	slog.New(slog.NewTextHandler(&buf, nil)).Info("kafka configured", slog.Any("config", cfg))
-	redactionWantSafe(t, "TextHandler + Config", buf.String())
-}
-
-// TestConfigLoggedWholeOnJSONHandlerFailsInsteadOfRedacting — на JSONHandler то
-// же самое обещание не выполняется: вместо конфигурации в лог уезжает
-// «!ERROR:json: unsupported type: func(...)».
-//
-// Пароль не утёк, но и конфигурации в логе нет — защита здесь та же
-// случайность, что и в TestConfigJSONMarshalFailsOnFuncFields, только
-// последствие другое: диагностическая запись бесполезна. Ассерт требует
-// присутствия маркера ошибки, потому что исчезнуть он может двумя разными
-// путями — добавили Config.LogValue (хорошо) или убрали поля-функции (утечка), —
-// и отличать их обязан человек, читающий падение.
-func TestConfigLoggedWholeOnJSONHandlerFailsInsteadOfRedacting(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-
-	cfg := testConfig(t)
-	cfg.SASL = redactionSASL()
-
-	slog.New(slog.NewJSONHandler(&buf, nil)).Info("kafka configured", slog.Any("config", cfg))
-
-	got := buf.String()
-	if strings.Contains(got, redactionCanary) {
-		t.Fatalf("пароль утёк в JSON-лог целого Config:\n%s", got)
+	tests := []struct {
+		name    string
+		handler func(*bytes.Buffer) slog.Handler
+	}{
+		{
+			name:    "TextHandler",
+			handler: func(b *bytes.Buffer) slog.Handler { return slog.NewTextHandler(b, nil) },
+		},
+		{
+			name:    "JSONHandler",
+			handler: func(b *bytes.Buffer) slog.Handler { return slog.NewJSONHandler(b, nil) },
+		},
 	}
 
-	if !strings.Contains(got, "!ERROR:json: unsupported type") {
-		t.Errorf("JSONHandler больше не спотыкается о поля-функции Config. Проверь, что появился "+
-			"Config.LogValue, а не просто исчезли хуки — во втором случае это утечка (находка У1).\n%s", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var buf bytes.Buffer
+
+			cfg := testConfig(t)
+			cfg.SASL = redactionSASL()
+
+			slog.New(tt.handler(&buf)).Info("kafka configured", slog.Any("config", cfg))
+
+			got := buf.String()
+			redactionWantSafe(t, tt.name+" + Config", got)
+
+			// Маркер ошибки хендлера проверяется отдельно от редакции, потому
+			// что это разные диагнозы с одинаковым симптомом: запись без
+			// пароля бывает и такой, где вместо конфигурации лежит
+			// «!ERROR:json: unsupported type». redactionWantSafe об этом
+			// сообщит отсутствием [REDACTED], но не скажет почему.
+			if strings.Contains(got, "!ERROR") {
+				t.Errorf("%s не смог записать Config — похоже, Config.LogValue перестал работать "+
+					"и хендлер снова сериализует структуру целиком:\n%s", tt.name, got)
+			}
+
+			// Config.LogValue обязан отдавать конфигурацию, а не один лишь
+			// отредактированный SASL: запись, из которой нельзя узнать адреса
+			// брокеров и client_id, диагностической ценности не имеет.
+			if !strings.Contains(got, testClientID) {
+				t.Errorf("%s: в записи нет client_id — LogValue отдаёт не всю конфигурацию:\n%s", tt.name, got)
+			}
+		})
 	}
 }

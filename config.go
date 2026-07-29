@@ -3,6 +3,7 @@ package kafkax
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -103,6 +104,36 @@ type Config struct {
 	OnMessageSkipped func(ctx context.Context, msg IncomingMessage, cause error) error `yaml:"-"`
 }
 
+// LogValue реализует slog.LogValuer для всей конфигурации: типовой способ
+// увидеть настройки — записать их в лог один раз на старте, целиком.
+//
+// До этого метода такая запись работала случайно и по-разному: TextHandler
+// печатал Config через %+v и попадал на SASL.String, а JSONHandler спотыкался
+// о поля-функции и клал в лог «!ERROR:json: unsupported type: func(...)»
+// вместо конфигурации. Пароль при этом не утекал, но и пользы от записи не
+// было — а исчезни поля-функции, не стало бы и защиты.
+//
+// Поля, которые в лог не помещаются (логгер, готовый *tls.Config, ExtraOpts,
+// хуки), заменены признаком наличия: их значение всё равно нечитаемо, а вот
+// факт, что хук задан, объясняет поведение, которого не видно в остальных
+// полях.
+func (c Config) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.Any("brokers", c.Brokers),
+		slog.String("client_id", c.ClientID),
+		slog.Duration("graceful_timeout", c.GracefulTimeout),
+		slog.Duration("dial_timeout", c.DialTimeout),
+		slog.Any("sasl", c.SASL),
+		slog.Any("tls", c.TLS),
+		slog.Any("producer", c.Producer),
+		slog.Any("consumer", c.Consumer),
+		slog.Bool("tls_config_set", c.TLSConfig != nil),
+		slog.Int("extra_opts", len(c.ExtraOpts)),
+		slog.Bool("on_panic_set", c.OnPanic != nil),
+		slog.Bool("on_message_skipped_set", c.OnMessageSkipped != nil),
+	)
+}
+
 // SASL содержит параметры аутентификации SASL.
 // Пустой Mechanism означает, что SASL не используется.
 type SASL struct {
@@ -111,28 +142,70 @@ type SASL struct {
 	Mechanism string `yaml:"mechanism" env:"KAFKAX_SASL_MECHANISM"`
 	Username  string `yaml:"username" env:"KAFKAX_SASL_USERNAME"`
 	Password  string `yaml:"password" env:"KAFKAX_SASL_PASSWORD"`
+	// AllowPlaintext разрешает механизм PLAIN без TLS. По умолчанию такая пара
+	// отвергается валидацией: PLAIN отправляет брокеру `zid\0user\0pass`
+	// открытым текстом, и без шифрования пароль читает любой, кто видит трафик.
+	//
+	// Флаг существует не для удобства, а чтобы решение было заявлено: у
+	// плейнтекста есть законные сценарии (локальный брокер в тестах, шифрование
+	// на уровне сети или сайдкара), и отличить их от забытого
+	// KAFKAX_TLS_ENABLED библиотека не может — а вот потребовать, чтобы разницу
+	// назвали явно, может.
+	//
+	// На SCRAM не влияет: тот пароль по проводу не передаёт, и без TLS
+	// библиотека ограничивается предупреждением при создании клиента.
+	AllowPlaintext bool `yaml:"allow_plaintext" env:"KAFKAX_SASL_ALLOW_PLAINTEXT"`
 }
 
 // LogValue реализует slog.LogValuer, чтобы пароль не попадал в логи при
 // логировании Config или SASL целиком.
 func (s SASL) LogValue() slog.Value {
-	password := ""
-	if s.Password != "" {
-		password = "[REDACTED]"
-	}
-
 	return slog.GroupValue(
 		slog.String("mechanism", s.Mechanism),
 		slog.String("username", s.Username),
-		slog.String("password", password),
+		slog.String("password", redactedOrEmpty(s.Password)),
+		slog.Bool("allow_plaintext", s.AllowPlaintext),
 	)
 }
 
 // String реализует fmt.Stringer по той же причине, что и LogValue: %v на
 // SASL не должен печатать пароль.
 func (s SASL) String() string {
-	return fmt.Sprintf("SASL{Mechanism:%s Username:%s Password:%s}",
-		s.Mechanism, s.Username, redactedOrEmpty(s.Password))
+	return fmt.Sprintf("SASL{Mechanism:%s Username:%s Password:%s AllowPlaintext:%t}",
+		s.Mechanism, s.Username, redactedOrEmpty(s.Password), s.AllowPlaintext)
+}
+
+// GoString реализует fmt.GoStringer, потому что Stringer здесь не помогает:
+// при флаге # fmt спрашивает только GoStringer и String игнорирует полностью.
+// Без этого метода одного `log.Printf("%#v", cfg)` в чужом отладочном коде
+// хватало, чтобы пароль уехал в лог мимо всей редакции.
+//
+// Вложенный случай закрывается тем же методом: %#v на Config обходит поля
+// рекурсивно и для каждого спрашивает GoStringer.
+func (s SASL) GoString() string {
+	return fmt.Sprintf("kafkax.SASL{Mechanism:%q, Username:%q, Password:%q, AllowPlaintext:%t}",
+		s.Mechanism, s.Username, redactedOrEmpty(s.Password), s.AllowPlaintext)
+}
+
+// MarshalJSON реализует json.Marshaler: encoding/json не знает ни о Stringer,
+// ни о LogValuer, так что без этого метода `json.Marshal(cfg.SASL)` — обычный
+// способ положить конфигурацию в ответ отладочной ручки или в дамп состояния —
+// возвращал пароль как есть.
+//
+// Ключи совпадают с yaml-тегами, чтобы дамп читался тем же глазом, что и
+// конфигурационный файл.
+func (s SASL) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Mechanism      string `json:"mechanism"`
+		Username       string `json:"username"`
+		Password       string `json:"password"`
+		AllowPlaintext bool   `json:"allow_plaintext"`
+	}{
+		Mechanism:      s.Mechanism,
+		Username:       s.Username,
+		Password:       redactedOrEmpty(s.Password),
+		AllowPlaintext: s.AllowPlaintext,
+	})
 }
 
 func redactedOrEmpty(secret string) string {
@@ -173,6 +246,16 @@ type TLS struct {
 
 // enabled сообщает, нужен ли TLS.
 func (t TLS) enabled() bool { return t.Enabled }
+
+// transportEncrypted сообщает, будет ли соединение с брокером зашифровано.
+//
+// Порядок условий повторяет tlsConfig: готовый TLSConfig побеждает секцию TLS,
+// поэтому «TLS.Enabled=false, но TLSConfig задан» — это TLS, а не его
+// отсутствие. Расхождение этих двух мест означало бы, что валидация судит об
+// одном соединении, а собирается другое.
+func (c Config) transportEncrypted() bool {
+	return c.TLSConfig != nil || c.TLS.enabled()
+}
 
 // Producer содержит параметры Kafka-продюсера.
 type Producer struct {
@@ -454,7 +537,9 @@ func (c Config) saslErrors() []error {
 	var errs []error
 
 	switch strings.ToUpper(c.SASL.Mechanism) {
-	case SASLMechanismPlain, SASLMechanismScramSHA256, SASLMechanismScramSHA512:
+	case SASLMechanismPlain:
+		errs = append(errs, c.plaintextPasswordErrors()...)
+	case SASLMechanismScramSHA256, SASLMechanismScramSHA512:
 	default:
 		errs = append(errs, fmt.Errorf(
 			"sasl.mechanism must be one of %s, %s, %s; got %q",
@@ -470,6 +555,37 @@ func (c Config) saslErrors() []error {
 	}
 
 	return errs
+}
+
+// plaintextPasswordErrors отвергает PLAIN без TLS.
+//
+// Почему ошибка, а не предупреждение — как у InsecureSkipVerify. Разница в
+// том, что теряется. Отключённая проверка сертификата делает сессию уязвимой к
+// MITM: чтобы что-то произошло, атакующий должен оказаться на пути и вклиниться
+// в соединение. PLAIN без TLS не создаёт уязвимости — он выполняет раскрытие:
+// пароль уходит в сеть открытым текстом при каждой аутентификации, включая
+// переаутентификации по расписанию брокера. Это необратимо и правкой
+// конфигурации не чинится — секрет придётся ротировать, и знать об этом надо до
+// первого подключения, а не из WARN, замеченного через месяц в Kibana.
+//
+// Ошибка возвращается только для PLAIN. SCRAM без TLS остаётся законным без
+// опт-аута: пароль по проводу не идёт, MITM-риск остаётся — на него библиотека
+// отвечает предупреждением в commonOpts, симметрично InsecureSkipVerify.
+//
+// Опт-аут именованным полем, а не подавлением предупреждения: сценарии без
+// шифрования законны (kfake в тестах, брокер в том же поде, TLS на сайдкаре), и
+// требуется от них ровно одно — чтобы решение было записано в конфигурации, а
+// не осталось следствием невыставленной переменной окружения.
+func (c Config) plaintextPasswordErrors() []error {
+	if c.transportEncrypted() || c.SASL.AllowPlaintext {
+		return nil
+	}
+
+	return []error{fmt.Errorf(
+		"sasl.mechanism=%s without TLS sends the password to the broker in cleartext;"+
+			" enable tls.enabled (or set Config.TLSConfig), or switch to %s/%s,"+
+			" or set sasl.allow_plaintext=true to state that the plaintext connection is intended",
+		SASLMechanismPlain, SASLMechanismScramSHA256, SASLMechanismScramSHA512)}
 }
 
 func (c Config) tlsErrors() []error {
@@ -520,6 +636,16 @@ func (c Config) producerErrors() []error {
 
 	if c.Producer.BatchBytes <= 0 {
 		errs = append(errs, fmt.Errorf("producer.batch_bytes must be positive, got %d", c.Producer.BatchBytes))
+	}
+
+	// Ноль — законное «без лимита», а вот отрицательное значение godoc не
+	// обещает: opts.go ставит kgo.MaxBufferedBytes только при > 0, так что
+	// минус тоже означал бы «без лимита» — молча и не тем способом, каким это
+	// написано в конфигурации.
+	if c.Producer.MaxBufferedBytes < 0 {
+		errs = append(errs, fmt.Errorf(
+			"producer.max_buffered_bytes must not be negative (0 means unlimited), got %d",
+			c.Producer.MaxBufferedBytes))
 	}
 
 	errs = append(errs, c.acksErrors()...)
@@ -612,7 +738,48 @@ func (c Config) consumerErrors() []error {
 			IsolationReadCommitted, IsolationReadUncommitted, c.Consumer.IsolationLevel))
 	}
 
+	errs = append(errs, c.fetchSizeErrors()...)
+
 	return append(errs, c.handlerRetryErrors()...)
+}
+
+// fetchSizeErrors проверяет байтовые границы fetch-запроса.
+//
+// Вынесено из consumerErrors не ради красоты: четыре проверки подряд упирают
+// функцию в потолок цикломатической сложности, а связаны они между собой
+// теснее, чем с остальной секцией.
+//
+// franz-go эти поля не проверяет вовсе. Ноль проходит и Validate, и конструктор
+// клиента, и отказ выглядит не как ошибка конфигурации, а как «консьюмер
+// подключился и ничего не читает». Пару max_partition_bytes > max_bytes
+// franz-go молча прижимает (kgo/config.go), то есть настройка перестаёт значить
+// написанное — и об этом тоже узнают не из лога, а из наблюдения за трафиком.
+func (c Config) fetchSizeErrors() []error {
+	var errs []error
+
+	if c.Consumer.MinBytes <= 0 {
+		errs = append(errs, fmt.Errorf("consumer.min_bytes must be positive, got %d", c.Consumer.MinBytes))
+	}
+
+	if c.Consumer.MaxBytes <= 0 {
+		errs = append(errs, fmt.Errorf("consumer.max_bytes must be positive, got %d", c.Consumer.MaxBytes))
+	}
+
+	if c.Consumer.MaxPartitionBytes <= 0 {
+		errs = append(errs, fmt.Errorf(
+			"consumer.max_partition_bytes must be positive, got %d", c.Consumer.MaxPartitionBytes))
+	}
+
+	// Сравнение имеет смысл только при положительной верхней границе: при
+	// max_bytes=0 ошибка о ней уже добавлена, и вторая претензия к той же
+	// опечатке только удлинила бы список.
+	if c.Consumer.MaxBytes > 0 && c.Consumer.MaxPartitionBytes > c.Consumer.MaxBytes {
+		errs = append(errs, fmt.Errorf(
+			"consumer.max_partition_bytes (%d) must not exceed consumer.max_bytes (%d)",
+			c.Consumer.MaxPartitionBytes, c.Consumer.MaxBytes))
+	}
+
+	return errs
 }
 
 // handlerRetryErrors проверяет пару полей ретраев обработчика: они осмысленны

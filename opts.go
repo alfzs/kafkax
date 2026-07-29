@@ -46,6 +46,13 @@ func (c Config) commonOpts(logger *slog.Logger) ([]kgo.Opt, error) {
 			return nil, err
 		}
 
+		// Проверяется результат tlsConfig, а не поля конфигурации: здесь уже
+		// известно, поедет ли в клиента DialTLSConfig, и никакое расхождение с
+		// валидацией невозможно.
+		if tlsCfg == nil {
+			warnPlaintextSASL(logger, c.SASL.Mechanism)
+		}
+
 		opts = append(opts, kgo.SASL(mech))
 	}
 
@@ -112,6 +119,31 @@ func (c Config) tlsConfig(logger *slog.Logger) (*tls.Config, error) {
 func warnInsecureTLS(logger *slog.Logger) {
 	logger.Warn("TLS certificate verification is disabled (InsecureSkipVerify); " +
 		"the connection is vulnerable to man-in-the-middle attacks")
+}
+
+// warnPlaintextSASL пишет предупреждение при аутентификации поверх
+// незашифрованного соединения.
+//
+// Два текста, потому что риски разные и путать их вредно. SCRAM пароль по
+// проводу не передаёт — без TLS он уязвим к MITM ровно как соединение с
+// InsecureSkipVerify, и предупреждение здесь той же силы. PLAIN отправляет
+// `zid\0user\0pass` открытым текстом; сюда эта ветка доходит только с явным
+// sasl.allow_plaintext=true (иначе конфигурация не прошла бы валидацию), но
+// напомнить об уже принятом решении в момент подключения всё равно стоит:
+// флаг обычно ставят один раз для локального стенда, а конфигурация потом
+// уезжает дальше.
+func warnPlaintextSASL(logger *slog.Logger, mechanism string) {
+	if strings.EqualFold(mechanism, SASLMechanismPlain) {
+		logger.Warn("SASL PLAIN is used over an unencrypted connection (sasl.allow_plaintext=true); "+
+			"the password is sent to the broker in cleartext and must be treated as disclosed",
+			slog.String("sasl_mechanism", mechanism))
+
+		return
+	}
+
+	logger.Warn("SASL authentication is used over an unencrypted connection; "+
+		"the exchange is vulnerable to man-in-the-middle attacks",
+		slog.String("sasl_mechanism", mechanism))
 }
 
 func caCertPool(path string) (*x509.CertPool, error) {

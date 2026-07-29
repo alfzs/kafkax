@@ -1,10 +1,13 @@
 package kafkax
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -506,6 +509,107 @@ func TestCommonOptsAttachSASL(t *testing.T) {
 
 	if _, err := cfg.producerOpts(testLogger(t)); err == nil {
 		t.Error("producerOpts принял неизвестный механизм SASL")
+	}
+}
+
+// TestCommonOptsWarnsOnUnencryptedSASL — аутентификация поверх нешифрованного
+// соединения не проходит молча.
+//
+// Находка С1 (docs/audit/05-security.md) начиналась с асимметрии:
+// InsecureSkipVerify получал WARN, а «пароль открытым текстом» — ничего.
+// PLAIN без TLS теперь отвергает валидация, но два случая до этого слоя всё
+// равно доходят: SCRAM (законен без опт-аута) и PLAIN с явным
+// sasl.allow_plaintext. Оба обязаны оставить след в логе — при разборе
+// «почему брокер видит нас неаутентифицированными» или «откуда утёк пароль»
+// эта строка и есть ответ.
+//
+// Предупреждение привязано к результату tlsConfig, а не к полям конфигурации:
+// иначе готовый Config.TLSConfig считался бы отсутствием шифрования.
+func TestCommonOptsWarnsOnUnencryptedSASL(t *testing.T) {
+	t.Parallel()
+
+	const canary = "opts-secret-canary"
+
+	tests := []struct {
+		name     string
+		mutate   func(*Config)
+		wantWarn string
+	}{
+		{
+			name:     "SCRAM без TLS",
+			mutate:   func(c *Config) { c.SASL.Mechanism = SASLMechanismScramSHA512 },
+			wantWarn: "SASL authentication is used over an unencrypted connection",
+		},
+		{
+			name: "PLAIN с опт-аутом без TLS",
+			mutate: func(c *Config) {
+				c.SASL.Mechanism = SASLMechanismPlain
+				c.SASL.AllowPlaintext = true
+			},
+			wantWarn: "the password is sent to the broker in cleartext",
+		},
+		{
+			name: "SCRAM поверх секции TLS",
+			mutate: func(c *Config) {
+				c.SASL.Mechanism = SASLMechanismScramSHA512
+				c.TLS = TLS{Enabled: true}
+			},
+		},
+		{
+			// Готовый TLSConfig — тот же зашифрованный транспорт, просто собран
+			// не библиотекой. Предупреждение здесь означало бы, что проверка
+			// смотрит на поля, а не на соединение.
+			name: "SCRAM поверх готового TLSConfig",
+			mutate: func(c *Config) {
+				c.SASL.Mechanism = SASLMechanismScramSHA512
+				c.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+			},
+		},
+		{
+			name:   "SASL выключен",
+			mutate: func(*Config) {},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var buf bytes.Buffer
+
+			cfg := testConfig(t)
+			cfg.SASL = SASL{Username: "u", Password: canary}
+			tt.mutate(&cfg)
+
+			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+			if _, err := cfg.producerOpts(logger); err != nil {
+				t.Fatalf("producerOpts: %v", err)
+			}
+
+			got := buf.String()
+
+			// Пароль в предупреждении о пароле — отдельный класс курьёза,
+			// поэтому проверяется всегда, а не только в ветке с ожидаемым WARN.
+			if strings.Contains(got, canary) {
+				t.Fatalf("пароль попал в предупреждение:\n%s", got)
+			}
+
+			if tt.wantWarn == "" {
+				if strings.Contains(got, "unencrypted") || strings.Contains(got, "cleartext") {
+					t.Errorf("предупреждение о плейнтексте выдано на зашифрованном соединении:\n%s", got)
+				}
+
+				return
+			}
+
+			if !strings.Contains(got, tt.wantWarn) {
+				t.Errorf("в логе нет предупреждения %q:\n%s", tt.wantWarn, got)
+			}
+
+			if !strings.Contains(got, "level=WARN") {
+				t.Errorf("предупреждение записано не на уровне WARN:\n%s", got)
+			}
+		})
 	}
 }
 

@@ -1,6 +1,7 @@
 package kafkax
 
 import (
+	"crypto/tls"
 	"errors"
 	"strings"
 	"testing"
@@ -206,9 +207,14 @@ func TestConfigValidateSectionsAreIndependent(t *testing.T) {
 func TestConfigValidateSASL(t *testing.T) {
 	t.Parallel()
 
+	// TLS включён во всех случаях с PLAIN: без него срабатывает отдельная
+	// проверка «пароль открытым текстом», и тест про пустой username считал бы
+	// две ошибки вместо одной. Плейнтекстовая пара разобрана отдельно, в
+	// TestConfigValidateSASLPlaintext.
 	tests := []struct {
 		name     string
 		sasl     SASL
+		tls      TLS
 		wantErrs int
 		want     []string
 	}{
@@ -219,12 +225,14 @@ func TestConfigValidateSASL(t *testing.T) {
 		{
 			name: "PLAIN с учётными данными",
 			sasl: SASL{Mechanism: SASLMechanismPlain, Username: "u", Password: "p"},
+			tls:  TLS{Enabled: true},
 		},
 		{
 			// Механизм из yaml приходит в произвольном регистре, а сравнение
 			// идёт через ToUpper: "plain" обязан приниматься наравне с "PLAIN".
 			name: "нижний регистр механизма",
 			sasl: SASL{Mechanism: "plain", Username: "u", Password: "p"},
+			tls:  TLS{Enabled: true},
 		},
 		{
 			name: "SCRAM-SHA-256 в смешанном регистре",
@@ -243,12 +251,14 @@ func TestConfigValidateSASL(t *testing.T) {
 		{
 			name:     "пустой username",
 			sasl:     SASL{Mechanism: SASLMechanismPlain, Password: "p"},
+			tls:      TLS{Enabled: true},
 			wantErrs: 1,
 			want:     []string{"sasl.username required for"},
 		},
 		{
 			name:     "пустой password",
 			sasl:     SASL{Mechanism: SASLMechanismPlain, Username: "u"},
+			tls:      TLS{Enabled: true},
 			wantErrs: 1,
 			want:     []string{"sasl.password required for"},
 		},
@@ -268,6 +278,7 @@ func TestConfigValidateSASL(t *testing.T) {
 
 			cfg := testConfig(t)
 			cfg.SASL = tt.sasl
+			cfg.TLS = tt.tls
 
 			err := cfg.validateProducer()
 			if tt.wantErrs == 0 {
@@ -280,6 +291,93 @@ func TestConfigValidateSASL(t *testing.T) {
 
 			if got := len(cfgUnwrapJoined(t, err)); got != tt.wantErrs {
 				t.Errorf("получено %d ошибок, ожидалось %d: %v", got, tt.wantErrs, err)
+			}
+		})
+	}
+}
+
+// TestConfigValidateSASLPlaintext — PLAIN без шифрования отвергается, и
+// отменить это можно только названным полем.
+//
+// Находка С1 (docs/audit/05-security.md): kgo.SASL добавлялся независимо от
+// того, вернул ли tlsConfig nil, и опечатка в KAFKA_TLS_ENABLED отправляла
+// пароль в сеть открытым текстом без единого сигнала. Проверяется вся матрица,
+// потому что «TLS есть» имеет два независимых источника, а «плейнтекст
+// разрешён» — одно поле, и любая из четырёх комбинаций, решённая неправильно,
+// либо ломает законный сценарий, либо возвращает утечку.
+func TestConfigValidateSASLPlaintext(t *testing.T) {
+	t.Parallel()
+
+	const plaintextErr = "sends the password to the broker in cleartext"
+
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr bool
+	}{
+		{
+			name:    "PLAIN без TLS",
+			mutate:  func(*Config) {},
+			wantErr: true,
+		},
+		{
+			// Регистр механизма не важен нигде в пакете — не должен быть важен
+			// и здесь: «plain» из yaml отправляет ровно тот же пароль.
+			name:    "нижний регистр без TLS",
+			mutate:  func(c *Config) { c.SASL.Mechanism = "plain" },
+			wantErr: true,
+		},
+		{
+			name:   "PLAIN с секцией TLS",
+			mutate: func(c *Config) { c.TLS = TLS{Enabled: true} },
+		},
+		{
+			// Готовый TLSConfig побеждает секцию TLS целиком (см. tlsConfig), и
+			// валидация обязана судить о том же соединении, которое соберётся:
+			// иначе mTLS из памяти — полностью поддерживаемый путь — упирался бы
+			// в требование выставить ещё и tls.enabled.
+			name:   "PLAIN с готовым TLSConfig",
+			mutate: func(c *Config) { c.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13} },
+		},
+		{
+			name:   "PLAIN без TLS с явным опт-аутом",
+			mutate: func(c *Config) { c.SASL.AllowPlaintext = true },
+		},
+		{
+			// SCRAM пароль по проводу не передаёт, поэтому опт-аут ему не
+			// нужен: на MITM-риск библиотека отвечает предупреждением при
+			// создании клиента, а не отказом.
+			name:   "SCRAM без TLS",
+			mutate: func(c *Config) { c.SASL.Mechanism = SASLMechanismScramSHA512 },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := testConfig(t)
+			// Пароль-канарейка, а не "p": текст этой ошибки читают в логе
+			// старта, и попадание пароля в него было бы ровно той утечкой, от
+			// которой заведена вся проверка.
+			cfg.SASL = SASL{Mechanism: SASLMechanismPlain, Username: "u", Password: redactionCanary}
+			tt.mutate(&cfg)
+
+			if !tt.wantErr {
+				cfgWantNoErr(t, cfg.validateProducer())
+				cfgWantNoErr(t, cfg.validateConsumer())
+
+				return
+			}
+
+			// Проверка общая, а не продюсерская: пароль уходит в сеть с любой
+			// стороны, и консьюмер обязан отвергать ту же конфигурацию.
+			err := cfg.validateProducer()
+			cfgWantErr(t, err, plaintextErr, "sasl.allow_plaintext=true")
+			cfgWantErr(t, cfg.validateConsumer(), plaintextErr)
+
+			if strings.Contains(err.Error(), redactionCanary) {
+				t.Errorf("пароль попал в текст ошибки валидации:\n%v", err)
 			}
 		})
 	}
@@ -414,6 +512,18 @@ func TestConfigValidateProducerFields(t *testing.T) {
 			name:   "нулевой max_retries допустим",
 			mutate: func(p *Producer) { p.MaxRetries = 0 },
 		},
+		{
+			// opts.go ставит kgo.MaxBufferedBytes только при значении > 0, так
+			// что минус означал бы «без лимита» — то же, что ноль, но не тем
+			// способом, каким это написано в godoc поля.
+			name:   "отрицательный max_buffered_bytes",
+			mutate: func(p *Producer) { p.MaxBufferedBytes = -1 },
+			want:   "producer.max_buffered_bytes must not be negative",
+		},
+		{
+			name:   "нулевой max_buffered_bytes допустим — это «без лимита»",
+			mutate: func(p *Producer) { p.MaxBufferedBytes = 0 },
+		},
 	}
 
 	for _, tt := range tests {
@@ -512,7 +622,14 @@ type consumerFieldCase struct {
 // consumerFieldCases держит таблицу отдельно от тела теста: список растёт с
 // каждым новым полем Consumer, а сама проверка не меняется — держать их одной
 // функцией значит регулярно упираться в лимит длины на ровном месте.
+//
+// Байтовые границы вынесены во вторую функцию по той же причине: таблица
+// упёрлась в лимит длины ровно на них.
 func consumerFieldCases() []consumerFieldCase {
+	return append(consumerTimingFieldCases(), consumerFetchSizeCases()...)
+}
+
+func consumerTimingFieldCases() []consumerFieldCase {
 	return []consumerFieldCase{
 		{
 			name:   "пустая группа",
@@ -640,6 +757,72 @@ func consumerFieldCases() []consumerFieldCase {
 			mutate: func(c *Consumer) { c.IsolationLevel = "READ_COMMITTED" },
 		},
 	}
+}
+
+// consumerFetchSizeCases — байтовые границы fetch (находка М1 в
+// docs/audit/05-security.md).
+//
+// franz-go их не проверяет вовсе: ноль проходит и Validate, и конструктор, и
+// первый опрос — отказ выглядит не как ошибка конфигурации, а как «консьюмер
+// подключился и молчит».
+func consumerFetchSizeCases() []consumerFieldCase {
+	return []consumerFieldCase{
+		{
+			name:   "нулевой min_bytes",
+			mutate: func(c *Consumer) { c.MinBytes = 0 },
+			want:   "consumer.min_bytes must be positive",
+		},
+		{
+			name:   "отрицательный min_bytes",
+			mutate: func(c *Consumer) { c.MinBytes = -1 },
+			want:   "consumer.min_bytes must be positive",
+		},
+		{
+			name:   "нулевой max_bytes",
+			mutate: func(c *Consumer) { c.MaxBytes = 0 },
+			want:   "consumer.max_bytes must be positive",
+		},
+		{
+			name:   "нулевой max_partition_bytes",
+			mutate: func(c *Consumer) { c.MaxPartitionBytes = 0 },
+			want:   "consumer.max_partition_bytes must be positive",
+		},
+		{
+			// franz-go эту пару принимает и молча прижимает первое ко второму
+			// (kgo/config.go), то есть настройка перестаёт значить написанное, и
+			// узнать об этом можно только по трафику.
+			name:   "max_partition_bytes больше max_bytes",
+			mutate: func(c *Consumer) { c.MaxPartitionBytes = c.MaxBytes + 1 },
+			want:   "consumer.max_partition_bytes (1048577) must not exceed consumer.max_bytes (1048576)",
+		},
+		{
+			// Равенство — законная граница: одна партиция вправе занять ответ
+			// целиком.
+			name:   "max_partition_bytes равен max_bytes",
+			mutate: func(c *Consumer) { c.MaxPartitionBytes = c.MaxBytes },
+		},
+	}
+}
+
+// TestConfigValidateFetchSizesReportSeparately — нулевой max_bytes не порождает
+// вторую претензию к паре границ.
+//
+// Проверка «max_partition_bytes не больше max_bytes» осмысленна только при
+// положительной верхней границе, иначе одна опечатка (max_bytes=0) даёт две
+// ошибки об одном и том же поле, и список претензий перестаёт быть списком
+// того, что надо править.
+func TestConfigValidateFetchSizesReportSeparately(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig(t)
+	cfg.Consumer.MaxBytes = 0
+
+	errs := cfgUnwrapJoined(t, cfg.validateConsumer())
+	if len(errs) != 1 {
+		t.Fatalf("получено %d ошибок, ожидалась одна: %v", len(errs), errs)
+	}
+
+	cfgWantErr(t, errs[0], "consumer.max_bytes must be positive")
 }
 
 func TestConfigValidateConsumerFields(t *testing.T) {
