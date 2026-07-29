@@ -3,295 +3,378 @@ package kafkax
 import (
 	"context"
 	"errors"
-	"sync/atomic"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
-	"time"
 
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/alfzs/kafkax/v2/encoding"
+	"github.com/google/uuid"
 )
 
-func TestConsumerHandlerFunc(t *testing.T) {
+// mwJournal — потокобезопасный журнал меток: на нём проверяется порядок
+// вызовов в цепочке. Обычный слайс не годится даже здесь — тесты параллельные,
+// а -race ловит запись без синхронизации независимо от фактических гонок.
+type mwJournal struct {
+	mu    sync.Mutex
+	marks []string
+}
+
+func (j *mwJournal) mark(s string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	j.marks = append(j.marks, s)
+}
+
+func (j *mwJournal) snapshot() []string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	return slices.Clone(j.marks)
+}
+
+// mwTrace возвращает middleware, отмечающее вход и выход вокруг next.
+// Пара меток нужна, чтобы отличить вложенность от простой очерёдности:
+// «внешний вход, внутренний вход, внутренний выход, внешний выход».
+func mwTrace(j *mwJournal, name string) ConsumerMiddleware {
+	return func(next ConsumerHandler) ConsumerHandler {
+		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
+			j.mark(name + ":in")
+
+			err := next.ProcessMessage(ctx, msg)
+
+			j.mark(name + ":out")
+
+			return err
+		})
+	}
+}
+
+// mwMsg собирает сообщение с заданным ключом.
+func mwMsg(key []byte) IncomingMessage {
+	return IncomingMessage{Topic: testTopic, Key: key, Value: []byte("payload")}
+}
+
+func TestChainOrder(t *testing.T) {
 	t.Parallel()
 
-	var calls atomic.Int64
+	j := &mwJournal{}
 
-	handler := ConsumerHandlerFunc(func(_ context.Context, _ IncomingMessage) error {
-		calls.Add(1)
+	handler := ConsumerHandlerFunc(func(context.Context, IncomingMessage) error {
+		j.mark("handler")
+
 		return nil
 	})
 
-	err := handler.ProcessMessage(t.Context(), IncomingMessage{})
+	chained := Chain(handler, mwTrace(j, "first"), mwTrace(j, "second"), mwTrace(j, "third"))
+
+	if err := chained.ProcessMessage(t.Context(), mwMsg(nil)); err != nil {
+		t.Fatalf("ProcessMessage: %v", err)
+	}
+
+	// Первый переданный middleware — внешний. Порядок задан документацией и
+	// на нём держатся типовые связки вроде «сначала трейсинг, потом фильтр по
+	// ключу»: перевернувшись, фильтр начал бы отсекать сообщения до создания
+	// спана, и отброшенные вообще перестали бы быть видны.
+	want := []string{
+		"first:in", "second:in", "third:in",
+		"handler",
+		"third:out", "second:out", "first:out",
+	}
+
+	if got := j.snapshot(); !slices.Equal(got, want) {
+		t.Fatalf("порядок вызовов = %v, want %v", got, want)
+	}
+}
+
+func TestChainWithoutMiddlewareReturnsHandler(t *testing.T) {
+	t.Parallel()
+
+	handler := &mockHandler{}
+
+	// Возврат исходного обработчика без обёрток: AddHandler вызывает Chain
+	// всегда, в том числе без middleware, и лишний слой на каждом сообщении
+	// был бы платой ни за что.
+	if got := Chain(handler); got != ConsumerHandler(handler) {
+		t.Fatalf("Chain(handler) вернул %#v, ожидался исходный обработчик", got)
+	}
+
+	if got := Chain(handler, []ConsumerMiddleware{}...); got != ConsumerHandler(handler) {
+		t.Fatal("Chain с пустым срезом middleware обернул обработчик")
+	}
+}
+
+func TestChainPropagatesErrorAndContext(t *testing.T) {
+	t.Parallel()
+
+	wantErr := errors.New("handler failed")
+
+	type ctxKey struct{}
+
+	var gotValue any
+
+	handler := ConsumerHandlerFunc(func(ctx context.Context, _ IncomingMessage) error {
+		gotValue = ctx.Value(ctxKey{})
+
+		return wantErr
+	})
+
+	inject := func(next ConsumerHandler) ConsumerHandler {
+		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
+			return next.ProcessMessage(context.WithValue(ctx, ctxKey{}, "from-middleware"), msg)
+		})
+	}
+
+	err := Chain(handler, inject).ProcessMessage(t.Context(), mwMsg(nil))
+
+	// Ошибка обработчика обязана дойти до консьюмера нетронутой: на ней
+	// держатся ретраи и остановка партиции.
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("ошибка = %v, want %v", err, wantErr)
+	}
+
+	if gotValue != "from-middleware" {
+		t.Errorf("значение из контекста = %v, want %q", gotValue, "from-middleware")
+	}
+}
+
+func TestMatchKeyMiddleware(t *testing.T) {
+	t.Parallel()
+
+	tenant := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+	other := uuid.MustParse("99999999-8888-7777-6666-555555555555")
+
+	matching, err := encoding.EncodeKey(tenant, int64(7))
 	if err != nil {
-		t.Fatalf("ProcessMessage() вернул неожиданную ошибку: %v", err)
+		t.Fatalf("EncodeKey: %v", err)
 	}
 
-	if calls.Load() != 1 {
-		t.Fatalf("ProcessMessage() вызван %d раз, ожидалось 1", calls.Load())
+	foreign, err := encoding.EncodeKey(other, int64(7))
+	if err != nil {
+		t.Fatalf("EncodeKey: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		key        []byte
+		wantCalled bool
+		wantErr    error
+	}{
+		{
+			name:       "совпадающий ключ",
+			key:        matching,
+			wantCalled: true,
+		},
+		{
+			// Чужой тенант — не ошибка: обработчик не вызывается, middleware
+			// возвращает nil, оффсет двигается. Иначе топик, который читают
+			// все, останавливал бы партицию на первом же чужом сообщении.
+			name: "ключ другого тенанта",
+			key:  foreign,
+		},
+		{
+			// Ключ длиннее ожидаемого проходит проверку длины, но не
+			// совпадает побайтово — то же «не наше», а не повреждение.
+			name: "ключ длиннее ожидаемого",
+			key:  append(slices.Clone(matching), 0xFF),
+		},
+		{
+			// Короткий ключ — повреждённое или чужого формата сообщение.
+			// Молча коммитить его нельзя: по умолчанию оно остановит партицию,
+			// а не уедет в тишину.
+			name:    "усечённый ключ",
+			key:     matching[:len(matching)-1],
+			wantErr: encoding.ErrInvalidKey,
+		},
+		{
+			name:    "пустой ключ",
+			key:     []byte{},
+			wantErr: encoding.ErrInvalidKey,
+		},
+		{
+			name:    "nil-ключ",
+			key:     nil,
+			wantErr: encoding.ErrInvalidKey,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			next := &mockHandler{}
+			handler := MatchKeyMiddleware(tenant, int64(7))(next)
+
+			err := handler.ProcessMessage(t.Context(), mwMsg(tt.key))
+
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("ошибка = %v, want errors.Is(%v)", err, tt.wantErr)
+				}
+
+				// Длины в тексте — то, ради чего ошибка оборачивается: без них
+				// «invalid composite key» не отличить от опечатки в parts.
+				if !strings.Contains(err.Error(), "match key middleware") {
+					t.Errorf("текст %q не называет middleware", err)
+				}
+			} else if err != nil {
+				t.Fatalf("ProcessMessage = %v, want nil", err)
+			}
+
+			called := next.callCount() > 0
+			if called != tt.wantCalled {
+				t.Fatalf("обработчик вызван = %v, want %v", called, tt.wantCalled)
+			}
+		})
 	}
 }
 
-func TestChain_NoMiddleware(t *testing.T) {
+func TestMatchKeyMiddlewarePropagatesHandlerError(t *testing.T) {
 	t.Parallel()
 
-	var calls atomic.Int64
+	wantErr := errors.New("downstream failed")
 
-	handler := ConsumerHandlerFunc(func(_ context.Context, _ IncomingMessage) error {
-		calls.Add(1)
-		return nil
-	})
+	key, err := encoding.EncodeKey("tenant-a")
+	if err != nil {
+		t.Fatalf("EncodeKey: %v", err)
+	}
 
-	chained := Chain(handler)
-	_ = chained.ProcessMessage(t.Context(), IncomingMessage{})
+	next := &mockHandler{returnErr: wantErr}
+	handler := MatchKeyMiddleware("tenant-a")(next)
 
-	if calls.Load() != 1 {
-		t.Fatalf("ProcessMessage() вызван %d раз, ожидалось 1", calls.Load())
+	// Фильтр не должен глотать отказ обработчика: иначе отравленное сообщение
+	// своего тенанта тихо коммитилось бы.
+	if got := handler.ProcessMessage(t.Context(), mwMsg(key)); !errors.Is(got, wantErr) {
+		t.Fatalf("ошибка = %v, want %v", got, wantErr)
 	}
 }
 
-func TestChain_SingleMiddleware(t *testing.T) {
+func TestMatchKeyMiddlewarePanicsAtBuildTime(t *testing.T) {
 	t.Parallel()
 
-	var order []string
-
-	handler := ConsumerHandlerFunc(func(_ context.Context, _ IncomingMessage) error {
-		order = append(order, "handler")
-		return nil
-	})
-
-	mw := func(next ConsumerHandler) ConsumerHandler {
-		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
-			order = append(order, "mw-start")
-			err := next.ProcessMessage(ctx, msg)
-
-			order = append(order, "mw-end")
-
-			return err
-		})
+	// parts статичны в коде вызывающего и от данных не зависят, поэтому
+	// неподдерживаемый тип — ошибка программиста. Паника должна случиться при
+	// сборке цепочки, то есть на старте процесса, а не на первом сообщении:
+	// иначе опечатка вроде int вместо int64 доехала бы до прода и проявилась
+	// под нагрузкой.
+	tests := []struct {
+		name string
+		part any
+	}{
+		{name: "int вместо int64", part: 42},
+		{name: "float64", part: 1.5},
+		{name: "срез байт", part: []byte("raw")},
+		{name: "структура", part: struct{ A int }{}},
 	}
 
-	chained := Chain(handler, mw)
-	_ = chained.ProcessMessage(t.Context(), IncomingMessage{})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	expected := []string{"mw-start", "handler", "mw-end"}
-	if len(order) != len(expected) || order[0] != expected[0] || order[1] != expected[1] || order[2] != expected[2] {
-		t.Fatalf("порядок вызовов: %v, ожидалось %v", order, expected)
+			defer func() {
+				recovered := recover()
+				if recovered == nil {
+					t.Fatal("MatchKeyMiddleware не запаниковал на неподдерживаемом типе")
+				}
+
+				msg, ok := recovered.(string)
+				if !ok || !strings.Contains(msg, "MatchKeyMiddleware") {
+					t.Fatalf("паника = %v, ожидалось упоминание MatchKeyMiddleware", recovered)
+				}
+			}()
+
+			// Ни ProcessMessage, ни даже применение к обработчику здесь не
+			// вызываются — паника обязана произойти на этой строке.
+			_ = MatchKeyMiddleware(uuid.Nil, tt.part)
+
+			t.Fatal("недостижимо: сборка middleware завершилась без паники")
+		})
 	}
 }
 
-func TestChain_MultipleMiddleware(t *testing.T) {
+func TestMatchKeyMiddlewarePanicsWithoutParts(t *testing.T) {
 	t.Parallel()
 
-	var order []string
-
-	handler := ConsumerHandlerFunc(func(_ context.Context, _ IncomingMessage) error {
-		order = append(order, "handler")
-		return nil
-	})
-
-	mw1 := func(next ConsumerHandler) ConsumerHandler {
-		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
-			order = append(order, "mw1-start")
-			err := next.ProcessMessage(ctx, msg)
-
-			order = append(order, "mw1-end")
-
-			return err
-		})
-	}
-
-	mw2 := func(next ConsumerHandler) ConsumerHandler {
-		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
-			order = append(order, "mw2-start")
-			err := next.ProcessMessage(ctx, msg)
-
-			order = append(order, "mw2-end")
-
-			return err
-		})
-	}
-
-	// Chain(handler, mw1, mw2) → mw1(mw2(handler))
-	// Порядок: mw1-start → mw2-start → handler → mw2-end → mw1-end
-	chained := Chain(handler, mw1, mw2)
-	_ = chained.ProcessMessage(t.Context(), IncomingMessage{})
-
-	expected := []string{"mw1-start", "mw2-start", "handler", "mw2-end", "mw1-end"}
-	if len(order) != len(expected) {
-		t.Fatalf("порядок вызовов(%d): %v, ожидалось %v", len(order), order, expected)
-	}
-
-	for i := range expected {
-		if order[i] != expected[i] {
-			t.Fatalf("позиция %d: %q, ожидалось %q; полный порядок: %v", i, order[i], expected[i], order)
+	// Отдельный случай от неподдерживаемого типа: EncodeKey() без частей
+	// ошибки не возвращает — он возвращает пустой ключ. Без явной проверки
+	// цепочка собралась бы, и middleware молча отбросил бы весь трафик топика,
+	// не оставив в метриках ни одной ошибки.
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("MatchKeyMiddleware не запаниковал на пустом списке частей")
 		}
-	}
-}
 
-func TestChain_MiddlewareSkipsInner(t *testing.T) {
-	t.Parallel()
-
-	var innerCalls atomic.Int64
-
-	handler := ConsumerHandlerFunc(func(_ context.Context, _ IncomingMessage) error {
-		innerCalls.Add(1)
-		return nil
-	})
-
-	filter := func(next ConsumerHandler) ConsumerHandler {
-		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
-			// Фильтр: пропускаем сообщения с пустым Key
-			if len(msg.Key) == 0 {
-				return nil
-			}
-
-			return next.ProcessMessage(ctx, msg)
-		})
-	}
-
-	chained := Chain(handler, filter)
-
-	// Сообщение с пустым Key — фильтр должен скипнуть
-	_ = chained.ProcessMessage(t.Context(), IncomingMessage{})
-
-	if innerCalls.Load() != 0 {
-		t.Fatalf("inner вызван %d раз, ожидалось 0 (фильтр должен скипнуть)", innerCalls.Load())
-	}
-
-	// Сообщение с непустым Key — фильтр пропускает
-	_ = chained.ProcessMessage(t.Context(), IncomingMessage{Key: []byte("key")})
-
-	if innerCalls.Load() != 1 {
-		t.Fatalf("inner вызван %d раз, ожидалось 1 (фильтр должен пропустить)", innerCalls.Load())
-	}
-}
-
-func TestChain_MiddlewareErrorPropagation(t *testing.T) {
-	t.Parallel()
-
-	expectedErr := errors.New("handler error")
-
-	handler := ConsumerHandlerFunc(func(_ context.Context, _ IncomingMessage) error {
-		return expectedErr
-	})
-
-	mw := func(next ConsumerHandler) ConsumerHandler {
-		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
-			return next.ProcessMessage(ctx, msg)
-		})
-	}
-
-	chained := Chain(handler, mw)
-	err := chained.ProcessMessage(context.Background(), IncomingMessage{})
-
-	if !errors.Is(err, expectedErr) {
-		t.Fatalf("Chain() error = %v, ожидалось %v", err, expectedErr)
-	}
-}
-
-// TestKafkaConsumer_AddHandler_Middleware проверяет, что middleware,
-// переданные в AddHandler, корректно применяются к handler.
-func TestKafkaConsumer_AddHandler_Middleware(t *testing.T) {
-	t.Parallel()
-	c := mustNewConsumerWithConfig(t, fastCommitConfig())
-
-	var (
-		outerCalls atomic.Int64
-		innerCalls atomic.Int64
-	)
-
-	handler := ConsumerHandlerFunc(func(_ context.Context, _ IncomingMessage) error {
-		innerCalls.Add(1)
-		return nil
-	})
-
-	counter := func(next ConsumerHandler) ConsumerHandler {
-		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
-			outerCalls.Add(1)
-			return next.ProcessMessage(ctx, msg)
-		})
-	}
-
-	if err := c.AddHandler("mw-test", handler, counter); err != nil {
-		t.Fatalf("AddHandler() вернул неожиданную ошибку: %v", err)
-	}
-
-	// Вызываем handleMessage напрямую, как в TestKafkaConsumer_HandleMessage_RetriesAndSkipsAfterMaxRetries
-	topic := "mw-test"
-	msg := &kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: 0, Offset: 1},
-		Value:          []byte("payload"),
-	}
-
-	done := make(chan struct{})
-
-	go func() {
-		c.handleMessage(t.Context(), msg)
-		close(done)
+		msg, ok := recovered.(string)
+		if !ok || !strings.Contains(msg, "MatchKeyMiddleware") {
+			t.Fatalf("паника = %v, ожидалось упоминание MatchKeyMiddleware", recovered)
+		}
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("handleMessage() завис")
-	}
+	_ = MatchKeyMiddleware()
 
-	if outerCalls.Load() != 1 {
-		t.Fatalf("middleware вызван %d раз, ожидалось 1", outerCalls.Load())
-	}
-
-	if innerCalls.Load() != 1 {
-		t.Fatalf("handler вызван %d раз, ожидалось 1", innerCalls.Load())
-	}
+	t.Fatal("недостижимо: сборка middleware завершилась без паники")
 }
 
-// TestKafkaConsumer_AddHandler_MiddlewareFilter проверяет, что middleware-
-// фильтр (возвращающий nil без вызова next) предотвращает вызов handler.
-func TestKafkaConsumer_AddHandler_MiddlewareFilter(t *testing.T) {
+func TestMatchKeyMiddlewareInsideChain(t *testing.T) {
 	t.Parallel()
-	c := mustNewConsumerWithConfig(t, fastCommitConfig())
 
-	var handlerCalls atomic.Int64
+	tenant := uuid.MustParse("11111111-2222-3333-4444-555555555555")
 
-	handler := ConsumerHandlerFunc(func(_ context.Context, _ IncomingMessage) error {
-		handlerCalls.Add(1)
-		return nil
-	})
+	matching, err := encoding.EncodeKey(tenant)
+	if err != nil {
+		t.Fatalf("EncodeKey: %v", err)
+	}
 
-	filter := func(next ConsumerHandler) ConsumerHandler {
-		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
-			if len(msg.Key) == 0 {
+	foreign, err := encoding.EncodeKey(uuid.MustParse("99999999-8888-7777-6666-555555555555"))
+	if err != nil {
+		t.Fatalf("EncodeKey: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		key        []byte
+		wantCalled bool
+		wantMarks  []string
+	}{
+		{
+			name:       "свой ключ доходит до обработчика",
+			key:        matching,
+			wantCalled: true,
+			wantMarks:  []string{"outer:in", "handler", "outer:out"},
+		},
+		{
+			// Внешнее middleware отрабатывает целиком даже на отброшенном
+			// сообщении: пропуск чужого ключа не должен быть невидим для
+			// трейсинга и метрик, навешанных снаружи.
+			name:      "чужой ключ отсекается внутри цепочки",
+			key:       foreign,
+			wantMarks: []string{"outer:in", "outer:out"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			j := &mwJournal{}
+
+			handler := ConsumerHandlerFunc(func(context.Context, IncomingMessage) error {
+				j.mark("handler")
+
 				return nil
+			})
+
+			chained := Chain(handler, mwTrace(j, "outer"), MatchKeyMiddleware(tenant))
+
+			if err := chained.ProcessMessage(t.Context(), mwMsg(tt.key)); err != nil {
+				t.Fatalf("ProcessMessage: %v", err)
 			}
 
-			return next.ProcessMessage(ctx, msg)
+			if got := j.snapshot(); !slices.Equal(got, tt.wantMarks) {
+				t.Fatalf("журнал = %v, want %v", got, tt.wantMarks)
+			}
 		})
-	}
-
-	if err := c.AddHandler("mw-filter", handler, filter); err != nil {
-		t.Fatalf("AddHandler() вернул неожиданную ошибку: %v", err)
-	}
-
-	topic := "mw-filter"
-	msg := &kafka.Message{
-		TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: 0, Offset: 1},
-		Value:          []byte("payload"),
-		// Key не установлен — пустой, фильтр должен скипнуть
-	}
-
-	done := make(chan struct{})
-
-	go func() {
-		c.handleMessage(t.Context(), msg)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("handleMessage() завис")
-	}
-
-	if handlerCalls.Load() != 0 {
-		t.Fatalf("handler вызван %d раз, ожидалось 0 (фильтр должен скипнуть)", handlerCalls.Load())
 	}
 }

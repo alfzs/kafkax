@@ -2,87 +2,212 @@ package kafkax
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/twmb/franz-go/pkg/kfake"
+	"go.opentelemetry.io/otel"
 )
 
-// Общие тестовые значения для конфигов с невалидным/минимальным набором полей
-// (TestNewKafkaProducer_InvalidConfig, TestNewKafkaConsumer_InvalidConfig,
-// TestConfig_Validate, TestBuildProducerKafkaConfig/TestBuildConsumerKafkaConfig).
+// Общая тестовая инфраструктура пакета.
+//
+// Брокер здесь настоящий, но внутрипроцессный: kfake реализует протокол Kafka
+// поверх net.Listener на localhost. Это снимает деление тестов на «unit» и
+// «integration» — путь сообщения проверяется целиком, включая коммит оффсетов
+// и ребаланс, без Docker и без пропуска тестов на машине без брокера.
 const (
-	testInvalidBroker   = "localhost:9092"
-	testInvalidClientID = "test"
-	testSASLUser        = "user"
-	testSASLPassword    = "secret"
-	testTopic           = "test-topic"
+	testTopic    = "kafkax-test-topic"
+	testClientID = "kafkax-test"
+	testGroup    = "kafkax-test-group"
 )
 
-// testConfig возвращает конфигурацию с короткими таймаутами для unit-тестов.
-// Указывает несуществующий брокер — librdkafka подключается лениво, поэтому
-// структурные и поведенческие тесты не требуют работающего Kafka.
-func testConfig() Config {
+// unreachableBroker — адрес, на котором заведомо никто не слушает. Для тестов,
+// которым брокер не нужен: клиент franz-go подключается лениво, поэтому
+// конструктор и валидация конфигурации отрабатывают без сети.
+const unreachableBroker = "127.0.0.1:1"
+
+// newFakeCluster поднимает брокер kfake с уже созданными топиками и возвращает
+// его адреса.
+//
+// Пороги сессии опущены до минимума: умолчания Kafka (6s) сделали бы каждый
+// тест ребаланса шестисекундным, а проверяется в них логика колбэков, а не
+// длительность таймаутов брокера.
+func newFakeCluster(t *testing.T, partitions int32, topics ...string) []string {
+	t.Helper()
+
+	if len(topics) == 0 {
+		topics = []string{testTopic}
+	}
+
+	cluster, err := kfake.NewCluster(
+		kfake.NumBrokers(1),
+		kfake.SeedTopics(partitions, topics...),
+		kfake.GroupMinSessionTimeout(100*time.Millisecond),
+		kfake.GroupMaxSessionTimeout(time.Minute),
+	)
+	if err != nil {
+		t.Fatalf("kfake.NewCluster: %v", err)
+	}
+
+	t.Cleanup(cluster.Close)
+
+	return cluster.ListenAddrs()
+}
+
+// testLogger пишет логи библиотеки в журнал теста: при падении они видны, при
+// успехе — нет. Уровень Info отсекает отладочный поток самого franz-go.
+func testLogger(t *testing.T) *slog.Logger {
+	t.Helper()
+
+	return slog.New(slog.NewTextHandler(t.Output(), &slog.HandlerOptions{Level: slog.LevelInfo}))
+}
+
+// testConfig — конфигурация с короткими таймаутами, указывающая на brokers.
+// Без аргументов даёт конфигурацию с недоступным брокером.
+func testConfig(t *testing.T, brokers ...string) Config {
+	t.Helper()
+
+	if len(brokers) == 0 {
+		brokers = []string{unreachableBroker}
+	}
+
 	return Config{
-		Brokers:          []string{"localhost:29092"},
-		ClientID:         "kafkax-unit-test",
-		SecurityProtocol: SecurityProtocolPlaintext,
-		GracefulTimeout:  2 * time.Second,
+		Brokers:         brokers,
+		ClientID:        testClientID,
+		GracefulTimeout: 5 * time.Second,
+		DialTimeout:     2 * time.Second,
+		Logger:          testLogger(t),
 		Producer: Producer{
-			RequiredAcks:          1,
-			AckTimeout:            300 * time.Millisecond,
-			FlushTimeout:          500 * time.Millisecond,
-			MaxRetries:            0,
-			RetryBackoff:          100 * time.Millisecond,
-			BatchSize:             10,
-			BatchBytes:            4096,
-			BatchTimeout:          10 * time.Millisecond,
-			CompressionType:       "none",
-			MaxInflight:           5,
-			EnableIdempotence:     false,
-			MessageQueueSize:      16,
-			MessageTimeout:        300 * time.Millisecond,
-			InactiveWorkerTTL:     5 * time.Minute,
-			CleanupWorkerInterval: 10 * time.Minute,
+			RequiredAcks:       -1,
+			EnableIdempotence:  true,
+			MaxInflight:        5,
+			MaxRetries:         3,
+			AckTimeout:         2 * time.Second,
+			RetryBackoff:       50 * time.Millisecond,
+			Linger:             0,
+			BatchBytes:         1 << 20,
+			CompressionType:    "none",
+			MaxBufferedRecords: 1000,
+			MessageTimeout:     3 * time.Second,
+			FlushTimeout:       3 * time.Second,
 		},
 		Consumer: Consumer{
-			Group:                 "kafkax-unit-test-group",
-			EnableAutoCommit:      false,
-			InitialOffset:         "earliest",
-			MinBytes:              1,
-			MaxBytes:              1048576,
-			MaxWait:               50 * time.Millisecond,
-			SocketTimeout:         5 * time.Second,
-			SessionTimeout:        10 * time.Second,
-			HeartbeatInterval:     3 * time.Second,
-			IsolationLevel:        "read_committed",
-			MaxPollInterval:       30 * time.Second,
-			ReadTimeout:           100 * time.Millisecond,
-			ReadErrorBackoff:      50 * time.Millisecond,
-			MessageQueueSize:      16,
-			HandlerMaxRetries:     2,
-			HandlerRetryDelay:     50 * time.Millisecond,
-			InactiveWorkerTTL:     5 * time.Minute,
-			CleanupWorkerInterval: 10 * time.Minute,
+			Group:             testGroup,
+			InitialOffset:     "earliest",
+			MinBytes:          1,
+			MaxBytes:          1 << 20,
+			MaxPartitionBytes: 1 << 20,
+			MaxWait:           50 * time.Millisecond,
+			SessionTimeout:    6 * time.Second,
+			HeartbeatInterval: time.Second,
+			RebalanceTimeout:  5 * time.Second,
+			IsolationLevel:    "read_uncommitted",
+			MaxPollRecords:    100,
+			MessageQueueSize:  16,
+			CommitInterval:    200 * time.Millisecond,
+			HandlerMaxRetries: 0,
+			HandlerRetryDelay: 20 * time.Millisecond,
 		},
 	}
 }
 
+// captureMetrics подменяет глобальный MeterProvider записывающим и возвращает
+// журнал вызовов.
+//
+// Провайдер глобальный, поэтому тест, вызвавший captureMetrics, не должен быть
+// параллельным: t.Parallel() в таком тесте перемешал бы записи с соседним.
+func captureMetrics(t *testing.T) *recordedMetrics {
+	t.Helper()
+
+	rec := &recordedMetrics{}
+	prev := otel.GetMeterProvider()
+
+	otel.SetMeterProvider(recordingMeterProvider{rec: rec})
+	t.Cleanup(func() { otel.SetMeterProvider(prev) })
+
+	return rec
+}
+
+// mustProducer создаёт продюсер и закрывает его по завершении теста.
+func mustProducer(t *testing.T, cfg Config) *KafkaProducer {
+	t.Helper()
+
+	p, err := NewKafkaProducer(cfg)
+	if err != nil {
+		t.Fatalf("NewKafkaProducer: %v", err)
+	}
+
+	// Провал закрытия в Cleanup сам по себе тест не валит: сценарий уже
+	// отработал, а часть тестов доводит продюсер до отказа намеренно. Но и
+	// терять ошибку молча незачем — в журнале упавшего теста она объясняет,
+	// почему брокер не отпустил соединение.
+	t.Cleanup(func() {
+		if err := p.Close(); err != nil {
+			t.Logf("Close в Cleanup: %v", err)
+		}
+	})
+
+	return p
+}
+
+// mustConsumer создаёт консьюмер и останавливает его по завершении теста.
+// Повторный Stop идемпотентен, поэтому Cleanup не мешает тесту остановить
+// консьюмер самому.
+func mustConsumer(t *testing.T, cfg Config) *KafkaConsumer {
+	t.Helper()
+
+	c, err := NewKafkaConsumer(cfg)
+	if err != nil {
+		t.Fatalf("NewKafkaConsumer: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := c.Stop(); err != nil {
+			t.Logf("Stop в Cleanup: %v", err)
+		}
+	})
+
+	return c
+}
+
+// mustAddHandler регистрирует обработчик и валит тест при отказе: AddHandler
+// в подготовительной части сценария — не то место, где ошибку можно потерять.
+func mustAddHandler(t *testing.T, c *KafkaConsumer, topic string, h ConsumerHandler, mws ...ConsumerMiddleware) {
+	t.Helper()
+
+	if err := c.AddHandler(topic, h, mws...); err != nil {
+		t.Fatalf("AddHandler(%q): %v", topic, err)
+	}
+}
+
 // mockHandler — потокобезопасный тестовый обработчик сообщений.
+//
+// Поведение задаётся либо фиксированной ошибкой returnErr, либо функцией fn,
+// которой доступен номер вызова (нумерация с 1) — так пишутся сценарии вида
+// «первые две попытки падают, третья проходит».
 type mockHandler struct {
 	mu        sync.Mutex
 	calls     int
+	msgs      []IncomingMessage
 	returnErr error
-	lastMsg   IncomingMessage
+	fn        func(call int, msg IncomingMessage) error
 }
 
 func (h *mockHandler) ProcessMessage(_ context.Context, msg IncomingMessage) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	h.calls++
-	h.lastMsg = msg
+	call := h.calls
+	h.msgs = append(h.msgs, msg)
+	fn, err := h.fn, h.returnErr
+	h.mu.Unlock()
 
-	return h.returnErr
+	if fn != nil {
+		return fn(call, msg)
+	}
+
+	return err
 }
 
 func (h *mockHandler) callCount() int {
@@ -92,71 +217,28 @@ func (h *mockHandler) callCount() int {
 	return h.calls
 }
 
-func (h *mockHandler) lastMessage() IncomingMessage {
+// messages возвращает снимок всех полученных сообщений в порядке вызовов.
+func (h *mockHandler) messages() []IncomingMessage {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	return h.lastMsg
+	return append([]IncomingMessage(nil), h.msgs...)
 }
 
-// mustNewProducer создаёт продюсер для тестов.
-// Пропускает тест, если librdkafka не может инициализировать клиент.
-func mustNewProducer(t *testing.T) *KafkaProducer {
+// waitFor опрашивает cond до истечения timeout и валит тест, если условие так
+// и не наступило. Опрос, а не канал: условие обычно складывается из нескольких
+// счётчиков, которые тест не контролирует поштучно.
+func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
 	t.Helper()
 
-	p, err := NewKafkaProducer(t.Context(), testConfig())
-	if err != nil {
-		t.Skipf("пропуск: не удалось создать продюсер (librdkafka): %v", err)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+
+		time.Sleep(5 * time.Millisecond)
 	}
 
-	t.Cleanup(p.Close)
-	t.Logf("продюсер создан: client_id=%s broker=%s", testConfig().ClientID, testConfig().Brokers[0])
-
-	return p
-}
-
-// fastCommitConfig возвращает testConfig() с уменьшенными SessionTimeout/
-// SocketTimeout: без брокера синхронный CommitMessage блокируется на "Local:
-// Waiting for coordinator" вплоть до SessionTimeout (10s в testConfig()) —
-// тестам, вызывающим handleMessage напрямую, не нужна точная длительность
-// таймаута группы, только его короткое и предсказуемое истечение.
-func fastCommitConfig() Config {
-	cfg := testConfig()
-	cfg.Consumer.SessionTimeout = time.Second
-	cfg.Consumer.SocketTimeout = time.Second
-	cfg.Consumer.HeartbeatInterval = 300 * time.Millisecond
-
-	return cfg
-}
-
-// mustNewConsumer создаёт консьюмер для тестов.
-// Пропускает тест, если librdkafka не может инициализировать клиент.
-func mustNewConsumer(t *testing.T) *KafkaConsumer {
-	t.Helper()
-
-	c, err := NewKafkaConsumer(testConfig())
-	if err != nil {
-		t.Skipf("пропуск: не удалось создать консьюмер (librdkafka): %v", err)
-	}
-
-	t.Cleanup(c.Stop)
-	t.Logf("консьюмер создан: group=%s broker=%s", testConfig().Consumer.Group, testConfig().Brokers[0])
-
-	return c
-}
-
-// mustNewConsumerWithConfig — вариант mustNewConsumer с явно переданным Config
-// (например, fastCommitConfig() для тестов, вызывающих handleMessage напрямую).
-func mustNewConsumerWithConfig(t *testing.T, cfg Config) *KafkaConsumer {
-	t.Helper()
-
-	c, err := NewKafkaConsumer(cfg)
-	if err != nil {
-		t.Skipf("пропуск: не удалось создать консьюмер (librdkafka): %v", err)
-	}
-
-	t.Cleanup(c.Stop)
-	t.Logf("консьюмер создан: group=%s broker=%s", cfg.Consumer.Group, cfg.Brokers[0])
-
-	return c
+	t.Fatalf("не дождались: %s (таймаут %s)", what, timeout)
 }

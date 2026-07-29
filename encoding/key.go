@@ -1,3 +1,10 @@
+// Package encoding собирает и сравнивает бинарные композитные ключи Kafka.
+//
+// Пакет намеренно оставлен листом: он не импортирует ни kafkax, ни franz-go и
+// зависит только от github.com/google/uuid. Тому, кому нужен лишь формат ключа
+// — продюсеру на другой библиотеке, миграционному скрипту, тесту — не
+// приходится тянуть за собой транспорт и телеметрию. Обратное направление
+// (kafkax импортирует encoding) реализовано в kafkax.MatchKeyMiddleware.
 package encoding
 
 import (
@@ -5,6 +12,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/google/uuid"
 )
@@ -33,7 +41,10 @@ func EncodeKey(parts ...any) ([]byte, error) {
 			buf = append(buf, v[:]...)
 
 		case string:
-			if len(v) > 1<<32-1 {
+			// uint64(len(v)) > math.MaxUint32, а не len(v) > 1<<32-1: на
+			// 32-битных платформах правая часть — нетипизированная константа,
+			// не влезающая в int, и файл просто не компилируется.
+			if uint64(len(v)) > math.MaxUint32 {
 				return nil, fmt.Errorf("encoding: part %d (string): length %d exceeds max uint32", i, len(v))
 			}
 
@@ -67,18 +78,22 @@ func EncodeKey(parts ...any) ([]byte, error) {
 // Если key соответствует parts — совпадение. Decode ключа не нужен:
 // консьюмер знает свои значения, кодирует их заново и сравнивает.
 //
-//	func (h *handler) ProcessMessage(ctx context.Context, msg kafkax.IncomingMessage) error {
-//	    if !encoding.MatchKey(msg.Key, h.myTenantID, h.myExternalBotID) {
-//	        return nil
-//	    }
-//	    ...
-//	}
+// Паникует, если EncodeKey отказал (неподдерживаемый тип части). Набор parts
+// статичен в коде вызывающего и от данных не зависит, поэтому отказ здесь —
+// ошибка программиста, а не свойство сообщения. Прежнее поведение — тихий
+// false — превращало опечатку в типе (int вместо int64) в «ключ не наш»:
+// обработчик возвращал nil, оффсет коммитился, и весь трафик отбрасывался при
+// зелёных метриках успеха. Паника, случившаяся внутри обработчика,
+// перехватывается consumer'ом, логируется со стеком и учитывается метрикой
+// kafkax.consumer.panics.
 //
-// Ошибка кодирования (неподдерживаемый тип parts) считается несовпадением.
+// Готовая связка «проверить длину, затем сравнить» — kafkax.MatchKeyMiddleware;
+// она кодирует parts один раз при сборке цепочки, поэтому неподдерживаемый тип
+// роняет процесс на старте, а не на первом сообщении.
 func MatchKey(key []byte, parts ...any) bool {
 	encoded, err := EncodeKey(parts...)
 	if err != nil {
-		return false
+		panic(fmt.Sprintf("kafkax/encoding: MatchKey: %v", err))
 	}
 
 	return bytes.Equal(key, encoded)
@@ -95,9 +110,9 @@ var ErrInvalidKey = errors.New("encoding: invalid composite key")
 // Ключ длиннее ожидаемого не считается невалидным — это просто не то,
 // что закодировали бы parts, и обнаруживается сравнением в MatchKey.
 //
-// Полезно там, где важно отличить "ключ другого тенанта" (MatchKey вернёт
-// false для валидного по длине ключа) от "сообщение повреждено" — см.
-// MatchKeyMiddleware.
+// Полезно там, где важно отличить «ключ другого тенанта» (MatchKey вернёт
+// false для валидного по длине ключа) от «сообщение повреждено» — см.
+// kafkax.MatchKeyMiddleware.
 func ValidateKeyLength(key []byte, parts ...any) error {
 	encoded, err := EncodeKey(parts...)
 	if err != nil {

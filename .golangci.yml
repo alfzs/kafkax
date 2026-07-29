@@ -113,6 +113,10 @@ linters:
       threshold: 100  # lower => stricter (tokens)
     errcheck:
       check-type-assertions: true
+      # check-blank ловит `x, _ := f()`. Без него десять регистраций
+      # OTel-инструментов молча теряли ошибки (RF-ERR-06): errcheck был включён,
+      # но именно этот класс не отслеживал.
+      check-blank: true
     funlen:
       lines: 120
       statements: 80
