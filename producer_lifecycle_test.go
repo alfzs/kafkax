@@ -379,11 +379,15 @@ func TestProducerMetricsOnFailure(t *testing.T) {
 	}
 }
 
-// Отбраковка на входе — тоже отказ отправки, и метрики обязаны её показывать.
+// Отбраковка на входе видна в метриках — но своим счётчиком и без topic.
 //
-// Иначе приложение, которое шлёт один невалидный запрос за другим, выглядит в
-// мониторинге идеально здоровым: сообщения не доезжают, messages.failed —
-// ноль, гистограмма пуста. Брокер здесь не нужен: до сети вызов не доходит.
+// Терять её нельзя: приложение, которое шлёт один невалидный запрос за другим,
+// иначе выглядит в мониторинге идеально здоровым — сообщения не доезжают, а все
+// счётчики нули. Но и класть её в messages.failed с атрибутом topic нельзя:
+// значение приходит снаружи и ничем не ограничено, так что отбракованный
+// запрос рождал бы серию на каждое уникальное значение — прямой путь к взрыву
+// кардинальности ровно теми запросами, которые пакет отверг не глядя. Брокер
+// здесь не нужен: до сети вызов не доходит.
 //
 //nolint:paralleltest // подменяет глобальный MeterProvider
 func TestProducerMetricsOnValidationFailure(t *testing.T) {
@@ -402,28 +406,38 @@ func TestProducerMetricsOnValidationFailure(t *testing.T) {
 		t.Fatalf("SendMessage = %v, want ErrEmptyHeaderKey", err)
 	}
 
-	if got := rec.sum("kafkax.producer.messages.failed", topicAttr); got != 1 {
-		t.Errorf("messages.failed = %d, want 1", got)
+	if got := rec.sum("kafkax.producer.messages.rejected",
+		attribute.String("reason", rejectInvalidHeaders)); got != 1 {
+		t.Errorf("messages.rejected{reason=invalid_headers} = %d, want 1", got)
 	}
 
-	if got := rec.sum("kafkax.producer.messages.sent", topicAttr); got != 0 {
-		t.Errorf("messages.sent = %d, want 0", got)
-	}
-
-	if got := len(rec.observations("kafkax.producer.message.duration", topicAttr,
-		attribute.String("status", statusError))); got != 1 {
-		t.Errorf("наблюдений message.duration(status=error) = %d, want 1", got)
-	}
-
-	// Пустой топик учитывается под пустым значением атрибута: терять отказ
-	// только потому, что поле, по которому метрика разрезается, и есть
-	// дефектное, — худший из вариантов.
 	if err := p.SendMessage(t.Context(), PublishRequest{Value: []byte("v")}); !errors.Is(err, ErrEmptyTopic) {
 		t.Fatalf("SendMessage(topic=\"\") = %v, want ErrEmptyTopic", err)
 	}
 
-	if got := rec.sum("kafkax.producer.messages.failed", attribute.String("topic", "")); got != 1 {
-		t.Errorf("messages.failed{topic=\"\"} = %d, want 1", got)
+	if got := rec.sum("kafkax.producer.messages.rejected",
+		attribute.String("reason", rejectEmptyTopic)); got != 1 {
+		t.Errorf("messages.rejected{reason=empty_topic} = %d, want 1", got)
+	}
+
+	// Ни один атрибут topic не заведён — ни валидный, ни пустой. Именно это
+	// отличает исправленное поведение от прежнего, где отбраковка шла общим
+	// путём исхода и тащила req.Topic в три инструмента сразу.
+	for _, attr := range []attribute.KeyValue{topicAttr, attribute.String("topic", "")} {
+		if got := rec.sum("kafkax.producer.messages.failed", attr); got != 0 {
+			t.Errorf("messages.failed{%v} = %d, want 0", attr, got)
+		}
+
+		if got := rec.sum("kafkax.producer.messages.sent", attr); got != 0 {
+			t.Errorf("messages.sent{%v} = %d, want 0", attr, got)
+		}
+
+		for _, status := range []string{statusError, statusSuccess} {
+			if got := len(rec.observations("kafkax.producer.message.duration", attr,
+				attribute.String("status", status))); got != 0 {
+				t.Errorf("наблюдений message.duration{%v,status=%s} = %d, want 0", attr, status, got)
+			}
+		}
 	}
 }
 

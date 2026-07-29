@@ -327,17 +327,25 @@ poll ──┬─► partition 0 ──► ProcessMessage (последоват�
 |---|---|---|---|
 | `kafkax.producer.messages.sent` | Counter | `topic` | Сообщения, доставленные в Kafka |
 | `kafkax.producer.messages.failed` | Counter | `topic` | Сообщения с ошибкой доставки |
+| `kafkax.producer.messages.rejected` | Counter | `reason` | Отбраковка на входе: `empty_topic`, `invalid_headers` |
 | `kafkax.producer.message.duration` | Histogram (s) | `topic`, `status` | Длительность `SendMessage` целиком |
-| `kafkax.consumer.messages.processed` | Counter | `topic`, `status` | Сообщения с терминальным исходом: `ok`, `skipped`, `error` |
+| `kafkax.consumer.messages.processed` | Counter | `topic`, `status` | Сообщения с терминальным исходом: `success`, `skipped`, `error` |
 | `kafkax.consumer.message.duration` | Histogram (s) | `topic`, `status` | Время обработчика включая все повторы и паузы |
 | `kafkax.consumer.handler.retries` | Counter | `topic` | Неудачные вызовы обработчика, за которыми последовал повтор |
 | `kafkax.consumer.fetch.errors` | Counter | `topic` | Партиционные ошибки, вернувшиеся из опроса |
 | `kafkax.consumer.workers.active` | UpDownCounter | — | Работающие партиционные воркеры |
 | `kafkax.consumer.panics` | Counter | `site` | Перехваченные паники в горутинах библиотеки |
 
-Длительности — в секундах, как требует OTel. Атрибута `partition` нет ни у
-одной метрики: он умножает кардинальность на число партиций, не давая ничего
-сверх того, что уже есть в спане.
+Длительности — в секундах, как требует OTel; границы бакетов заданы пакетом
+явно, потому что умолчание SDK размечено под миллисекунды. Атрибута `partition`
+нет ни у одной метрики: он умножает кардинальность на число партиций, не давая
+ничего сверх того, что уже есть в спане.
+
+Атрибут `topic` пишется только для запросов, прошедших валидацию. Значение
+приходит из `PublishRequest` и пакетом не ограничено, поэтому отбраковка на
+входе учитывается отдельным счётчиком с замкнутым множеством причин: иначе
+приложение, подставляющее в топик пользовательский ввод, порождало бы новую
+серию на каждое уникальное значение.
 
 Транспортные метрики (соединения, байты, ошибки чтения и записи) регистрирует
 kotel под своими именами.

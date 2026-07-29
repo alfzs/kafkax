@@ -90,8 +90,13 @@ const (
 	// consumerStatusError — обработчик исчерпал повторы и не справился.
 	// Запись НЕ отмечена: at-least-once держится именно на этом.
 	consumerStatusError = "error"
-	// consumerStatusSkipped — до вердикта обработчика дело не дошло: на топик
-	// нет обработчика либо отмена контекста прервала паузу между повторами.
+	// consumerStatusSkipped — запись сознательно пропущена и отмечена к
+	// коммиту: обработчик исчерпал повторы, а OnMessageSkipped вернул nil,
+	// то есть принял её на себя. Либо отмена контекста застала паузу между
+	// повторами — вердикта нет, но и партицию останавливать не за что.
+	//
+	// Это единственный статус, при котором коммит сдвигается за запись, так и
+	// не обработанную успешно. Ненулевой рост — повод смотреть в OnMessageSkipped.
 	consumerStatusSkipped = "skipped"
 )
 
@@ -169,7 +174,8 @@ func newConsumerMetrics(meter metric.Meter) (consumerMetrics, error) {
 	durationName := "kafkax.consumer.message.duration"
 	duration, err := meter.Float64Histogram(durationName,
 		metric.WithDescription("End-to-end handler time including all retries and retry delays"),
-		metric.WithUnit("s"))
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(consumerDurationBuckets...))
 	m.duration = record(&reg, durationName, duration, err)
 
 	retriesName := "kafkax.consumer.handler.retries"
@@ -210,11 +216,17 @@ type KafkaConsumer struct {
 	handlersMu sync.RWMutex
 	handlers   map[string]ConsumerHandler
 
-	// workers живёт без мьютекса, и это следствие kgo.BlockRebalanceOnPoll:
-	// опрос и колбэки ребаланса становятся взаимно исключающими, так что
-	// единственные, кто трогает карту, — цикл опроса и колбэки — никогда не
-	// работают одновременно.
-	workers map[workerKey]*partitionWorker
+	// workersMu защищает саму карту. kgo.BlockRebalanceOnPoll делает опрос и
+	// колбэки ребаланса взаимно исключающими, но полагаться на это как на
+	// единственную синхронизацию нельзя: колбэки исполняются в горутинах
+	// franz-go, и на любой ошибке в порядке остановки инвариант «карта
+	// принадлежит циклу опроса» превращается в гонку. Мьютекс стоит одного
+	// незанятого захвата на батч.
+	//
+	// Держать его на время ожидания воркеров запрещено: остановка снимает
+	// нужных воркеров с карты под мьютексом, а ждёт их уже без него.
+	workersMu sync.Mutex
+	workers   map[workerKey]*partitionWorker
 
 	// mu защищает только переходы жизненного цикла (client, pollCancel):
 	// Start и Stop могут быть вызваны из разных горутин.
@@ -238,8 +250,19 @@ type KafkaConsumer struct {
 	// прежде чем трогать карту воркеров.
 	loopDone chan struct{}
 
-	started  atomic.Bool
+	started atomic.Bool
+
+	// stopping взводится в начале остановки и читается Start: он обязан узнать
+	// о ней раньше, чем опубликует созданного клиента.
 	stopping atomic.Bool
+
+	// stopOnce делает Stop одновременно однократным и блокирующим: второй
+	// вызывающий ждёт первого и получает тот же результат, а не nil «уже
+	// останавливаемся». Без этого отмена контекста Start, которая теперь и
+	// сама зовёт Stop, отнимала бы у явного Stop любую возможность узнать,
+	// закончилось завершение или ещё идёт.
+	stopOnce sync.Once
+	stopErr  error
 }
 
 // NewKafkaConsumer создаёт консьюмера.
@@ -315,9 +338,12 @@ func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ..
 
 // Start создаёт клиента Kafka и запускает цикл опроса. Не блокирует.
 //
-// Отмена ctx эквивалентна Stop, но без дренажа очередей и без финального
-// коммита: предпочтительнее явный Stop. Повторный вызов возвращает
-// ErrConsumerStarted; консьюмер, прошедший Stop, не перезапускается.
+// Отмена ctx запускает ровно тот же путь, что и Stop, — с дренажем очередей и
+// финальным коммитом. Разница только в том, что ошибку завершения при этом
+// некому вернуть: она уходит в лог. Предпочтительнее явный Stop.
+//
+// Повторный вызов возвращает ErrConsumerStarted; консьюмер, прошедший Stop, не
+// перезапускается.
 func (c *KafkaConsumer) Start(ctx context.Context) error {
 	const op = "start"
 
@@ -334,6 +360,8 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 		return ErrNoHandlers
 	}
 
+	// Быстрый путь: Stop уже прошёл, создавать клиента незачем. Гарантию даёт
+	// не эта проверка, а повторная — под c.mu, рядом с публикацией клиента.
 	if c.stopping.Load() {
 		c.started.Store(false)
 
@@ -365,7 +393,23 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 
 	pollCtx, pollCancel := context.WithCancel(c.lifeCtx)
 
+	// Проверка stopping и публикация клиента — одна критическая секция, и это
+	// обязательное условие, а не аккуратность. Stop взводит stopping до захвата
+	// c.mu, поэтому разнести их значит открыть окно, в котором Stop видит
+	// c.client == nil, уходит по ранней ветке и оставляет уже созданного
+	// клиента — присоединившегося к группе, с живым heartbeat — без единого
+	// владельца, способного его закрыть. Типовой триггер — SIGTERM во время
+	// старта пода.
 	c.mu.Lock()
+	if c.stopping.Load() {
+		c.mu.Unlock()
+		pollCancel()
+		client.CloseAllowingRebalance()
+		c.started.Store(false)
+
+		return ErrConsumerClosed
+	}
+
 	c.client = client
 	c.pollCancel = pollCancel
 	c.mu.Unlock()
@@ -378,12 +422,20 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 	return nil
 }
 
-// watchContext переводит отмену пользовательского ctx в отмену жизненного
-// цикла. Сам завершается вместе с ним, чтобы не пережить консьюмера.
+// watchContext переводит отмену пользовательского ctx в штатную остановку.
+// Сам завершается вместе с жизненным циклом, чтобы не пережить консьюмера.
+//
+// Именно Stop, а не голый lifeCancel: отмена контекста обязана оставлять после
+// себя закрытого клиента и закоммиченные оффсеты. Без этого экземпляр
+// превращался бы в зомби — heartbeat идёт, партиции закреплены, координатор
+// ждёт его на каждом ребалансе, а закрыть клиента уже некому.
 func (c *KafkaConsumer) watchContext(ctx context.Context) {
 	select {
 	case <-ctx.Done():
-		c.lifeCancel()
+		// Возврат некуда отдать: контекст отменил не тот, кто ждёт ошибку.
+		if err := c.Stop(); err != nil {
+			c.logger.Error("Shutdown on context cancellation failed", slog.Any("error", err))
+		}
 	case <-c.lifeCtx.Done():
 	}
 }
@@ -409,36 +461,61 @@ func (c *KafkaConsumer) handler(topic string) (ConsumerHandler, bool) {
 
 // runPollLoop — единственный читатель клиента и единственный писатель в очереди
 // воркеров.
+//
+// Перехват паники здесь — страховка, а не лечение: все чужие вызовы на этом
+// пути уже под собственными recover. Но именно эта горутина владеет картой
+// воркеров и гейтом BlockRebalanceOnPoll, и её падение уронило бы процесс
+// целиком, поэтому непойманного пути отсюда быть не должно. Консьюмер после
+// такого перестаёт потреблять: закрытие loopDone разблокирует Stop, но сам
+// Stop обязан позвать вызывающий.
 func (c *KafkaConsumer) runPollLoop(ctx context.Context, client *kgo.Client) {
+	// Порядок регистрации обратен порядку исполнения: сначала перехват паники,
+	// и только затем сигнал о завершении — иначе Stop пошёл бы закрывать
+	// клиента, пока паника ещё разматывается.
 	defer close(c.loopDone)
-
-	for {
-		fetches := client.PollRecords(ctx, c.config.Consumer.MaxPollRecords)
-
-		// Оба условия проверяются до разбора ошибок: закрытие клиента и отмена
-		// контекста приезжают синтетическим фетчем с ошибкой в нулевой
-		// партиции, и принимать их за отказ брокера не за чем.
-		if fetches.IsClientClosed() {
-			return
+	defer func() {
+		if r := recover(); r != nil {
+			c.panics.report(context.WithoutCancel(ctx), panicSitePollLoop, r, debug.Stack())
 		}
+	}()
 
-		if err := fetches.Err0(); errors.Is(err, context.Canceled) {
-			return
-		}
-
-		// Обход ошибок вынесен наружу цикла по записям намеренно: партиция с
-		// фатальной ошибкой и без записей приезжает отдельным пустым фетчем и
-		// изнутри обхода Records не видна вовсе.
-		fetches.EachError(c.reportFetchError)
-
-		fetches.EachPartition(func(ftp kgo.FetchTopicPartition) {
-			c.dispatch(ctx, client, ftp)
-		})
-
-		// Обязательно на каждой итерации: без этого следующий ребаланс —
-		// включая тот, что инициирует закрытие клиента, — повиснет навсегда.
-		client.AllowRebalance()
+	for c.pollOnce(ctx, client) {
 	}
+}
+
+// pollOnce обрабатывает результат одного опроса. false означает, что цикл
+// закончился.
+//
+// Отдельная функция ради defer: AllowRebalance обязателен на каждой итерации, а
+// в теле цикла есть два ранних выхода и возможная паника, которые его миновали
+// бы. Без него следующий ребаланс — включая тот, что инициирует закрытие
+// клиента, — повис бы навсегда.
+func (c *KafkaConsumer) pollOnce(ctx context.Context, client *kgo.Client) bool {
+	defer client.AllowRebalance()
+
+	fetches := client.PollRecords(ctx, c.config.Consumer.MaxPollRecords)
+
+	// Оба условия проверяются до разбора ошибок: закрытие клиента и отмена
+	// контекста приезжают синтетическим фетчем с ошибкой в нулевой
+	// партиции, и принимать их за отказ брокера не за чем.
+	if fetches.IsClientClosed() {
+		return false
+	}
+
+	if err := fetches.Err0(); errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	// Обход ошибок вынесен наружу цикла по записям намеренно: партиция с
+	// фатальной ошибкой и без записей приезжает отдельным пустым фетчем и
+	// изнутри обхода Records не видна вовсе.
+	fetches.EachError(c.reportFetchError)
+
+	fetches.EachPartition(func(ftp kgo.FetchTopicPartition) {
+		c.dispatch(ctx, client, ftp)
+	})
+
+	return true
 }
 
 // reportFetchError фиксирует ошибку уровня партиции.
@@ -480,9 +557,12 @@ func (c *KafkaConsumer) dispatch(ctx context.Context, client *kgo.Client, ftp kg
 // worker возвращает воркера партиции, создавая его при необходимости.
 //
 // Обычно воркер уже создан колбэком назначения; ленивое создание закрывает
-// окно, в котором фетч приезжает раньше колбэка, и стоит одну проверку карты.
-// Мьютекса не требует: см. комментарий у поля workers.
+// окно, в котором фетч приезжает раньше колбэка, и стоит один незанятый захват
+// мьютекса.
 func (c *KafkaConsumer) worker(client *kgo.Client, key workerKey) *partitionWorker {
+	c.workersMu.Lock()
+	defer c.workersMu.Unlock()
+
 	if w, ok := c.workers[key]; ok {
 		return w
 	}
@@ -526,7 +606,23 @@ func (c *KafkaConsumer) runPartitionWorker(
 
 	logger.Debug("Partition worker started")
 
-	for batch := range w.records {
+	for {
+		// Отмена читается наравне с очередью, а не только внутри батча:
+		// простаивающий воркер иначе не увидел бы её вовсе и висел бы на
+		// приёме до тех пор, пока кто-нибудь не закроет канал.
+		var batch []*kgo.Record
+
+		select {
+		case b, ok := <-w.records:
+			if !ok {
+				return
+			}
+
+			batch = b
+		case <-ctx.Done():
+			return
+		}
+
 		for _, rec := range batch {
 			// Проверка внутри батча, а не только на приёме: жёсткая отмена
 			// должна обрывать разбор уже полученного буфера, иначе Stop по
@@ -557,11 +653,27 @@ func (c *KafkaConsumer) processRecord(
 	key workerKey, w *partitionWorker, logger *slog.Logger,
 ) {
 	defer func() {
-		if r := recover(); r != nil {
-			// Отдельный перехват вокруг обвязки: паника в трейсинге или в
-			// метриках не должна уносить воркера вместе с очередью.
-			c.panics.report(ctx, panicSiteProcessMessage, r, debug.Stack(), recordAttrs(rec)...)
+		r := recover()
+		if r == nil {
+			return
 		}
+
+		// Отдельный перехват вокруг обвязки: паника в трейсинге или в
+		// метриках не должна уносить воркера вместе с очередью.
+		c.panics.report(ctx, panicSiteProcessMessage, r, debug.Stack(), recordAttrs(rec)...)
+
+		// Отравление здесь обязательно. Штатный возврат из processRecord
+		// оставил бы запись без отметки, но не остановил бы партицию — и
+		// первая же успешная запись за ней сдвинула бы коммит через
+		// необработанную. Паника обвязки поэтому трактуется ровно как
+		// исчерпание повторов.
+		//
+		// Метрика исхода намеренно не пишется: упасть могла как раз она, и
+		// повторный вызов того же инструмента увёл бы панику из-под этого
+		// recover. Машиночитаемый след даёт kafkax.consumer.panics с
+		// site=process_message.
+		c.poison(client, key, w, logger.With(slog.Int64("offset", rec.Offset)),
+			fmt.Errorf("panic in message processing: %v", r))
 	}()
 
 	// Trace context из заголовков записи kotel уже извлёк на хуке фетча,
@@ -871,84 +983,145 @@ func (c *KafkaConsumer) rebalanceBudget(ctx context.Context) (context.Context, c
 	return context.WithTimeout(ctx, c.config.Consumer.RebalanceTimeout)
 }
 
+// keyedWorker — воркер вместе со своим ключом: снимок, снятый с карты под
+// мьютексом, чтобы ждать воркеров, уже не удерживая его.
+type keyedWorker struct {
+	key    workerKey
+	worker *partitionWorker
+}
+
 // stopWorkers мягко останавливает воркеров перечисленных партиций и дожидается
 // их выхода.
 func (c *KafkaConsumer) stopWorkers(ctx context.Context, partitions map[string][]int32) {
-	stopped := make([]workerKey, 0, len(partitions))
+	c.workersMu.Lock()
 
-	// Сначала закрываются все очереди, и лишь потом идёт ожидание: иначе
-	// воркеры дренировались бы по очереди, а не параллельно.
+	stopped := make([]keyedWorker, 0, len(partitions))
+
 	for topic, parts := range partitions {
 		for _, partition := range parts {
 			key := workerKey{topic: topic, partition: partition}
 			if w, ok := c.workers[key]; ok {
-				w.stop()
+				delete(c.workers, key)
 
-				stopped = append(stopped, key)
+				stopped = append(stopped, keyedWorker{key: key, worker: w})
 			}
 		}
 	}
 
-	c.awaitWorkers(ctx, stopped)
+	c.workersMu.Unlock()
+
+	c.closeAndAwait(ctx, stopped)
 }
 
 // stopAllWorkers мягко останавливает всех воркеров.
 func (c *KafkaConsumer) stopAllWorkers(ctx context.Context) {
-	stopped := make([]workerKey, 0, len(c.workers))
+	c.workersMu.Lock()
+
+	stopped := make([]keyedWorker, 0, len(c.workers))
 
 	for key, w := range c.workers {
-		w.stop()
+		stopped = append(stopped, keyedWorker{key: key, worker: w})
+	}
 
-		stopped = append(stopped, key)
+	clear(c.workers)
+	c.workersMu.Unlock()
+
+	c.closeAndAwait(ctx, stopped)
+}
+
+// closeAndAwait закрывает очереди снятых с карты воркеров и дожидается их
+// выхода.
+//
+// Сначала закрываются все очереди, и лишь потом идёт ожидание: иначе воркеры
+// дренировались бы по очереди, а не параллельно.
+func (c *KafkaConsumer) closeAndAwait(ctx context.Context, stopped []keyedWorker) {
+	for _, kw := range stopped {
+		kw.worker.stop()
 	}
 
 	c.awaitWorkers(ctx, stopped)
 }
 
-// awaitWorkers ждёт завершения воркеров и убирает их из карты.
+// awaitWorkers ждёт завершения воркеров.
 //
 // Воркер, не уложившийся в бюджет, отменяется жёстко: продолжать обработку
 // партиции, которая уже отдана другому участнику группы, хуже, чем оборвать
-// текущее сообщение — оно всё равно не отмечено и приедет снова.
-func (c *KafkaConsumer) awaitWorkers(ctx context.Context, keys []workerKey) {
-	for _, key := range keys {
-		w := c.workers[key]
-		delete(c.workers, key)
+// текущее сообщение — оно всё равно не отмечено и приедет снова. Но и после
+// отмены его выхода приходится дождаться: живой воркер продолжает отмечать
+// оффсеты и трогать клиента параллельно с финальным коммитом и закрытием.
+func (c *KafkaConsumer) awaitWorkers(ctx context.Context, stopped []keyedWorker) {
+	i := 0
+	for ; i < len(stopped); i++ {
+		if !waitClosed(ctx, stopped[i].worker.done) {
+			break
+		}
+	}
 
-		select {
-		case <-w.done:
-		case <-ctx.Done():
-			c.logger.Warn("Partition worker did not stop in time, cancelling",
-				slog.String("topic", key.topic),
-				slog.Int("partition", int(key.partition)))
-			w.cancel()
+	if i == len(stopped) {
+		return
+	}
+
+	// Бюджет исчерпан. Отмена идёт по всем оставшимся сразу, и лишь потом —
+	// ожидание в одном общем жёстком бюджете: по отдельности худший случай
+	// умножался бы на число воркеров.
+	pending := stopped[i:]
+
+	hardCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(c.lifeCtx), c.config.Consumer.RebalanceTimeout)
+	defer cancel()
+
+	for _, kw := range pending {
+		c.logger.Warn("Partition worker did not stop in time, cancelling",
+			slog.String("topic", kw.key.topic),
+			slog.Int("partition", int(kw.key.partition)))
+		kw.worker.cancel()
+	}
+
+	for _, kw := range pending {
+		if !waitClosed(hardCtx, kw.worker.done) {
+			c.logger.Error("Partition worker is still running after hard cancellation",
+				slog.String("topic", kw.key.topic),
+				slog.Int("partition", int(kw.key.partition)))
 		}
 	}
 }
 
 // Stop останавливает консьюмера и закрывает клиента.
 //
-// Порядок фиксирован: остановить цикл опроса, дождаться воркеров, явно
-// закоммитить отмеченные оффсеты (не полагаясь на тикер автокоммита) и лишь
-// затем закрыть клиента. Весь путь ограничен Config.GracefulTimeout; при
-// исчерпании бюджета в лог уходит предупреждение, и завершение продолжается.
+// Порядок фиксирован и обязателен: остановить цикл опроса и дождаться его
+// выхода, дождаться воркеров, явно закоммитить отмеченные оффсеты (не
+// полагаясь на тикер автокоммита) и лишь затем закрыть клиента.
+//
+// Ждать цикл опроса приходится потому, что он владеет картой воркеров и гейтом
+// BlockRebalanceOnPoll: CloseAllowingRebalance при живом цикле снял бы гейт,
+// удерживаемый чужой горутиной, и запустил бы onPartitionsRevoked параллельно
+// с dispatch — то есть гонку за картой и «send on closed channel» в горутине
+// без вызывающего. Если цикл не вышел даже после жёсткой отмены, клиент
+// остаётся открытым, а Stop возвращает ErrPollLoopStuck: утечка одного клиента
+// дешевле падения процесса.
 //
 // Закрытие — только CloseAllowingRebalance: обычный Close при
 // BlockRebalanceOnPoll повисает, потому что уход из группы вызывает ребаланс,
 // заблокированный незавершённым опросом.
 //
-// Клиент закрывается и при исчерпании бюджета, даже если воркер ещё жив:
-// отметка оффсета после закрытия — безопасный no-op, а не обращение к
-// освобождённым ресурсам, поэтому удерживать хендл ради опоздавших воркеров
-// не нужно.
+// Бюджет. Мягкая фаза (цикл опроса + дренаж воркеров) укладывается в
+// Config.GracefulTimeout. Сверх него в худшем случае добавляются жёсткая
+// добивка цикла, жёсткая добивка воркеров и финальный коммит — по
+// Consumer.RebalanceTimeout каждая, — плюс время внутри
+// CloseAllowingRebalance. Это стоит учитывать в terminationGracePeriodSeconds.
 //
-// Идемпотентен: повторный вызов пишет предупреждение и возвращает nil.
+// Идемпотентен и блокирующий: завершение выполняется ровно один раз, а всякий
+// вызывающий — включая пришедшего вторым и того, кто просто отменил контекст
+// Start, — дожидается его конца и получает один и тот же результат.
 func (c *KafkaConsumer) Stop() error {
-	if !c.stopping.CompareAndSwap(false, true) {
-		c.logger.Warn("Consumer is already stopping")
+	c.stopOnce.Do(func() { c.stopErr = c.shutdown() })
 
-		return nil
-	}
+	return c.stopErr
+}
+
+// shutdown — тело остановки, выполняемое ровно один раз.
+func (c *KafkaConsumer) shutdown() error {
+	c.stopping.Store(true)
 
 	c.mu.Lock()
 	client, pollCancel := c.client, c.pollCancel
@@ -968,15 +1141,14 @@ func (c *KafkaConsumer) Stop() error {
 
 	pollCancel()
 
-	if waitClosed(ctx, c.loopDone) {
-		c.stopAllWorkers(ctx)
-	} else {
-		// Карта воркеров не защищена мьютексом и принадлежит циклу опроса:
-		// пока цикл жив, трогать её нельзя, поэтому остаётся жёсткая отмена.
-		c.logger.Warn("Poll loop did not stop within graceful timeout",
-			slog.Duration("timeout", c.config.GracefulTimeout))
-		c.lifeCancel()
+	if !c.awaitPollLoop(ctx) {
+		c.logger.Error("Poll loop is still running after hard cancellation; " +
+			"leaving the kafka client open to avoid racing it")
+
+		return ErrPollLoopStuck
 	}
+
+	c.stopAllWorkers(ctx)
 
 	// Отдельный бюджет вместо остатка от ctx: ровно в том случае, когда
 	// финальный коммит важнее всего — цикл опроса или воркеры не уложились в
@@ -1000,6 +1172,30 @@ func (c *KafkaConsumer) Stop() error {
 	c.logger.Info("Kafka consumer shutdown completed")
 
 	return err
+}
+
+// awaitPollLoop дожидается выхода цикла опроса, при необходимости отменяя его
+// жёстко. false означает, что цикл не вышел и трогать ни карту воркеров, ни
+// клиента нельзя.
+//
+// Жёсткая отмена — это lifeCancel: она отменяет контексты воркеров, из-за чего
+// разблокируются и dispatch, упёршийся в полную очередь, и сам воркер, если он
+// стоял на приёме. Не помочь она может только тогда, когда цикл висит в чужом
+// коде, отмену не проверяющем, — в slog.Handler или в экспортёре метрик.
+func (c *KafkaConsumer) awaitPollLoop(ctx context.Context) bool {
+	if waitClosed(ctx, c.loopDone) {
+		return true
+	}
+
+	c.logger.Warn("Poll loop did not stop within graceful timeout, cancelling",
+		slog.Duration("timeout", c.config.GracefulTimeout))
+	c.lifeCancel()
+
+	hardCtx, cancel := context.WithTimeout(
+		context.WithoutCancel(c.lifeCtx), c.config.Consumer.RebalanceTimeout)
+	defer cancel()
+
+	return waitClosed(hardCtx, c.loopDone)
 }
 
 // waitClosed ждёт закрытия канала; false означает исчерпание бюджета.

@@ -20,6 +20,14 @@ const (
 	statusError   = "error"
 )
 
+// Значения атрибута reason у kafkax.producer.messages.rejected. Множество
+// замкнуто по построению: причина отбраковки — это ветка кода, а не входные
+// данные, поэтому кардинальность метрики ограничена числом этих констант.
+const (
+	rejectEmptyTopic     = "empty_topic"
+	rejectInvalidHeaders = "invalid_headers"
+)
+
 // PublishRequest — сообщение для отправки в Kafka.
 //
 // Все поля структуры доезжают до брокера: библиотека не съедает ни одного из
@@ -74,6 +82,7 @@ type KafkaProducer struct {
 
 	sent     metric.Int64Counter
 	failed   metric.Int64Counter
+	rejected metric.Int64Counter
 	duration metric.Float64Histogram
 }
 
@@ -141,13 +150,24 @@ func (p *KafkaProducer) initMetrics() error {
 		metric.WithDescription("Number of messages that failed to be delivered"))
 	p.failed = record(reg, "kafkax.producer.messages.failed", failed, err)
 
+	// Отбраковка на входе считается отдельно от отказов доставки, и атрибута
+	// topic у неё нет намеренно: значение приходит снаружи и ничем не
+	// ограничено, а серия рождается на каждое уникальное. Приложение,
+	// подставляющее в топик пользовательский ввод, иначе роняло бы backend
+	// метрик ровно теми запросами, которые пакет отверг не глядя.
+	rejected, err := meter.Int64Counter("kafkax.producer.messages.rejected",
+		metric.WithDescription("Messages rejected by input validation, by reason"))
+	p.rejected = record(reg, "kafkax.producer.messages.rejected", rejected, err)
+
 	// Единица — секунды, а не миллисекунды: при записи целыми миллисекундами
 	// всё, что быстрее миллисекунды, попадало бы в гистограмму нулём — то есть
 	// весь happy path при локальном брокере. Секунды к тому же требование OTel
-	// к единицам длительности, и стандартные бакеты подобраны под них.
+	// к единицам длительности. Бакеты при этом обязаны быть свои: умолчание SDK
+	// размечено под миллисекунды, см. producerDurationBuckets.
 	duration, err := meter.Float64Histogram("kafkax.producer.message.duration",
 		metric.WithDescription("End-to-end duration of SendMessage"),
-		metric.WithUnit("s"))
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(producerDurationBuckets...))
 	p.duration = record(reg, "kafkax.producer.message.duration", duration, err)
 
 	return reg.err()
@@ -169,16 +189,35 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) (er
 	}
 	defer p.inflight.Done()
 
+	// Валидация идёт до регистрации метрик исхода, а не после: атрибут topic
+	// берётся из запроса и ничем не ограничен, так что писать его для
+	// запроса, отвергнутого на входе, значит заводить три серии и полтора
+	// десятка бакетов на каждое уникальное значение, пришедшее снаружи.
+	// Отбраковка учитывается своим счётчиком с замкнутым множеством причин.
+	if req.Topic == "" {
+		p.reject(ctx, rejectEmptyTopic)
+
+		return fmt.Errorf("send message: %w", ErrEmptyTopic)
+	}
+
+	if err := validateHeaders(req.Headers); err != nil {
+		p.reject(ctx, rejectInvalidHeaders)
+
+		return fmt.Errorf("send message: %w", err)
+	}
+
 	start := time.Now()
 
-	// Единственная точка учёта: и счётчики, и гистограмма заполняются здесь,
-	// для любого исхода — включая отбраковку на входе, до похода в брокер.
+	// Единственная точка учёта исхода: и счётчики, и гистограмма заполняются
+	// здесь, для любого результата похода в брокер.
 	//
 	// Гистограмма только успешных отправок систематически занижает хвост,
-	// потому что таймауты — самые долгие вызовы — из неё выпадают. А счётчик
-	// отказов, не видящий отказы валидации, показывает идеальное здоровье
-	// приложению, которое шлёт один невалидный запрос за другим: сообщения не
-	// доезжают, а kafkax.producer.messages.failed остаётся нулём.
+	// потому что таймауты — самые долгие вызовы — из неё выпадают.
+	//
+	// Контекст здесь пользовательский, а не sendCtx: этот defer зарегистрирован
+	// раньше, чем defer cancel(), поэтому исполняется позже него, и sendCtx к
+	// этому моменту гарантированно отменён. Экспортёр, уважающий контекст,
+	// выбросил бы такую запись целиком.
 	defer func() {
 		topic := attribute.String("topic", req.Topic)
 
@@ -195,20 +234,12 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) (er
 			topic, attribute.String("status", status)))
 	}()
 
-	if req.Topic == "" {
-		return fmt.Errorf("send message: %w", ErrEmptyTopic)
-	}
-
-	if err := validateHeaders(req.Headers); err != nil {
-		return fmt.Errorf("send message: %w", err)
-	}
-
 	// Дедлайн ставится и на контекст, и на запись (RecordDeliveryTimeout в
 	// producerOpts) намеренно. Контекст отпускает вызывающего, но отменяет
 	// батч только по контексту ПЕРВОЙ записи в нём, так что чужой батч может
 	// пережить наш дедлайн; RecordDeliveryTimeout бьёт по каждой записи и
 	// закрывает этот зазор.
-	ctx, cancel := context.WithTimeout(ctx, p.messageTimeout)
+	sendCtx, cancel := context.WithTimeout(ctx, p.messageTimeout)
 	defer cancel()
 
 	rec := &kgo.Record{
@@ -222,11 +253,16 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) (er
 	// из rec.Context (который ProduceSync заполнит нашим ctx), инжектит
 	// traceparent в заголовки записи и закрывает спан в
 	// OnProduceRecordUnbuffered, проставив partition, offset и статус ошибки.
-	if err := p.client.ProduceSync(ctx, rec).FirstErr(); err != nil {
+	if err := p.client.ProduceSync(sendCtx, rec).FirstErr(); err != nil {
 		return p.produceError(err)
 	}
 
 	return nil
+}
+
+// reject считает сообщение, отвергнутое валидацией входа.
+func (p *KafkaProducer) reject(ctx context.Context, reason string) {
+	p.rejected.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
 }
 
 // acquire регистрирует отправку, если продюсер ещё принимает сообщения.

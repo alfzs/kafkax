@@ -551,14 +551,25 @@ func consumerFieldCases() []consumerFieldCase {
 			mutate: func(c *Consumer) {
 				c.HeartbeatInterval = c.SessionTimeout
 			},
-			want: "must be less than consumer.session_timeout",
+			want: "must not exceed a third of consumer.session_timeout",
 		},
 		{
 			name: "heartbeat_interval больше session_timeout",
 			mutate: func(c *Consumer) {
 				c.HeartbeatInterval = c.SessionTimeout + time.Second
 			},
-			want: "must be less than consumer.session_timeout",
+			want: "must not exceed a third of consumer.session_timeout",
+		},
+		{
+			// Граница проверки — треть, а не сам таймаут: при интервале в
+			// половину сессии один потерянный heartbeat уже стоит ребаланса.
+			// Прежняя проверка такую конфигурацию пропускала, хотя godoc
+			// запрещал её с самого начала.
+			name: "heartbeat_interval между третью session_timeout и им самим",
+			mutate: func(c *Consumer) {
+				c.HeartbeatInterval = c.SessionTimeout/3 + time.Millisecond
+			},
+			want: "must not exceed a third of consumer.session_timeout",
 		},
 		{
 			// Отрицательное значение уронило бы make(chan, n) паникой уже

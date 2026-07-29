@@ -28,9 +28,13 @@ lint: $(TOOLS_DIR)/golangci-lint
 lint-fix: $(TOOLS_DIR)/golangci-lint
 	$(TOOLS_DIR)/golangci-lint run --fix ./...
 
-## fmt: Check gofmt formatting
+## fmt: Check gofmt formatting (read-only; `make lint-fix` rewrites files)
+# gofmt -l, а не `go fmt`: последний переписывает файлы на месте, так что цель,
+# заявленная как проверка, молча меняла рабочее дерево — и в CI «проваливалась»
+# уже после того, как исправила причину провала.
 fmt:
-	@test -z "$$($(GO) fmt ./...)" || (echo "gofmt found issues" && exit 1)
+	@out="$$($$($(GO) env GOROOT)/bin/gofmt -l .)"; \
+	test -z "$$out" || (echo "gofmt found issues:"; echo "$$out"; exit 1)
 
 ## vet: Run go vet
 vet:

@@ -255,7 +255,9 @@ type Consumer struct {
 	// SessionTimeout — время, после которого координатор считает консьюмера
 	// мёртвым при отсутствии heartbeat.
 	SessionTimeout time.Duration `yaml:"session_timeout" env:"KAFKAX_CONSUMER_SESSION_TIMEOUT" env-default:"45s"`
-	// HeartbeatInterval — период heartbeat. Не более SessionTimeout/3.
+	// HeartbeatInterval — период heartbeat. Не более SessionTimeout/3, и это
+	// проверяется: запас на два промаха подряд — минимум, при котором
+	// единственный потерянный heartbeat не превращается в ребаланс.
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval" env:"KAFKAX_CONSUMER_HEARTBEAT_INTERVAL" env-default:"3s"`
 	// RebalanceTimeout — сколько координатор ждёт, пока консьюмер отдаст
 	// партиции. Должен превышать максимальное время обработки батча: именно в
@@ -466,10 +468,16 @@ func (c Config) consumerErrors() []error {
 		boundedDuration{"consumer.commit_interval", c.Consumer.CommitInterval, 100 * time.Millisecond},
 		boundedDuration{"consumer.max_wait", c.Consumer.MaxWait, 10 * time.Millisecond})
 
-	if c.Consumer.HeartbeatInterval >= c.Consumer.SessionTimeout && c.Consumer.SessionTimeout > 0 {
+	// Не «меньше session_timeout», а «не больше его трети» — ровно то, что
+	// обещает godoc HeartbeatInterval. Требование не косметическое: при
+	// интервале в половину таймаута достаточно одного потерянного heartbeat,
+	// чтобы координатор объявил живого консьюмера мёртвым и запустил ребаланс.
+	// Треть даёт запас на два промаха подряд — общепринятый минимум для Kafka.
+	maxHeartbeat := c.Consumer.SessionTimeout / 3
+	if c.Consumer.SessionTimeout > 0 && c.Consumer.HeartbeatInterval > maxHeartbeat {
 		errs = append(errs, fmt.Errorf(
-			"consumer.heartbeat_interval (%v) must be less than consumer.session_timeout (%v)",
-			c.Consumer.HeartbeatInterval, c.Consumer.SessionTimeout))
+			"consumer.heartbeat_interval (%v) must not exceed a third of consumer.session_timeout (%v), i.e. %v",
+			c.Consumer.HeartbeatInterval, c.Consumer.SessionTimeout, maxHeartbeat))
 	}
 
 	// Отрицательное значение роняет makechan паникой уже после того, как

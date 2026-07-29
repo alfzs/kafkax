@@ -74,14 +74,19 @@ func TestStopWithoutStart(t *testing.T) {
 // TestStartContextCancelStopsConsumer — отмена контекста Start останавливает
 // консьюмера, и последующий Stop не виснет.
 //
-// Отмена контекста — жёсткая остановка без дренажа, но Stop после неё обязан
-// пройти до конца: он вызывается из defer'а, и зависание там означало бы
-// процесс, который не завершается по SIGTERM.
+// Отмена контекста запускает тот же путь, что и явный Stop. Явный Stop после
+// неё обязан пройти до конца и вернуть результат того же завершения: он
+// вызывается из defer'а, и зависание там означало бы процесс, который не
+// завершается по SIGTERM.
 func TestStartContextCancelStopsConsumer(t *testing.T) {
 	t.Parallel()
 
 	brokers := newFakeCluster(t, 1, testTopic)
 	cfg := testConfig(t, brokers...)
+	// Как и в TestStopCommitsMarkedOffsets: тикер автокоммита заведомо не
+	// сработает, поэтому закоммиченный оффсет доказывает, что отмена контекста
+	// прошла полный путь завершения, а не оборвала консьюмера на месте.
+	cfg.Consumer.CommitInterval = time.Hour
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, testTopic, 0, "v")
@@ -109,6 +114,12 @@ func TestStartContextCancelStopsConsumer(t *testing.T) {
 		}
 	case <-time.After(consWait):
 		t.Fatal("Stop завис после отмены контекста Start")
+	}
+
+	got := consDrainFresh(t, cfg, prod, testTopic, 0)
+	if len(got) != 1 || got[0] != consMarkerValue {
+		t.Fatalf("свежий консьюмер получил %v, want только маркер: отмена контекста "+
+			"не довела завершение до финального коммита", got)
 	}
 }
 

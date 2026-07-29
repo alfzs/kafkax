@@ -39,6 +39,11 @@ type recordedMetrics struct {
 	mu      sync.Mutex
 	adds    []counterAdd
 	records []histogramRecord
+
+	// buckets — границы бакетов, с которыми регистрировалась гистограмма.
+	// Опции инструмента иначе нигде не видны: значения Record о разметке
+	// ничего не говорят, а до реального SDK они не доезжают вовсе.
+	buckets map[string][]float64
 }
 
 func (r *recordedMetrics) recordAdd(name string, value int64, attrs attribute.Set) {
@@ -127,9 +132,26 @@ func (m recordingMeter) Int64Counter(name string, _ ...metric.Int64CounterOption
 }
 
 func (m recordingMeter) Float64Histogram(
-	name string, _ ...metric.Float64HistogramOption,
+	name string, opts ...metric.Float64HistogramOption,
 ) (metric.Float64Histogram, error) {
+	m.rec.mu.Lock()
+	defer m.rec.mu.Unlock()
+
+	if m.rec.buckets == nil {
+		m.rec.buckets = make(map[string][]float64)
+	}
+
+	m.rec.buckets[name] = metric.NewFloat64HistogramConfig(opts...).ExplicitBucketBoundaries()
+
 	return recordingHistogram{rec: m.rec, name: name}, nil
+}
+
+// bucketsOf возвращает границы, с которыми регистрировалась гистограмма.
+func (r *recordedMetrics) bucketsOf(name string) []float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.buckets[name]
 }
 
 type recordingCounter struct {

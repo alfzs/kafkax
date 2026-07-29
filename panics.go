@@ -22,12 +22,18 @@ const (
 	panicSiteHandler          = "handler"
 	panicSiteProcessMessage   = "process_message"
 	panicSitePartitionWorker  = "partition_worker"
+	panicSitePollLoop         = "poll_loop"
 	panicSiteMessageSkipped   = "on_message_skipped"
 	panicSitePanicHookHandler = "on_panic"
 )
 
-// panicReporter — общая для продюсера и консьюмера реакция на восстановленную
-// панику: лог, метрика и пользовательский хук.
+// panicReporter — реакция на восстановленную панику: лог, метрика и
+// пользовательский хук.
+//
+// Поле есть только у консьюмера, и это не упущение: собственных горутин у
+// продюсера нет, восстанавливать панику негде и не из чего — она уходит
+// вызывающему по его же стеку. Config.OnPanic поэтому тоже вызывается только
+// консьюмером.
 //
 // Не пробрасывать панику наружу — правильное решение: rethrow из воркерной
 // горутины уронил бы процесс, поскольку паника чужой горутины вызывающим кодом

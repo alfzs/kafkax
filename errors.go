@@ -37,13 +37,24 @@ var (
 	// ErrConsumerStarted — Start вызван повторно на уже запущенном консьюмере.
 	ErrConsumerStarted = errors.New("kafkax: consumer already started")
 
+	// ErrPollLoopStuck — цикл опроса не вышел даже после жёсткой отмены,
+	// поэтому клиент Kafka намеренно НЕ закрыт: закрытие при живом цикле —
+	// это гонка за картой воркеров и паника «send on closed channel», то есть
+	// падение процесса вместо утечки одного клиента.
+	//
+	// Экземпляр утёк и не восстанавливается: партиции остаются закреплены за
+	// ним до истечения session timeout после гибели процесса. Причина всегда
+	// снаружи пакета — заблокировавшийся slog.Handler, экспортёр OTel или
+	// обработчик, не реагирующий на отмену контекста.
+	ErrPollLoopStuck = errors.New("kafkax: poll loop did not stop; kafka client left open")
+
 	// ErrNoHandlers — ни одного обработчика не зарегистрировано через
 	// AddHandler: подписываться и запускаться не на что.
 	ErrNoHandlers = errors.New("kafkax: no handlers registered")
 
 	// ErrEmptyTopic — топик не указан. Пустая строка отвергается на границе
 	// API: иначе AddHandler зарегистрировал бы обработчик под пустым ключом,
-	// который SubscribeAll передал бы в ConsumeTopics.
+	// а Start передал бы этот ключ в kgo.ConsumeTopics.
 	ErrEmptyTopic = errors.New("kafkax: topic must not be empty")
 
 	// ErrEmptyHeaderKey — заголовок с пустым именем. Поведение при чтении
