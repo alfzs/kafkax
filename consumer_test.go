@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -550,8 +549,8 @@ func TestAddHandlerContract(t *testing.T) {
 			t.Fatal("повторная регистрация прошла молча: прежний обработчик заменён без следа")
 		}
 
-		if !strings.Contains(err.Error(), "already registered") {
-			t.Fatalf("AddHandler (повтор) = %v, ожидалась ошибка о повторной регистрации", err)
+		if !errors.Is(err, ErrDuplicateHandler) {
+			t.Fatalf("AddHandler (повтор) = %v, want ErrDuplicateHandler", err)
 		}
 	})
 

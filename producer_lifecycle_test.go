@@ -516,10 +516,14 @@ func TestProducerCloseBoundedByGracefulTimeout(t *testing.T) {
 	// awaitInflight Close ждал бы все 30 секунд MessageTimeout.
 	closeStart := time.Now()
 
-	// Ошибка здесь ожидаема и не проверяется: брокер недоступен, flush не
-	// успевает за свой бюджет. Тест про длительность Close, а не про его исход.
-	if err := p.Close(); err != nil {
-		t.Logf("Close (ошибка ожидаема на недоступном брокере): %v", err)
+	// Брокер недоступен, flush не успевает за свой бюджет — запись потеряна.
+	// Именно это и обязан сообщить Close: без сентинела «не отправили» ничем
+	// не отличается от «не смогли красиво попрощаться», и вызывающий, у
+	// которого стоит defer producer.Close(), не отличит потерю данных от шума
+	// на завершении.
+	closeErr := p.Close()
+	if !errors.Is(closeErr, ErrFlushIncomplete) {
+		t.Fatalf("Close = %v, ожидался ErrFlushIncomplete", closeErr)
 	}
 
 	if elapsed := time.Since(closeStart); elapsed > 5*time.Second {

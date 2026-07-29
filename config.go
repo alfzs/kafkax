@@ -293,6 +293,65 @@ type Consumer struct {
 	HandlerRetryDelay time.Duration `yaml:"handler_retry_delay" env:"KAFKAX_CONSUMER_HANDLER_RETRY_DELAY" env-default:"1s"`
 }
 
+// DefaultConfig возвращает Config со всеми значениями по умолчанию —
+// теми же, что подставит cleanenv из тегов env-default.
+//
+// Существует потому, что нулевой Config нерабочий: собранный литералом в Go
+// (полностью поддерживаемый путь, а не обходной), он даёт около полутора
+// десятков ошибок валидации, и каждый вызывающий обязан знать все умолчания
+// наизусть. Правильный способ настроить пакет из кода — взять эту базу и
+// переопределить то, что нужно:
+//
+//	cfg := kafkax.DefaultConfig()
+//	cfg.Brokers = []string{"kafka:9092"}
+//	cfg.ClientID = "billing"
+//	cfg.Consumer.Group = "billing-workers"
+//
+// Обязательные поля без умолчаний — Brokers, ClientID, Consumer.Group — здесь
+// остаются пустыми: подставить за пользователя идентификатор группы значило бы
+// молча свести два разных сервиса в одну группу. Их отсутствие поймает
+// валидация в конструкторе.
+//
+// Значения дублируют теги структуры, и это проверяется тестом на сверку через
+// reflect: разъехаться молча они не могут.
+func DefaultConfig() Config {
+	return Config{
+		GracefulTimeout: 3 * time.Minute,
+		DialTimeout:     10 * time.Second,
+		Producer: Producer{
+			RequiredAcks:       -1,
+			EnableIdempotence:  true,
+			MaxInflight:        5,
+			MaxRetries:         3,
+			AckTimeout:         5 * time.Second,
+			RetryBackoff:       100 * time.Millisecond,
+			Linger:             0,
+			BatchBytes:         1048576,
+			CompressionType:    CompressionLZ4,
+			MaxBufferedRecords: 10000,
+			MaxBufferedBytes:   0,
+			MessageTimeout:     30 * time.Second,
+			FlushTimeout:       time.Minute,
+		},
+		Consumer: Consumer{
+			InitialOffset:     OffsetEarliest,
+			MinBytes:          1,
+			MaxBytes:          52428800,
+			MaxPartitionBytes: 1048576,
+			MaxWait:           500 * time.Millisecond,
+			SessionTimeout:    45 * time.Second,
+			HeartbeatInterval: 3 * time.Second,
+			RebalanceTimeout:  time.Minute,
+			IsolationLevel:    IsolationReadCommitted,
+			MaxPollRecords:    500,
+			MessageQueueSize:  100,
+			CommitInterval:    5 * time.Second,
+			HandlerMaxRetries: 0,
+			HandlerRetryDelay: time.Second,
+		},
+	}
+}
+
 // Validate проверяет Config целиком — и продюсерскую, и консьюмерскую секцию.
 // Подходит приложению, которое создаёт из одного Config и то, и другое.
 //
@@ -300,25 +359,70 @@ type Consumer struct {
 // требовать consumer.group, а консьюмеру — producer.flush_timeout. Config,
 // прошедший NewKafkaProducer, может не пройти Validate.
 //
-// Ошибки собираются все разом через errors.Join, а не возвращаются по первой:
-// иначе неполный конфиг чинится по одному полю за перезапуск. Список
-// разворачивается через errors.Unwrap() []error.
+// Ошибки собираются все разом, а не возвращаются по первой: иначе неполный
+// конфиг чинится по одному полю за перезапуск. Результат отвечает
+// errors.Is(err, ErrInvalidConfig), а полный список претензий разворачивается
+// через errors.Unwrap() []error. Сентинел в этот список НЕ входит: код,
+// печатающий список пользователю, иначе выводил бы «invalid configuration»
+// первой строкой перечня полей.
+//
+// Конструкторы возвращают эту ошибку как есть, не оборачивая: обёртка через
+// fmt.Errorf дала бы Unwrap() error вместо Unwrap() []error и сломала бы
+// описанный выше разбор.
 func (c Config) Validate() error {
 	errs := c.commonErrors()
 	errs = append(errs, c.producerErrors()...)
 	errs = append(errs, c.consumerErrors()...)
 
-	return errors.Join(errs...)
+	return newConfigError("config", errs)
 }
 
 // validateProducer — проверка для NewKafkaProducer: общие поля и секция Producer.
 func (c Config) validateProducer() error {
-	return errors.Join(append(c.commonErrors(), c.producerErrors()...)...)
+	return newConfigError("producer config", append(c.commonErrors(), c.producerErrors()...))
 }
 
 // validateConsumer — проверка для NewKafkaConsumer: общие поля и секция Consumer.
 func (c Config) validateConsumer() error {
-	return errors.Join(append(c.commonErrors(), c.consumerErrors()...)...)
+	return newConfigError("consumer config", append(c.commonErrors(), c.consumerErrors()...))
+}
+
+// configError — агрегат ошибок валидации.
+//
+// Собственный тип, а не errors.Join с подмешанным ErrInvalidConfig: у Join'а
+// разворот через Unwrap() []error отдал бы сентинел наравне с ошибками полей.
+// Здесь Is отвечает за принадлежность к ErrInvalidConfig, а Unwrap отдаёт
+// ровно претензии к полям — в том порядке, в каком их собрали проверки.
+type configError struct {
+	// subject — что именно не прошло проверку: «config», «producer config»
+	// или «consumer config». Роль важна, потому что проверки разные: Config,
+	// прошедший NewKafkaProducer, может не пройти Validate.
+	subject string
+	errs    []error
+}
+
+// newConfigError возвращает nil на пустом списке — иначе каждый вызывающий
+// писал бы эту проверку сам, а забытая превратила бы валидный конфиг в ошибку.
+func newConfigError(subject string, errs []error) error {
+	if len(errs) == 0 {
+		return nil
+	}
+
+	return &configError{subject: subject, errs: errs}
+}
+
+func (e *configError) Error() string {
+	return fmt.Sprintf("kafkax: invalid %s: %s", e.subject, errors.Join(e.errs...))
+}
+
+func (e *configError) Unwrap() []error {
+	return e.errs
+}
+
+// Is привязывает агрегат к ErrInvalidConfig. Обход вложенных ошибок errors.Is
+// делает сам через Unwrap() []error, поэтому здесь достаточно одного сентинела.
+func (e *configError) Is(target error) bool {
+	return target == ErrInvalidConfig
 }
 
 func (c Config) commonErrors() []error {

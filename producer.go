@@ -94,8 +94,11 @@ var _ MessageProducer = (*KafkaProducer)(nil)
 // franz-go не ходит в сеть при создании клиента, так что ошибка здесь —
 // всегда ошибка конфигурации, а не доступности кластера.
 func NewKafkaProducer(config Config) (*KafkaProducer, error) {
+	// Не оборачивается: у агрегата валидации Unwrap() []error, и fmt.Errorf
+	// подменил бы его на Unwrap() error — документированный разбор списка
+	// перестал бы работать ровно там, где он нужен.
 	if err := config.validateProducer(); err != nil {
-		return nil, fmt.Errorf("invalid producer config: %w", err)
+		return nil, err
 	}
 
 	logger := config.logger("kafka_producer")
@@ -372,7 +375,7 @@ func (p *KafkaProducer) flush(deadline time.Time) error {
 		p.logger.Warn("No time left for flush, dropping buffered records",
 			slog.Int64("buffered", p.client.BufferedProduceRecords()))
 
-		return errors.New("closing producer: flush budget exhausted")
+		return fmt.Errorf("closing producer: %w: flush budget exhausted", ErrFlushIncomplete)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
@@ -386,7 +389,8 @@ func (p *KafkaProducer) flush(deadline time.Time) error {
 		p.logger.Warn("Flush timed out, messages remaining in buffer",
 			slog.Int64("remaining", remaining))
 
-		return fmt.Errorf("closing producer: flushing %d buffered records: %w", remaining, err)
+		return fmt.Errorf("closing producer: %w: %d records remaining: %w",
+			ErrFlushIncomplete, remaining, err)
 	}
 
 	p.logger.Info("All buffered messages flushed")

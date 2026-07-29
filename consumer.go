@@ -335,8 +335,11 @@ type KafkaConsumer struct {
 func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 	const op = "new_kafka_consumer"
 
+	// Не оборачивается: у агрегата валидации Unwrap() []error, и fmt.Errorf
+	// подменил бы его на Unwrap() error — документированный разбор списка
+	// перестал бы работать ровно там, где он нужен.
 	if err := config.validateConsumer(); err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
+		return nil, err
 	}
 
 	logger := config.logger("kafka_consumer").With(slog.String("group", config.Consumer.Group))
@@ -389,7 +392,7 @@ func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ..
 	defer c.handlersMu.Unlock()
 
 	if _, exists := c.handlers[topic]; exists {
-		return fmt.Errorf("handler for topic %q already registered", topic)
+		return fmt.Errorf("add handler for topic %q: %w", topic, ErrDuplicateHandler)
 	}
 
 	// Цепочка middleware собирается один раз при регистрации, а не на каждое
@@ -1359,7 +1362,7 @@ func (c *KafkaConsumer) shutdown() error {
 
 	if commitErr := client.CommitMarkedOffsets(commitCtx); commitErr != nil {
 		c.logger.Error("Failed to commit marked offsets on shutdown", slog.Any("error", commitErr))
-		err = fmt.Errorf("committing marked offsets: %w", commitErr)
+		err = fmt.Errorf("%w: %w", ErrCommitFailed, commitErr)
 	}
 
 	client.CloseAllowingRebalance()

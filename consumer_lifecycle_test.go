@@ -2,6 +2,7 @@ package kafkax
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -53,6 +54,62 @@ func TestStopCommitsMarkedOffsets(t *testing.T) {
 	got := consDrainFresh(t, cfg, prod, testTopic, 0)
 	if len(got) != 1 || got[0] != consMarkerValue {
 		t.Fatalf("свежий консьюмер получил %v, want только маркер: Stop не закоммитил оффсет", got)
+	}
+}
+
+// TestStopReportsFailedFinalCommit — провал финального коммита виден в ошибке
+// Stop, а не только в логе.
+//
+// Сценарий не экзотический: брокер уезжает ровно в тот момент, когда под ним
+// перезапускают сервис. Обработанное осталось незакоммиченным и после старта
+// приедет заново — для at-least-once это штатно, но потребитель обязан узнать
+// про дубликаты из возвращённого значения. Без сентинела этот исход неотличим
+// от чистой остановки, потому что оба возвращаются из одного Stop.
+//
+// Кластер гасится целиком: подделать отказ именно коммита подменой
+// конфигурации нельзя, а обрыв связи с координатором — та самая причина, по
+// которой ветка вообще существует.
+func TestStopReportsFailedFinalCommit(t *testing.T) {
+	t.Parallel()
+
+	cluster, brokers := newFakeClusterHandle(t, 1, testTopic)
+	cfg := testConfig(t, brokers...)
+	// Автокоммит не должен успеть: иначе к моменту Stop коммитить будет нечего,
+	// franz-go вернёт nil, не сходив к брокеру, и тест проверял бы пустоту.
+	cfg.Consumer.CommitInterval = time.Hour
+	// Бюджет финального коммита — RebalanceTimeout. На мёртвом брокере он
+	// выбирается целиком, поэтому берётся близкий к минимуму.
+	cfg.Consumer.RebalanceTimeout = 500 * time.Millisecond
+
+	prod := consNewProducer(t, brokers)
+	prod.send(t, testTopic, 0, "processed")
+
+	h := &mockHandler{}
+	c := mustConsumer(t, cfg)
+	mustAddHandler(t, c, testTopic, h)
+	consStart(t, c)
+
+	waitFor(t, consWait, "сообщение обработано", func() bool { return h.callCount() == 1 })
+
+	// Оффсет отмечен, но не закоммичен — коммитить будет что, а некуда.
+	cluster.Close()
+
+	err := c.Stop()
+	if !errors.Is(err, ErrCommitFailed) {
+		t.Fatalf("Stop = %v, ожидался ErrCommitFailed", err)
+	}
+
+	// Причина сохранена рядом с сентинелом: без неё дежурный видит «commit
+	// failed» и не знает, координатор ли недоступен, истёк ли бюджет или
+	// отобрали партиции. Разворачивается списком, потому что обёрнуты обе
+	// ошибки сразу.
+	list := cfgUnwrapJoined(t, err)
+	if len(list) != 2 {
+		t.Fatalf("развернулось %v, ожидались сентинел и причина", list)
+	}
+
+	if errors.Is(list[1], ErrCommitFailed) {
+		t.Fatalf("вместо причины развернулся тот же сентинел: %v", list[1])
 	}
 }
 

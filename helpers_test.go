@@ -37,6 +37,21 @@ const unreachableBroker = "127.0.0.1:1"
 func newFakeCluster(t *testing.T, partitions int32, topics ...string) []string {
 	t.Helper()
 
+	_, addrs := newFakeClusterHandle(t, partitions, topics...)
+
+	return addrs
+}
+
+// newFakeClusterHandle — то же самое, но отдаёт и сам кластер. Нужен тестам,
+// которые гасят брокер посреди сценария: обрыв связи посреди работы — это
+// отдельный класс отказов, и подделать его подменой конфигурации нельзя.
+//
+// Close у kfake идемпотентен, поэтому тест закрывает кластер сам, а
+// зарегистрированный здесь Cleanup остаётся страховкой на случай раннего
+// t.Fatal.
+func newFakeClusterHandle(t *testing.T, partitions int32, topics ...string) (*kfake.Cluster, []string) {
+	t.Helper()
+
 	if len(topics) == 0 {
 		topics = []string{testTopic}
 	}
@@ -53,7 +68,7 @@ func newFakeCluster(t *testing.T, partitions int32, topics ...string) []string {
 
 	t.Cleanup(cluster.Close)
 
-	return cluster.ListenAddrs()
+	return cluster, cluster.ListenAddrs()
 }
 
 // testLogger пишет логи библиотеки в журнал теста: при падении они видны, при
