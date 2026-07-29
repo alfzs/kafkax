@@ -438,7 +438,25 @@ kotel под своими именами.
 |---|---|---|
 | `SASL.Mechanism` | `KAFKAX_SASL_MECHANISM` | `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`. Регистр не важен |
 | `SASL.Username` | `KAFKAX_SASL_USERNAME` | Имя пользователя |
-| `SASL.Password` | `KAFKAX_SASL_PASSWORD` | Пароль. Не попадает в логи: `SASL` реализует `slog.LogValuer` и `fmt.Stringer` |
+| `SASL.Password` | `KAFKAX_SASL_PASSWORD` | Пароль. Не попадает ни в логи, ни в отладочный вывод: `SASL` реализует `slog.LogValuer`, `fmt.Stringer`, `fmt.GoStringer` и `json.Marshaler`, то есть `%s`, `%v`, `%#v` и `json.Marshal` печатают `[REDACTED]`. `Config` реализует `slog.LogValuer`, поэтому `slog.Any("config", cfg)` безопасен и на `JSONHandler` |
+| `SASL.AllowPlaintext` | `KAFKAX_SASL_ALLOW_PLAINTEXT` | `false`. Разрешает `PLAIN` без TLS — см. ниже. На `SCRAM` не влияет |
+
+`PLAIN` без TLS — ошибка валидации, а не предупреждение. Пароль при таком
+сочетании уходит брокеру открытым текстом при каждой аутентификации, включая
+переаутентификации по расписанию брокера; правкой конфигурации это не чинится,
+секрет придётся ротировать. Поэтому `Validate` отвергает такую пару, а не
+сообщает о ней постфактум.
+
+Способов продолжить три: включить `TLS.Enabled` (или задать `TLSConfig`),
+перейти на `SCRAM-SHA-256`/`SCRAM-SHA-512`, либо выставить
+`SASL.AllowPlaintext=true`. Последнее нужно там, где незашифрованное соединение
+законно — брокер в том же поде, TLS на сайдкаре, тесты на `kfake`, — и требует
+ровно одного: чтобы решение было записано в конфигурации, а не оказалось
+следствием невыставленной переменной окружения.
+
+`SCRAM` без TLS остаётся законным без опт-аута: пароль по проводу не идёт.
+Библиотека пишет `WARN` при создании такого клиента — симметрично
+`TLS.InsecureSkipVerify`.
 
 ### TLS
 
@@ -465,7 +483,7 @@ kotel под своими именами.
 | `BatchBytes` | `BATCH_BYTES` | `1048576` | Верхняя граница размера батча |
 | `CompressionType` | `COMPRESSION_TYPE` | `lz4` | `none`, `gzip`, `snappy`, `lz4`, `zstd` |
 | `MaxBufferedRecords` | `MAX_BUFFERED_RECORDS` | `10000` | Записей в памяти до подтверждения. Это и есть backpressure — лимит общий на клиента |
-| `MaxBufferedBytes` | `MAX_BUFFERED_BYTES` | `0` | Тот же лимит в байтах. `0` — без лимита |
+| `MaxBufferedBytes` | `MAX_BUFFERED_BYTES` | `0` | Тот же лимит в байтах. `0` — без лимита. Отрицательное значение отвергается |
 | `MessageTimeout` | `MESSAGE_TIMEOUT` | `30s` | Полный бюджет одного `SendMessage`. Минимум — `1s` |
 | `FlushTimeout` | `FLUSH_TIMEOUT` | `1m` | Верхняя граница финального flush при `Close`. Реально — `min(FlushTimeout, остаток GracefulTimeout)` |
 
@@ -475,9 +493,9 @@ kotel под своими именами.
 |---|---|---|---|
 | `Group` | `GROUP` | — | Идентификатор consumer group. Обязателен |
 | `InitialOffset` | `INITIAL_OFFSET` | `earliest` | Откуда читать группу без сохранённого оффсета: `earliest` или `latest` |
-| `MinBytes` | `MIN_BYTES` | `1` | Минимальный объём данных в ответе на fetch |
-| `MaxBytes` | `MAX_BYTES` | `52428800` | Максимальный объём данных в ответе |
-| `MaxPartitionBytes` | `MAX_PARTITION_BYTES` | `1048576` | Максимум с одной партиции в ответе |
+| `MinBytes` | `MIN_BYTES` | `1` | Минимальный объём данных в ответе на fetch. Должен быть положительным |
+| `MaxBytes` | `MAX_BYTES` | `52428800` | Максимальный объём данных в ответе. Должен быть положительным |
+| `MaxPartitionBytes` | `MAX_PARTITION_BYTES` | `1048576` | Максимум с одной партиции в ответе. Должен быть положительным и не превышать `MaxBytes` |
 | `MaxWait` | `MAX_WAIT` | `500ms` | Сколько брокер ждёт накопления `MinBytes` |
 | `SessionTimeout` | `SESSION_TIMEOUT` | `45s` | После какого молчания координатор считает консьюмера мёртвым |
 | `HeartbeatInterval` | `HEARTBEAT_INTERVAL` | `3s` | Период heartbeat. Не более `SessionTimeout/3` |
