@@ -485,6 +485,10 @@ func TestSkipHookPanicPausesPartition(t *testing.T) { //nolint:paralleltest // c
 // Вердикта обработчика в этот момент нет, поэтому сообщение не отмечается, но и
 // партицию не травит: оно просто приедет снова. Считать здесь отказ значило бы
 // ставить партицию на паузу при каждой штатной остановке процесса.
+//
+// Исход помечается отдельным cancelled, а не skipped: у skipped коммит уезжает
+// за необработанную запись, здесь — нет. Тест проверяет обе стороны разделения,
+// иначе дашборд «сколько сообщений мы потеряли» считал бы каждый деплой.
 func TestRetryCancelledDuringDelayDoesNotPoison(t *testing.T) { //nolint:paralleltest // captureMetrics подменяет глобальный MeterProvider: параллельный сосед смешал бы записи
 	const topic = "kafkax-retry-cancel-topic"
 
@@ -516,12 +520,27 @@ func TestRetryCancelledDuringDelayDoesNotPoison(t *testing.T) { //nolint:paralle
 
 	cancel()
 
-	consWaitTerminal(t, rec, topic, consumerStatusSkipped, 1)
+	consWaitTerminal(t, rec, topic, consumerStatusCancelled, 1)
 
 	if got := rec.sum(consMetricProcessed,
 		attribute.String("topic", topic),
 		attribute.String("status", consumerStatusError)); got != 0 {
 		t.Fatalf("processed(status=error) = %d, want 0: отмена — не отказ обработчика", got)
+	}
+
+	if got := rec.sum(consMetricProcessed,
+		attribute.String("topic", topic),
+		attribute.String("status", consumerStatusSkipped)); got != 0 {
+		t.Fatalf("processed(status=skipped) = %d, want 0: коммит за эту запись не сдвинулся", got)
+	}
+
+	// Длительность под cancelled не пишется: обработка не закончилась, мерить
+	// нечего. Проверяется здесь, а не в тесте гистограммы, потому что это
+	// единственный путь, порождающий cancelled.
+	if got := rec.observations(consMetricDuration,
+		attribute.String("topic", topic),
+		attribute.String("status", consumerStatusCancelled)); len(got) != 0 {
+		t.Fatalf("duration(status=cancelled) = %v, want none", got)
 	}
 
 	if err := c.Stop(); err != nil {

@@ -1,5 +1,8 @@
 # Тесты
 
+> **Статус на 2026-07-29:** С1 и С4 закрыты волной 2. К1–К4, С2, С3, С5, С6 и далее — открыты.
+> Сводка — в [00-summary.md](00-summary.md).
+
 Покрытие: **kafkax 89.4%**, **encoding 96.4%**, суммарно **89.7%**.
 `go test -race -count=5` и `-race -cpu=1,4` — чисто, ни одного флака.
 
@@ -68,6 +71,9 @@
 
 ## С1 [СЕРЬЁЗНО] Счётчик активных воркеров технически невозможно проверить
 
+**Статус: закрыто волной 2.** `recordingMeter` умеет `Int64UpDownCounter`; ассерт
+«после `Stop` == 0» есть и для `workers.active`, и для `partitions.paused`.
+
 `recorders_test.go:125-135` — `recordingMeter` переопределяет только `Int64Counter` и
 `Float64Histogram`; `Int64UpDownCounter` проваливается в noop.
 `kafkax.consumer.workers.active` (`consumer.go:185-188`, +1 на `:498`, −1 на `:515`) не упоминается
@@ -106,6 +112,12 @@
 ---
 
 ## С4 [СЕРЬЁЗНО] Ошибки фетча: и обработчик, и метрика мертвы
+
+**Статус: закрыто волной 2** — но не через kfake. Неретраибельную партиционную ошибку туда не
+выписать, а логика дедупа целиком живёт в `reportFetchError`, поэтому он вызывается напрямую:
+`TestFetchErrorsReportedOnStateChange` покрывает повтор, смену текста, раздельный учёт партиций и
+сброс после выздоровления; `TestFetchErrorsIgnoreShutdownNoise` — обе молчаливые ветки;
+`TestGroupSessionErrorCountedSeparately` — разделение группового и партиционного отказа.
 
 `consumer.go:445` `reportFetchError` — **0%**; метрика `kafkax.consumer.fetch.errors` не
 встречается в тестах.

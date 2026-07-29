@@ -92,12 +92,27 @@ const (
 	consumerStatusError = "error"
 	// consumerStatusSkipped — запись сознательно пропущена и отмечена к
 	// коммиту: обработчик исчерпал повторы, а OnMessageSkipped вернул nil,
-	// то есть принял её на себя. Либо отмена контекста застала паузу между
-	// повторами — вердикта нет, но и партицию останавливать не за что.
+	// то есть принял её на себя.
 	//
 	// Это единственный статус, при котором коммит сдвигается за запись, так и
 	// не обработанную успешно. Ненулевой рост — повод смотреть в OnMessageSkipped.
 	consumerStatusSkipped = "skipped"
+	// consumerStatusCancelled — отмена контекста застала паузу между повторами:
+	// вердикта нет, оффсет НЕ отмечен, партицию останавливать не за что.
+	// Сообщение приедет снова.
+	//
+	// Отдельно от skipped, хотя оба означают «успеха не было»: коммит здесь не
+	// двигается, записи в DLQ под это событие нет, и происходит оно на каждом
+	// штатном завершении процесса. Свалив их в одно значение, дашборд DLQ
+	// завышал бы счёт на каждом деплое. Длительность под этим статусом не
+	// пишется: мерить нечего, обработка не закончилась.
+	consumerStatusCancelled = "cancelled"
+	// consumerStatusDropped — запись прочитана из очереди отравленной партиции
+	// и выброшена не глядя. Оффсет не отмечен, поэтому она приедет снова.
+	//
+	// Считается, чтобы масштаб отравления был виден: за одной остановившейся
+	// партицией стоит не одно сообщение, а весь буфер, набранный до паузы.
+	consumerStatusDropped = "dropped"
 )
 
 // workerKey — адрес партиционного воркера. Структура сравнима, поэтому годится
@@ -147,12 +162,14 @@ func (w *partitionWorker) stop() {
 // уровень (задержки запросов, размеры батчей, состояние соединений) измеряет
 // kotel, дублировать его здесь нечем.
 type consumerMetrics struct {
-	processed     metric.Int64Counter
-	duration      metric.Float64Histogram
-	retries       metric.Int64Counter
-	fetchErrors   metric.Int64Counter
-	workersActive metric.Int64UpDownCounter
-	panics        metric.Int64Counter
+	processed        metric.Int64Counter
+	duration         metric.Float64Histogram
+	retries          metric.Int64Counter
+	fetchErrors      metric.Int64Counter
+	groupErrors      metric.Int64Counter
+	workersActive    metric.Int64UpDownCounter
+	partitionsPaused metric.Int64UpDownCounter
+	panics           metric.Int64Counter
 }
 
 // newConsumerMetrics регистрирует инструменты, собирая все ошибки разом.
@@ -183,15 +200,38 @@ func newConsumerMetrics(meter metric.Meter) (consumerMetrics, error) {
 		metric.WithDescription("Handler invocations that failed and were retried"))
 	m.retries = record(&reg, retriesName, retries, err)
 
+	// Считаются эпизоды, а не опросы: неретраибельную ошибку партиции franz-go
+	// возвращает на каждом опросе заново, и счётчик всех вхождений мерил бы
+	// частоту опроса, а не масштаб проблемы. Инкремент делается на переходе
+	// «партиция была здорова → сломалась» и на смену текста ошибки.
 	fetchErrorsName := "kafkax.consumer.fetch.errors"
 	fetchErrors, err := meter.Int64Counter(fetchErrorsName,
-		metric.WithDescription("Partition-level errors returned by a poll"))
+		metric.WithDescription("Partition-level fetch error episodes, counted on state change"))
 	m.fetchErrors = record(&reg, fetchErrorsName, fetchErrors, err)
+
+	// Отказ уровня группы — не то же самое, что отказ партиции: сообщений нет
+	// вообще, и алерт на него нужен свой. franz-go подкидывает такую ошибку
+	// синтетическим фетчем с пустым топиком и партицией 0, поэтому в
+	// fetch.errors она выглядела как поломка несуществующей партиции.
+	// Атрибутов нет намеренно: топика у этой ошибки не существует.
+	groupErrorsName := "kafkax.consumer.group.errors"
+	groupErrors, err := meter.Int64Counter(groupErrorsName,
+		metric.WithDescription("Group session error episodes, counted on state change"))
+	m.groupErrors = record(&reg, groupErrorsName, groupErrors, err)
 
 	workersName := "kafkax.consumer.workers.active"
 	workers, err := meter.Int64UpDownCounter(workersName,
 		metric.WithDescription("Partition workers currently running"))
 	m.workersActive = record(&reg, workersName, workers, err)
+
+	// Продолжающийся сигнал для штатного исхода политики отравленного
+	// сообщения. Разового лога мало: приостановленная партиция — это состояние,
+	// и алерт «стоит хотя бы одна» строится только по гейджу. Разовое событие к
+	// моменту дежурства уже уехало из окна.
+	pausedName := "kafkax.consumer.partitions.paused"
+	paused, err := meter.Int64UpDownCounter(pausedName,
+		metric.WithDescription("Partitions currently paused at an uncommitted offset"))
+	m.partitionsPaused = record(&reg, pausedName, paused, err)
 
 	panicsName := "kafkax.consumer.panics"
 	panicsCounter, err := meter.Int64Counter(panicsName,
@@ -227,6 +267,27 @@ type KafkaConsumer struct {
 	// нужных воркеров с карты под мьютексом, а ждёт их уже без него.
 	workersMu sync.Mutex
 	workers   map[workerKey]*partitionWorker
+
+	// pausedMu защищает набор приостановленных партиций и журнал последних
+	// сообщённых ошибок фетча. Отдельный мьютекс, а не workersMu: оба поля
+	// трогаются из цикла опроса и из горутин воркеров, но к карте воркеров
+	// отношения не имеют, а брать её замок на пути ошибки фетча значило бы
+	// сцепить разбор ошибок с созданием воркеров.
+	pausedMu sync.Mutex
+
+	// paused — партиции, снятые с выборки в poison. Дублирует набор пауз внутри
+	// franz-go намеренно: тот набор непрозрачен, а без собственного счёта
+	// нельзя ни отличить повторный poison от первого (иначе гейдж
+	// partitions.paused считал бы сообщения, а не партиции), ни узнать, что
+	// снятие паузы действительно что-то сняло.
+	paused map[workerKey]struct{}
+
+	// lastFetchErr — последняя сообщённая ошибка на партицию, по тексту.
+	// Неретраибельную ошибку franz-go возвращает на каждом опросе заново;
+	// без этого журнала лог и счётчик мерили бы частоту опроса. Ключ
+	// workerKey{} с пустым топиком отведён под ошибки уровня группы: топика у
+	// них нет, а состояние «группа сломана» точно так же требует дедупа.
+	lastFetchErr map[workerKey]string
 
 	// mu защищает только переходы жизненного цикла (client, pollCancel):
 	// Start и Stop могут быть вызваны из разных горутин.
@@ -288,16 +349,18 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 	lifeCtx, lifeCancel := context.WithCancel(context.Background())
 
 	return &KafkaConsumer{
-		config:     config,
-		logger:     logger,
-		telemetry:  newTelemetry(config.ClientID, config.Consumer.Group),
-		metrics:    metrics,
-		panics:     panicReporter{logger: logger, panics: metrics.panics, onPanic: config.OnPanic},
-		handlers:   make(map[string]ConsumerHandler),
-		workers:    make(map[workerKey]*partitionWorker),
-		lifeCtx:    lifeCtx,
-		lifeCancel: lifeCancel,
-		loopDone:   make(chan struct{}),
+		config:       config,
+		logger:       logger,
+		telemetry:    newTelemetry(config.ClientID, config.Consumer.Group),
+		metrics:      metrics,
+		panics:       panicReporter{logger: logger, panics: metrics.panics, onPanic: config.OnPanic},
+		handlers:     make(map[string]ConsumerHandler),
+		workers:      make(map[workerKey]*partitionWorker),
+		paused:       make(map[workerKey]struct{}),
+		lastFetchErr: make(map[workerKey]string),
+		lifeCtx:      lifeCtx,
+		lifeCancel:   lifeCancel,
+		loopDone:     make(chan struct{}),
 	}, nil
 }
 
@@ -518,19 +581,79 @@ func (c *KafkaConsumer) pollOnce(ctx context.Context, client *kgo.Client) bool {
 	return true
 }
 
-// reportFetchError фиксирует ошибку уровня партиции.
+// reportFetchError фиксирует ошибку фетча — партиционную или групповую.
+//
+// Сообщается только смена состояния. Ретраибельные ошибки franz-go гасит сам,
+// а неретраибельные оставляет в фетче: курсор снова становится годным, и
+// следующий опрос приносит ту же ошибку. Бэкоффа в этой ветке нет, поэтому
+// безусловный лог давал бы поток записей Error с частотой опроса — при
+// MaxWait=500ms это минимум две в секунду на партицию, а при мгновенном ответе
+// брокера на порядки больше. Счётчик при этом мерил бы частоту опроса вместо
+// масштаба проблемы.
 func (c *KafkaConsumer) reportFetchError(topic string, partition int32, err error) {
 	if errors.Is(err, context.Canceled) || errors.Is(err, kgo.ErrClientClosed) {
 		return
 	}
 
-	ctx := context.WithoutCancel(c.lifeCtx)
+	// Отказ уровня группы franz-go подкидывает синтетическим фетчем с пустым
+	// топиком и партицией 0. Без разбора он выглядел бы как поломка
+	// несуществующей партиции 0 топика "" — притом что это худший из отказов
+	// консьюмера: сообщений нет вообще, ни по одной партиции.
+	if groupErr, isGroupErr := errors.AsType[*kgo.ErrGroupSession](err); isGroupErr {
+		// Дедуп и лог смотрят на одну и ту же ошибку — распакованную. Иначе
+		// смена обёртки вокруг неизменившейся причины считалась бы новым
+		// эпизодом.
+		if c.firstReport(workerKey{}, groupErr) {
+			c.metrics.groupErrors.Add(context.WithoutCancel(c.lifeCtx), 1)
+			c.logger.Error("Consumer group session error", slog.Any("error", groupErr))
+		}
 
-	c.metrics.fetchErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("topic", topic)))
+		return
+	}
+
+	key := workerKey{topic: topic, partition: partition}
+	if !c.firstReport(key, err) {
+		return
+	}
+
+	c.metrics.fetchErrors.Add(context.WithoutCancel(c.lifeCtx), 1,
+		metric.WithAttributes(attribute.String("topic", topic)))
 	c.logger.Error("Partition fetch error",
 		slog.String("topic", topic),
 		slog.Int("partition", int(partition)),
 		slog.Any("error", err))
+}
+
+// firstReport сообщает, изменилось ли состояние ошибки на key.
+//
+// Сравнение по тексту, а не по значению: ошибки franz-go — указатели на
+// структуры, свежие на каждом фетче, и == сравнивал бы адреса. Текст же
+// содержит и код ошибки, и её параметры, поэтому смена причины отказа
+// распознаётся как новый эпизод.
+func (c *KafkaConsumer) firstReport(key workerKey, err error) bool {
+	text := err.Error()
+
+	c.pausedMu.Lock()
+	defer c.pausedMu.Unlock()
+
+	if c.lastFetchErr[key] == text {
+		return false
+	}
+
+	c.lastFetchErr[key] = text
+
+	return true
+}
+
+// clearFetchError снимает отметку об ошибке: партиция снова отдаёт записи.
+//
+// Без сброса повторение той же ошибки после выздоровления не было бы сообщено
+// вовсе — дедуп превратился бы в «сообщаем один раз за жизнь процесса».
+func (c *KafkaConsumer) clearFetchError(key workerKey) {
+	c.pausedMu.Lock()
+	defer c.pausedMu.Unlock()
+
+	delete(c.lastFetchErr, key)
 }
 
 // dispatch отдаёт батч воркеру партиции.
@@ -543,7 +666,14 @@ func (c *KafkaConsumer) dispatch(ctx context.Context, client *kgo.Client, ftp kg
 		return
 	}
 
-	worker := c.worker(client, workerKey{topic: ftp.Topic, partition: ftp.Partition})
+	key := workerKey{topic: ftp.Topic, partition: ftp.Partition}
+
+	// Партиция отдала записи — значит, выздоровела. Отметку о последней
+	// сообщённой ошибке снимаем здесь, а не в обходе ошибок: тот про успех
+	// ничего не знает.
+	c.clearFetchError(key)
+
+	worker := c.worker(client, key)
 
 	select {
 	case worker.records <- ftp.Records:
@@ -576,6 +706,13 @@ func (c *KafkaConsumer) worker(client *kgo.Client, key workerKey) *partitionWork
 	c.workers[key] = w
 
 	c.metrics.workersActive.Add(ctx, 1)
+
+	// Свежий воркер читает партицию с непрокоммиченного оффсета, поэтому пауза,
+	// если она была, снимается именно здесь — и только здесь. Вызов под
+	// workersMu: он берёт другой мьютекс и карту воркеров не трогает, а
+	// вынесенный за замок открыл бы окно, в котором воркер уже в карте, но
+	// партиция ещё не в выборке.
+	c.resumePartition(client, key)
 
 	go c.runPartitionWorker(ctx, client, key, w)
 
@@ -638,6 +775,8 @@ func (c *KafkaConsumer) runPartitionWorker(
 			// это делать, dispatch упёрся бы в полную очередь и заблокировал
 			// общий цикл опроса, остановив заодно и здоровые партиции.
 			if w.poisoned {
+				c.countMessage(context.WithoutCancel(ctx), rec.Topic, consumerStatusDropped)
+
 				continue
 			}
 
@@ -709,8 +848,9 @@ func (c *KafkaConsumer) processRecord(
 	decided, err := c.runHandler(msgCtx, handler, msg, span, log)
 	if !decided {
 		// Отмена застала паузу между попытками: вердикта нет, длительность
-		// мерить нечего.
-		c.countMessage(msgCtx, rec.Topic, consumerStatusSkipped)
+		// мерить нечего. Оффсет не отмечается — сообщение приедет снова, —
+		// поэтому и статус не skipped: там коммит двигается, здесь нет.
+		c.countMessage(context.WithoutCancel(msgCtx), rec.Topic, consumerStatusCancelled)
 
 		return
 	}
@@ -805,11 +945,9 @@ func (c *KafkaConsumer) callSkipHook(ctx context.Context, msg IncomingMessage, c
 // приедет заново. PauseFetchPartitions прекращает выборку, не отдавая
 // партицию: назначение остаётся за нами, лаг растёт и виден в мониторинге.
 //
-// Пауза снимается следующим назначением этой партиции — своим (ребаланс,
-// перезапуск) или чужим — ровно тогда, когда она начнёт читаться с
-// проваленного оффсета заново. Снимает её onPartitionsAssigned: сам по себе
-// ребаланс приостановленную партицию не отпускает, набор пауз в franz-go
-// принадлежит клиенту, а не назначению.
+// Пауза снимается вместе со сменой воркера — см. resumePartition. Набор пауз в
+// franz-go принадлежит клиенту, а не назначению, и сам по себе ребаланс его не
+// трогает.
 func (c *KafkaConsumer) poison(
 	client *kgo.Client, key workerKey, w *partitionWorker, log *slog.Logger, cause error,
 ) {
@@ -820,6 +958,59 @@ func (c *KafkaConsumer) poison(
 		slog.Any("error", cause))
 
 	client.PauseFetchPartitions(map[string][]int32{key.topic: {key.partition}})
+
+	c.pausedMu.Lock()
+	defer c.pausedMu.Unlock()
+
+	// Гейдж считает партиции, а не отравленные сообщения. Повторный poison той
+	// же партиции возможен: воркер выбрасывает записи, но обвязка вокруг
+	// processRecord может упасть и на выброшенной, — и без этой проверки
+	// счётчик уехал бы вверх на каждой такой записи и никогда не вернулся.
+	if _, already := c.paused[key]; already {
+		return
+	}
+
+	c.paused[key] = struct{}{}
+	c.metrics.partitionsPaused.Add(context.WithoutCancel(c.lifeCtx), 1)
+}
+
+// resumePartition возвращает партицию в выборку, если та была приостановлена.
+//
+// Вызывается ровно при появлении нового воркера — и это единственный момент,
+// когда снимать паузу правильно. Новый воркер означает, что партиция будет
+// прочитана заново с непрокоммиченного оффсета: отравившее её сообщение
+// приедет снова, ради чего пауза и ставилась.
+//
+// Привязка к воркеру, а не к списку assigned, — не стилистический выбор.
+// Балансировщик franz-go по умолчанию кооперативный, и onPartitionsAssigned
+// получает только вновь добавленные партиции: партиция, пережившая ребаланс за
+// тем же экземпляром, в этот список не попадает. Резюмировать по нему значило
+// бы оставить её на паузе навсегда, если воркера всё-таки пересоздали, и
+// наоборот — снять паузу с партиции, чей отравленный воркер жив и продолжает
+// выбрасывать записи.
+func (c *KafkaConsumer) resumePartition(client *kgo.Client, key workerKey) {
+	c.pausedMu.Lock()
+
+	_, wasPaused := c.paused[key]
+	if wasPaused {
+		delete(c.paused, key)
+		c.metrics.partitionsPaused.Add(context.WithoutCancel(c.lifeCtx), -1)
+	}
+
+	// Журнал ошибок фетча чистится вместе с паузой: партиция начинает жизнь
+	// заново, и следующая её поломка обязана быть сообщена как новая.
+	delete(c.lastFetchErr, key)
+
+	c.pausedMu.Unlock()
+
+	if !wasPaused {
+		return
+	}
+
+	client.ResumeFetchPartitions(map[string][]int32{key.topic: {key.partition}})
+	c.logger.Info("Partition resumed after reassignment",
+		slog.String("topic", key.topic),
+		slog.Int("partition", int(key.partition)))
 }
 
 // countMessage инкрементирует счётчик исходов обработки.
@@ -906,16 +1097,11 @@ func waitRetryDelay(ctx context.Context, delay time.Duration) bool {
 
 // onPartitionsAssigned заводит воркеров назначенных партиций.
 //
-// Снятие паузы — обязательная часть назначения, а не подстраховка. Набор
-// приостановленных партиций в franz-go живёт на уровне клиента и переживает
-// ребаланс: методы Pause*/Resume* — единственное, что его меняет. Без этого
-// вызова партиция, отравленная и приостановленная в poison, при возврате к
-// тому же экземпляру получала бы свежего воркера с poisoned=false, но её
-// фетч оставался бы выключенным навсегда — и обещание «сообщение приедет
-// заново после ребаланса» держалось бы только при переезде на другой процесс.
+// Паузу снимает не этот колбэк, а создание воркера внутри c.worker — см.
+// resumePartition. Балансировщик franz-go по умолчанию кооперативный, и
+// assigned содержит только вновь добавленные партиции: снятие паузы по этому
+// списку промахивалось бы мимо всех, кто остался за тем же экземпляром.
 func (c *KafkaConsumer) onPartitionsAssigned(_ context.Context, client *kgo.Client, assigned map[string][]int32) {
-	client.ResumeFetchPartitions(assigned)
-
 	for topic, partitions := range assigned {
 		for _, partition := range partitions {
 			c.worker(client, workerKey{topic: topic, partition: partition})
@@ -937,7 +1123,7 @@ func (c *KafkaConsumer) onPartitionsAssigned(_ context.Context, client *kgo.Clie
 // потерялись бы вместе с сессией.
 func (c *KafkaConsumer) onPartitionsRevoked(ctx context.Context, client *kgo.Client, revoked map[string][]int32) {
 	drainCtx, cancelDrain := c.rebalanceBudget(ctx)
-	c.stopWorkers(drainCtx, revoked)
+	c.stopWorkers(drainCtx, client, revoked)
 	cancelDrain()
 
 	// Отдельный бюджет, а не остаток от drainCtx: если воркеров пришлось
@@ -962,11 +1148,11 @@ func (c *KafkaConsumer) onPartitionsRevoked(ctx context.Context, client *kgo.Cli
 // Коммита здесь нет намеренно: партиции потеряны вместе с сессией группы, и
 // коммит либо будет отвергнут координатором, либо перезапишет оффсет,
 // принадлежащий уже другому участнику.
-func (c *KafkaConsumer) onPartitionsLost(ctx context.Context, _ *kgo.Client, lost map[string][]int32) {
+func (c *KafkaConsumer) onPartitionsLost(ctx context.Context, client *kgo.Client, lost map[string][]int32) {
 	ctx, cancel := c.rebalanceBudget(ctx)
 	defer cancel()
 
-	c.stopWorkers(ctx, lost)
+	c.stopWorkers(ctx, client, lost)
 
 	c.logger.Warn("Partitions lost", slog.Any("partitions", lost))
 }
@@ -992,7 +1178,7 @@ type keyedWorker struct {
 
 // stopWorkers мягко останавливает воркеров перечисленных партиций и дожидается
 // их выхода.
-func (c *KafkaConsumer) stopWorkers(ctx context.Context, partitions map[string][]int32) {
+func (c *KafkaConsumer) stopWorkers(ctx context.Context, client *kgo.Client, partitions map[string][]int32) {
 	c.workersMu.Lock()
 
 	stopped := make([]keyedWorker, 0, len(partitions))
@@ -1010,11 +1196,11 @@ func (c *KafkaConsumer) stopWorkers(ctx context.Context, partitions map[string][
 
 	c.workersMu.Unlock()
 
-	c.closeAndAwait(ctx, stopped)
+	c.closeAndAwait(ctx, client, stopped)
 }
 
 // stopAllWorkers мягко останавливает всех воркеров.
-func (c *KafkaConsumer) stopAllWorkers(ctx context.Context) {
+func (c *KafkaConsumer) stopAllWorkers(ctx context.Context, client *kgo.Client) {
 	c.workersMu.Lock()
 
 	stopped := make([]keyedWorker, 0, len(c.workers))
@@ -1026,7 +1212,7 @@ func (c *KafkaConsumer) stopAllWorkers(ctx context.Context) {
 	clear(c.workers)
 	c.workersMu.Unlock()
 
-	c.closeAndAwait(ctx, stopped)
+	c.closeAndAwait(ctx, client, stopped)
 }
 
 // closeAndAwait закрывает очереди снятых с карты воркеров и дожидается их
@@ -1034,12 +1220,22 @@ func (c *KafkaConsumer) stopAllWorkers(ctx context.Context) {
 //
 // Сначала закрываются все очереди, и лишь потом идёт ожидание: иначе воркеры
 // дренировались бы по очереди, а не параллельно.
-func (c *KafkaConsumer) closeAndAwait(ctx context.Context, stopped []keyedWorker) {
+func (c *KafkaConsumer) closeAndAwait(ctx context.Context, client *kgo.Client, stopped []keyedWorker) {
 	for _, kw := range stopped {
 		kw.worker.stop()
 	}
 
 	c.awaitWorkers(ctx, stopped)
+
+	// Пауза снимается вместе с воркером, который её поставил. Набор пауз в
+	// franz-go живёт на уровне клиента и переживает и ребаланс, и отзыв
+	// партиции: не сняв её здесь, мы оставили бы гейдж partitions.paused
+	// поднятым за партицию, которой у нас уже нет, — то есть подняли бы алерт
+	// на чужую проблему. Партиция, вернувшаяся к нам позже, получит свежего
+	// воркера и будет прочитана заново в любом случае.
+	for _, kw := range stopped {
+		c.resumePartition(client, kw.key)
+	}
 }
 
 // awaitWorkers ждёт завершения воркеров.
@@ -1148,7 +1344,7 @@ func (c *KafkaConsumer) shutdown() error {
 		return ErrPollLoopStuck
 	}
 
-	c.stopAllWorkers(ctx)
+	c.stopAllWorkers(ctx, client)
 
 	// Отдельный бюджет вместо остатка от ctx: ровно в том случае, когда
 	// финальный коммит важнее всего — цикл опроса или воркеры не уложились в

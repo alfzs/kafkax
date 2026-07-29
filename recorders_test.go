@@ -131,6 +131,17 @@ func (m recordingMeter) Int64Counter(name string, _ ...metric.Int64CounterOption
 	return recordingCounter{rec: m.rec, name: name}, nil
 }
 
+// Int64UpDownCounter пишет в тот же журнал, что и монотонный счётчик: у обоих
+// инструментов наблюдаемое событие — вызов Add(delta), и разделять их значило бы
+// заводить второй sum с той же логикой. Текущее значение гейджа — это сумма
+// дельт, которую sum и считает; отрицательные дельты складываются наравне с
+// положительными.
+func (m recordingMeter) Int64UpDownCounter(
+	name string, _ ...metric.Int64UpDownCounterOption,
+) (metric.Int64UpDownCounter, error) {
+	return recordingUpDownCounter{rec: m.rec, name: name}, nil
+}
+
 func (m recordingMeter) Float64Histogram(
 	name string, opts ...metric.Float64HistogramOption,
 ) (metric.Float64Histogram, error) {
@@ -162,6 +173,17 @@ type recordingCounter struct {
 }
 
 func (c recordingCounter) Add(_ context.Context, incr int64, opts ...metric.AddOption) {
+	c.rec.recordAdd(c.name, incr, metric.NewAddConfig(opts).Attributes())
+}
+
+type recordingUpDownCounter struct {
+	metricnoop.Int64UpDownCounter
+
+	rec  *recordedMetrics
+	name string
+}
+
+func (c recordingUpDownCounter) Add(_ context.Context, incr int64, opts ...metric.AddOption) {
 	c.rec.recordAdd(c.name, incr, metric.NewAddConfig(opts).Attributes())
 }
 
