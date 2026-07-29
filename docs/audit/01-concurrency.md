@@ -98,6 +98,14 @@ session timeout — heartbeat продолжается), гейт `BlockRebalanc
 `onPartitionsRevoked`/`stopWorkers` против `mapaccess1` в `worker` (`:486`) из `runPollLoop`, плюс
 `panic: send on closed channel` в `dispatch` (`:471`).
 
+**Отрицательный результат волны 2:** повторить гонку на исправленном коде не удалось. Пробу будили
+на 460/490/505/530/560/600 мс при `-count=4` и на 510 мс при `-count=8` — ни одного `DATA RACE`.
+Это ожидаемо после правки (ветка таймаута больше не закрывает клиента), но означает, что
+регрессионного теста на саму гонку у нас нет: закреплено только наблюдаемое следствие правки —
+`ErrPollLoopStuck` и то, что клиент остался открыт (`TestStopReportsStuckPollLoopAndLeavesClientOpen`,
+[06-tests.md](06-tests.md) С5). Верните безусловный `CloseAllowingRebalance` — этот тест упадёт, но
+по `Ping`, а не по детектору гонок.
+
 **Чем грозит.** `runPollLoop` — **единственная горутина пакета без `recover`**. Паника уносит
 процесс целиком, в момент штатного graceful shutdown. Практический триггер попадания в ветку
 таймаута: медленный пользовательский OTel-экспортёр в `c.metrics.workersActive.Add` (`:498`) или
