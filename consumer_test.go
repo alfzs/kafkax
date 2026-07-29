@@ -1,15 +1,19 @@
 package kafkax
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Тесты консьюмера поверх внутрипроцессного брокера kfake.
@@ -666,5 +670,160 @@ func TestConsumerSuccessMetrics(t *testing.T) { //nolint:paralleltest // capture
 	// миллисекунд всё быстрее миллисекунды падало бы в нулевую корзину.
 	if observations[0] < 0 || observations[0] > 60 {
 		t.Errorf("длительность = %v s, ожидалось разумное значение в секундах", observations[0])
+	}
+}
+
+// Тесты ленивого логгера записи.
+//
+// Проверяется не текст сообщений, а момент, в который строится обогащённый
+// логгер: happy path не пишет ни строки, и клонирование хэндлера на нём —
+// чистая потеря. Считаются поэтому именно вызовы WithAttrs, а не байты вывода.
+
+// loggerCalls — счётчики обращений к хэндлеру. Указатель общий у всех клонов:
+// Logger.With порождает новый хэндлер, и без общего счётчика клонирование как
+// раз и терялось бы из виду.
+type loggerCalls struct {
+	withAttrs int
+	handled   int
+}
+
+// countingHandler считает клонирования и записи, ничего не выводя.
+type countingHandler struct {
+	calls *loggerCalls
+}
+
+func (h countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h countingHandler) Handle(context.Context, slog.Record) error {
+	h.calls.handled++
+
+	return nil
+}
+
+func (h countingHandler) WithAttrs([]slog.Attr) slog.Handler {
+	h.calls.withAttrs++
+
+	return h
+}
+
+func (h countingHandler) WithGroup(string) slog.Handler { return h }
+
+// testSpan — спан с заданным контекстом и без записи.
+func testSpan(sampled bool) trace.Span {
+	cfg := trace.SpanContextConfig{}
+	if sampled {
+		cfg = trace.SpanContextConfig{
+			TraceID: trace.TraceID{
+				0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+				0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+			},
+			SpanID:     trace.SpanID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08},
+			TraceFlags: trace.FlagsSampled,
+		}
+	}
+
+	return trace.SpanFromContext(
+		trace.ContextWithSpanContext(context.Background(), trace.NewSpanContext(cfg)))
+}
+
+// TestRecordLoggerBuildsNothingUntilUsed — happy path не платит за логгер.
+func TestRecordLoggerBuildsNothingUntilUsed(t *testing.T) {
+	t.Parallel()
+
+	calls := &loggerCalls{}
+	log := &recordLogger{base: slog.New(countingHandler{calls: calls}), offset: 7}
+	log.span = testSpan(true)
+
+	if calls.withAttrs != 0 {
+		t.Fatalf("хэндлер клонирован %d раз до первого лога, want 0", calls.withAttrs)
+	}
+
+	log.get().Error("boom")
+
+	// offset и trace_id — два обогащения, то есть два клона хэндлера.
+	if calls.withAttrs != 2 {
+		t.Errorf("клонов хэндлера = %d, want 2", calls.withAttrs)
+	}
+
+	if calls.handled != 1 {
+		t.Errorf("записей = %d, want 1", calls.handled)
+	}
+}
+
+// TestRecordLoggerCachesEnrichment — путь отказа логирует по несколько раз, и
+// клонировать хэндлер заново на каждую строку незачем.
+func TestRecordLoggerCachesEnrichment(t *testing.T) {
+	t.Parallel()
+
+	calls := &loggerCalls{}
+	log := &recordLogger{base: slog.New(countingHandler{calls: calls}), offset: 7}
+	log.span = testSpan(true)
+
+	first := log.get()
+
+	for range 3 {
+		log.get().Warn("retry")
+	}
+
+	if second := log.get(); second != first {
+		t.Errorf("повторный get построил новый логгер")
+	}
+
+	if calls.withAttrs != 2 {
+		t.Errorf("клонов хэндлера = %d, want 2 (обогащение строится один раз)", calls.withAttrs)
+	}
+}
+
+// TestRecordLoggerWithoutTrace — без спана и с невалидным спан-контекстом
+// обогащение сводится к offset.
+//
+// Ветка с nil не гипотетическая: логгер строится раньше спана, потому что
+// перехватчик паник обвязки регистрируется раньше — и паника в самом
+// WithProcessSpan обязана попасть в лог, а не в nil-разыменование.
+func TestRecordLoggerWithoutTrace(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]trace.Span{
+		"спан ещё не создан":       nil,
+		"невалидный спан-контекст": testSpan(false),
+	}
+
+	for name, span := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			calls := &loggerCalls{}
+			log := &recordLogger{base: slog.New(countingHandler{calls: calls}), offset: 7}
+			log.span = span
+
+			log.get().Error("boom")
+
+			if calls.withAttrs != 1 {
+				t.Errorf("клонов хэндлера = %d, want 1 (только offset)", calls.withAttrs)
+			}
+		})
+	}
+}
+
+// TestRecordLoggerAttributes — обогащение доезжает до записи целиком: и
+// offset, и trace_id.
+func TestRecordLoggerAttributes(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+
+	log := &recordLogger{
+		base:   slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		offset: 42,
+	}
+	log.span = testSpan(true)
+
+	log.get().Error("boom")
+
+	out := buf.String()
+	for _, want := range []string{`"offset":42`, `"trace_id":"0102030405060708090a0b0c0d0e0f10"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("в записи нет %s: %s", want, out)
+		}
 	}
 }

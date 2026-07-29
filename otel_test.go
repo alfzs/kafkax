@@ -1,10 +1,14 @@
 package kafkax
 
 import (
+	"fmt"
 	"slices"
+	"sync"
 	"testing"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // TestDurationHistogramsDeclareExplicitBuckets — обе гистограммы длительности
@@ -26,7 +30,7 @@ func TestDurationHistogramsDeclareExplicitBuckets(t *testing.T) { //nolint:paral
 	}
 
 	p := &KafkaProducer{}
-	if err := p.initMetrics(); err != nil {
+	if err := p.initMetrics(otel.GetMeterProvider().Meter(instrumentationName)); err != nil {
 		t.Fatalf("initMetrics: %v", err)
 	}
 
@@ -74,5 +78,189 @@ func TestDurationBucketsAreSaneGrids(t *testing.T) {
 					name, i-1, buckets[i-1], i, buckets[i])
 			}
 		}
+	}
+}
+
+// Тесты кэша опций метрик.
+//
+// Кэш не наблюдаем снаружи пакета: он не меняет ни имён метрик, ни атрибутов,
+// а только цену их записи. Поэтому проверяется двумя способами — что атрибуты
+// на выходе те же, что строил metric.WithAttributes, и что кэш остаётся
+// ограниченным по памяти на входных данных, которые пакет не контролирует.
+
+// optsAttrs разбирает готовые опции обратно в множество атрибутов — ровно так,
+// как это делает SDK на приёме.
+func optsAttrs(t *testing.T, opts *metricOpts) attribute.Set {
+	t.Helper()
+
+	add := metric.NewAddConfig(opts.add).Attributes()
+	rec := metric.NewRecordConfig(opts.record).Attributes()
+
+	if !add.Equals(&rec) {
+		t.Fatalf("AddOption и RecordOption разошлись: %v vs %v", add, rec)
+	}
+
+	return add
+}
+
+// TestOptsCacheAttributesMatchWithAttributes — кэш отдаёт то же множество
+// атрибутов, что построил бы metric.WithAttributes на месте.
+func TestOptsCacheAttributesMatchWithAttributes(t *testing.T) {
+	t.Parallel()
+
+	cache := newOptsCache(8)
+
+	tests := map[string]struct {
+		status string
+		want   []attribute.KeyValue
+	}{
+		"topic only": {
+			status: noStatus,
+			want:   []attribute.KeyValue{attribute.String("topic", testTopic)},
+		},
+		"topic and status": {
+			status: consumerStatusSuccess,
+			want: []attribute.KeyValue{
+				attribute.String("topic", testTopic),
+				attribute.String("status", consumerStatusSuccess),
+			},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			got := optsAttrs(t, cache.get(testTopic, tt.status))
+			want := metric.NewAddConfig([]metric.AddOption{metric.WithAttributes(tt.want...)}).Attributes()
+
+			if !got.Equals(&want) {
+				t.Errorf("атрибуты = %v, want %v", got.ToSlice(), want.ToSlice())
+			}
+		})
+	}
+}
+
+// TestOptsCacheReusesEntries — повторный запрос отдаёт тот же экземпляр, а не
+// собирает опции заново. Это и есть весь смысл кэша, и проверить его иначе,
+// чем сравнением указателей, нечем.
+func TestOptsCacheReusesEntries(t *testing.T) {
+	t.Parallel()
+
+	cache := newOptsCache(4)
+
+	first := cache.get(testTopic, consumerStatusSuccess)
+	if second := cache.get(testTopic, consumerStatusSuccess); second != first {
+		t.Errorf("повторный get вернул другой экземпляр")
+	}
+
+	if other := cache.get(testTopic, consumerStatusError); other == first {
+		t.Errorf("разные статусы получили общий набор опций")
+	}
+}
+
+// TestOptsCacheWarmIgnoresLimit — прогрев укладывает все статусы топика и не
+// смотрит на потолок: топики приходят из AddHandler, то есть из кода
+// приложения, а не из данных.
+func TestOptsCacheWarmIgnoresLimit(t *testing.T) {
+	t.Parallel()
+
+	cache := newOptsCache(0)
+	cache.warm(testTopic, consumerStatuses...)
+
+	entries := *cache.entries.Load()
+	if want := len(consumerStatuses) + 1; len(entries) != want {
+		t.Fatalf("записей после прогрева = %d, want %d", len(entries), want)
+	}
+
+	// После прогрева путь сообщения обязан находить готовое: если бы он
+	// промахивался, кэш с limit=0 собирал бы опции заново на каждое сообщение.
+	for _, status := range append([]string{noStatus}, consumerStatuses...) {
+		if got := cache.get(testTopic, status); got != entries[optKey{topic: testTopic, status: status}] {
+			t.Errorf("get(%q) промахнулся мимо прогретой записи", status)
+		}
+	}
+
+	// Повторный прогрев того же топика не должен ни ломать записи, ни плодить
+	// новые: AddHandler дубликаты отвергает, но кэш не обязан на это полагаться.
+	cache.warm(testTopic, consumerStatuses...)
+
+	if got := len(*cache.entries.Load()); got != len(entries) {
+		t.Errorf("записей после повторного прогрева = %d, want %d", got, len(entries))
+	}
+}
+
+// TestOptsCacheStopsGrowingAtLimit — кэш не растёт за потолок.
+//
+// Это проверка не производительности, а памяти: topic продюсера приходит из
+// PublishRequest и ничем не ограничен, так что кэш без потолка был бы утечкой,
+// растущей ровно со скоростью подстановки пользовательского ввода в топик.
+func TestOptsCacheStopsGrowingAtLimit(t *testing.T) {
+	t.Parallel()
+
+	const limit = 4
+
+	cache := newOptsCache(limit)
+
+	for i := range 100 {
+		topic := fmt.Sprintf("topic-%d", i)
+
+		// Опции остаются годными и за потолком — просто собираются на месте.
+		attrs := optsAttrs(t, cache.get(topic, statusSuccess))
+		if got := attrs.Len(); got != 2 {
+			t.Fatalf("атрибутов у топика %q = %d, want 2", topic, got)
+		}
+	}
+
+	if got := len(*cache.entries.Load()); got != limit {
+		t.Errorf("записей в кэше = %d, want %d", got, limit)
+	}
+
+	// За потолком кэш ничего не запоминает: каждый вызов строит опции заново.
+	beyond := "topic-99"
+
+	first := cache.get(beyond, statusSuccess)
+	if second := cache.get(beyond, statusSuccess); second == first {
+		t.Errorf("топик за потолком всё-таки осел в кэше")
+	}
+}
+
+// TestOptsCacheConcurrentGet — параллельные промахи по одному ключу.
+//
+// Смысл не в скорости, а в двух инвариантах под -race: снимок карты
+// публикуется атомарно, а повторная проверка под мьютексом не даёт двум
+// промахам разложить в карту две записи для одного набора атрибутов.
+func TestOptsCacheConcurrentGet(t *testing.T) {
+	t.Parallel()
+
+	const goroutines = 16
+
+	cache := newOptsCache(goroutines)
+	got := make([]*metricOpts, goroutines)
+
+	var (
+		wg    sync.WaitGroup
+		start = make(chan struct{})
+	)
+
+	for i := range goroutines {
+		wg.Go(func() {
+			<-start
+
+			got[i] = cache.get(testTopic, consumerStatusSuccess)
+		})
+	}
+
+	close(start)
+	wg.Wait()
+
+	for i, opts := range got {
+		if opts != got[0] {
+			t.Fatalf("горутина %d получила другой экземпляр опций", i)
+		}
+	}
+
+	if n := len(*cache.entries.Load()); n != 1 {
+		t.Errorf("записей в кэше = %d, want 1", n)
 	}
 }

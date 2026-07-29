@@ -84,6 +84,10 @@ type KafkaProducer struct {
 	failed   metric.Int64Counter
 	rejected metric.Int64Counter
 	duration metric.Float64Histogram
+
+	// opts — готовые опции атрибутов для трёх инструментов исхода отправки.
+	// Кэш с потолком, потому что топик приходит снаружи; см. optsCache.
+	opts *optsCache
 }
 
 // Проверка на этапе компиляции, а не в тестах: интерфейс объявлен в этом же
@@ -118,7 +122,7 @@ func NewKafkaProducer(config Config) (*KafkaProducer, error) {
 		gracefulTimeout: config.GracefulTimeout,
 	}
 
-	if err := p.initMetrics(); err != nil {
+	if err := p.initMetrics(otel.GetMeterProvider().Meter(instrumentationName)); err != nil {
 		return nil, err
 	}
 
@@ -141,9 +145,9 @@ func NewKafkaProducer(config Config) (*KafkaProducer, error) {
 // Счётчика kafkax.producer.panics здесь нет: собственных горутин у продюсера
 // не заведено, восстанавливать паники негде и не из чего. Config.OnPanic
 // вызывается только консьюмером.
-func (p *KafkaProducer) initMetrics() error {
-	meter := otel.GetMeterProvider().Meter(instrumentationName)
+func (p *KafkaProducer) initMetrics(meter metric.Meter) error {
 	reg := &instrumentRegistry{}
+	p.opts = newOptsCache(producerOptsLimit)
 
 	sent, err := meter.Int64Counter("kafkax.producer.messages.sent",
 		metric.WithDescription("Number of messages successfully delivered to Kafka"))
@@ -221,21 +225,7 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) (er
 	// раньше, чем defer cancel(), поэтому исполняется позже него, и sendCtx к
 	// этому моменту гарантированно отменён. Экспортёр, уважающий контекст,
 	// выбросил бы такую запись целиком.
-	defer func() {
-		topic := attribute.String("topic", req.Topic)
-
-		status := statusSuccess
-		if err != nil {
-			status = statusError
-
-			p.failed.Add(ctx, 1, metric.WithAttributes(topic))
-		} else {
-			p.sent.Add(ctx, 1, metric.WithAttributes(topic))
-		}
-
-		p.duration.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(
-			topic, attribute.String("status", status)))
-	}()
+	defer func() { p.recordSend(ctx, req.Topic, time.Since(start), err) }()
 
 	// Дедлайн ставится и на контекст, и на запись (RecordDeliveryTimeout в
 	// producerOpts) намеренно. Контекст отпускает вызывающего, но отменяет
@@ -261,6 +251,30 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) (er
 	}
 
 	return nil
+}
+
+// recordSend записывает исход отправки: счётчик доставки и гистограмму
+// длительности.
+//
+// Вынесено из тела defer в SendMessage отдельным методом, потому что это
+// единственная точка учёта исхода на горячем пути: её цена измеряется
+// бенчмарком, а измерить замыкание внутри defer нечем.
+func (p *KafkaProducer) recordSend(ctx context.Context, topic string, elapsed time.Duration, err error) {
+	// Два обращения к кэшу, а не одно: у счётчиков доставки атрибут только
+	// topic — status у них был бы избыточен (само имя инструмента и есть
+	// исход), а у гистограммы он нужен, иначе таймауты сливаются с успехами.
+	topicOnly := p.opts.get(topic, noStatus)
+
+	status := statusSuccess
+	if err != nil {
+		status = statusError
+
+		p.failed.Add(ctx, 1, topicOnly.add...)
+	} else {
+		p.sent.Add(ctx, 1, topicOnly.add...)
+	}
+
+	p.duration.Record(ctx, elapsed.Seconds(), p.opts.get(topic, status).record...)
 }
 
 // reject считает сообщение, отвергнутое валидацией входа.

@@ -14,7 +14,6 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kgo"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
@@ -114,6 +113,19 @@ const (
 	// партицией стоит не одно сообщение, а весь буфер, набранный до паузы.
 	consumerStatusDropped = "dropped"
 )
+
+// consumerStatuses — то же множество списком, для прогрева кэша опций метрик.
+//
+// Держится рядом с константами намеренно: забытый здесь статус не сломает
+// метрику, но вернёт ей аллокации на горячем пути — молча, и заметно это будет
+// только по бенчмарку.
+var consumerStatuses = []string{
+	consumerStatusSuccess,
+	consumerStatusError,
+	consumerStatusSkipped,
+	consumerStatusCancelled,
+	consumerStatusDropped,
+}
 
 // workerKey — адрес партиционного воркера. Структура сравнима, поэтому годится
 // ключом карты без конкатенации строк на горячем пути.
@@ -256,6 +268,11 @@ type KafkaConsumer struct {
 	handlersMu sync.RWMutex
 	handlers   map[string]ConsumerHandler
 
+	// opts — готовые опции атрибутов доменных метрик. Прогревается в
+	// AddHandler и после Start не растёт: множество топиков замкнуто
+	// обработчиками, множество статусов — константами consumerStatus*.
+	opts *optsCache
+
 	// workersMu защищает саму карту. kgo.BlockRebalanceOnPoll делает опрос и
 	// колбэки ребаланса взаимно исключающими, но полагаться на это как на
 	// единственную синхронизацию нельзя: колбэки исполняются в горутинах
@@ -358,6 +375,7 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 		metrics:      metrics,
 		panics:       panicReporter{logger: logger, panics: metrics.panics, onPanic: config.OnPanic},
 		handlers:     make(map[string]ConsumerHandler),
+		opts:         newOptsCache(0),
 		workers:      make(map[workerKey]*partitionWorker),
 		paused:       make(map[workerKey]struct{}),
 		lastFetchErr: make(map[workerKey]string),
@@ -398,6 +416,11 @@ func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ..
 	// Цепочка middleware собирается один раз при регистрации, а не на каждое
 	// сообщение: аллокации замыканий на горячем пути ничего не дают.
 	c.handlers[topic] = Chain(handler, mws...)
+
+	// По той же причине здесь прогреваются опции метрик: набор атрибутов
+	// топика известен целиком уже сейчас, и строить его заново на каждое
+	// сообщение незачем.
+	c.opts.warm(topic, consumerStatuses...)
 
 	return nil
 }
@@ -620,7 +643,7 @@ func (c *KafkaConsumer) reportFetchError(topic string, partition int32, err erro
 	}
 
 	c.metrics.fetchErrors.Add(context.WithoutCancel(c.lifeCtx), 1,
-		metric.WithAttributes(attribute.String("topic", topic)))
+		c.opts.get(topic, noStatus).add...)
 	c.logger.Error("Partition fetch error",
 		slog.String("topic", topic),
 		slog.Int("partition", int(partition)),
@@ -788,12 +811,57 @@ func (c *KafkaConsumer) runPartitionWorker(
 	}
 }
 
+// recordLogger — логгер одной записи, обогащаемый лениво.
+//
+// offset и trace_id нужны только сообщениям об отказе, а на happy path не
+// пишется ни строки: два Logger.With клонируют хэндлер вместе с его
+// предформатированными атрибутами, а TraceID().String() кодирует шестнадцать
+// байт в hex — и всё это на каждое сообщение впустую. Обогащение поэтому
+// откладывается до первого обращения и запоминается: путь отказа логирует по
+// несколько раз, и платить за клонирование каждый раз незачем.
+//
+// Экземпляр живёт в пределах одного processRecord и не покидает горутину
+// воркера, поэтому кэш без синхронизации.
+type recordLogger struct {
+	base   *slog.Logger
+	offset int64
+
+	// span проставляется уже после создания: обогащённый логгер нужен и
+	// перехватчику паник, зарегистрированному раньше, чем спан появился.
+	span trace.Span
+
+	cached *slog.Logger
+}
+
+// get возвращает обогащённый логгер, строя его при первом обращении.
+func (l *recordLogger) get() *slog.Logger {
+	if l.cached != nil {
+		return l.cached
+	}
+
+	log := l.base.With(slog.Int64("offset", l.offset))
+
+	// Проверка на nil не формальность: сюда попадает и паника обвязки,
+	// случившаяся до старта спана.
+	if l.span != nil {
+		if sc := l.span.SpanContext(); sc.IsValid() {
+			log = log.With(slog.String("trace_id", sc.TraceID().String()))
+		}
+	}
+
+	l.cached = log
+
+	return log
+}
+
 // processRecord проводит одну запись через трейсинг, обработчик и отметку
 // к коммиту.
 func (c *KafkaConsumer) processRecord(
 	ctx context.Context, client *kgo.Client, rec *kgo.Record,
 	key workerKey, w *partitionWorker, logger *slog.Logger,
 ) {
+	log := &recordLogger{base: logger, offset: rec.Offset}
+
 	defer func() {
 		r := recover()
 		if r == nil {
@@ -814,8 +882,7 @@ func (c *KafkaConsumer) processRecord(
 		// повторный вызов того же инструмента увёл бы панику из-под этого
 		// recover. Машиночитаемый след даёт kafkax.consumer.panics с
 		// site=process_message.
-		c.poison(client, key, w, logger.With(slog.Int64("offset", rec.Offset)),
-			fmt.Errorf("panic in message processing: %v", r))
+		c.poison(client, key, w, log, fmt.Errorf("panic in message processing: %v", r))
 	}()
 
 	// Trace context из заголовков записи kotel уже извлёк на хуке фетча,
@@ -823,21 +890,18 @@ func (c *KafkaConsumer) processRecord(
 	_, span := c.telemetry.tracer.WithProcessSpan(rec)
 	defer span.End()
 
+	log.span = span
+
 	// Контекст спана построен от rec.Context, у которого нет отмены. Обработчику
 	// нужен отменяемый контекст воркера, поэтому спан переносится в него, а не
 	// наоборот.
 	msgCtx := trace.ContextWithSpan(ctx, span)
 
-	log := logger.With(slog.Int64("offset", rec.Offset))
-	if sc := span.SpanContext(); sc.IsValid() {
-		log = log.With(slog.String("trace_id", sc.TraceID().String()))
-	}
-
 	handler, ok := c.handler(rec.Topic)
 	if !ok {
 		// Возможно только при рассинхроне подписки и карты обработчиков.
 		// Оффсет не отмечается: сообщение вернётся, а не исчезнет.
-		log.Error("No handler registered for topic")
+		log.get().Error("No handler registered for topic")
 		c.countMessage(msgCtx, rec.Topic, consumerStatusError)
 		c.poison(client, key, w, log, errors.New("no handler registered"))
 
@@ -865,9 +929,7 @@ func (c *KafkaConsumer) processRecord(
 
 	// Длительность включает все попытки и все паузы между ними: измеряется
 	// задержка сообщения, а не одного вызова обработчика.
-	c.metrics.duration.Record(msgCtx, time.Since(start).Seconds(),
-		metric.WithAttributes(attribute.String("topic", rec.Topic), attribute.String("status", status)))
-	c.countMessage(msgCtx, rec.Topic, status)
+	c.recordOutcome(msgCtx, rec.Topic, status, time.Since(start))
 
 	if status == consumerStatusError {
 		// Неотмеченная запись — и есть гарантия at-least-once: коммит не
@@ -896,10 +958,10 @@ func (c *KafkaConsumer) resolveFailure(
 	key workerKey,
 	w *partitionWorker,
 	cause error,
-	log *slog.Logger,
+	log *recordLogger,
 ) string {
 	if c.config.OnMessageSkipped == nil {
-		log.Error("Message processing failed and no OnMessageSkipped hook is configured",
+		log.get().Error("Message processing failed and no OnMessageSkipped hook is configured",
 			slog.Any("error", cause))
 		c.poison(client, key, w, log, cause)
 
@@ -907,7 +969,7 @@ func (c *KafkaConsumer) resolveFailure(
 	}
 
 	if hookErr := c.callSkipHook(ctx, msg, cause); hookErr != nil {
-		log.Error("OnMessageSkipped refused the message",
+		log.get().Error("OnMessageSkipped refused the message",
 			slog.Any("error", cause),
 			slog.Any("hook_error", hookErr))
 		c.poison(client, key, w, log, cause)
@@ -915,7 +977,7 @@ func (c *KafkaConsumer) resolveFailure(
 		return consumerStatusError
 	}
 
-	log.Warn("Message skipped after exhausting retries", slog.Any("error", cause))
+	log.get().Warn("Message skipped after exhausting retries", slog.Any("error", cause))
 
 	return consumerStatusSkipped
 }
@@ -952,11 +1014,11 @@ func (c *KafkaConsumer) callSkipHook(ctx context.Context, msg IncomingMessage, c
 // franz-go принадлежит клиенту, а не назначению, и сам по себе ребаланс его не
 // трогает.
 func (c *KafkaConsumer) poison(
-	client *kgo.Client, key workerKey, w *partitionWorker, log *slog.Logger, cause error,
+	client *kgo.Client, key workerKey, w *partitionWorker, log *recordLogger, cause error,
 ) {
 	w.poisoned = true
 
-	log.Error("Partition paused at uncommitted offset; the message will be redelivered "+
+	log.get().Error("Partition paused at uncommitted offset; the message will be redelivered "+
 		"after rebalance or restart",
 		slog.Any("error", cause))
 
@@ -1016,11 +1078,22 @@ func (c *KafkaConsumer) resumePartition(client *kgo.Client, key workerKey) {
 		slog.Int("partition", int(key.partition)))
 }
 
+// recordOutcome записывает исход обработки целиком: длительность и счётчик.
+//
+// Отдельный метод, а не две строки в processRecord: это единственная точка,
+// где на каждое сообщение трогаются оба инструмента разом, и её цена
+// измеряется бенчмарком.
+func (c *KafkaConsumer) recordOutcome(ctx context.Context, topic, status string, elapsed time.Duration) {
+	// Один поиск в кэше на оба инструмента: набор атрибутов у них общий.
+	opts := c.opts.get(topic, status)
+
+	c.metrics.duration.Record(ctx, elapsed.Seconds(), opts.record...)
+	c.metrics.processed.Add(ctx, 1, opts.add...)
+}
+
 // countMessage инкрементирует счётчик исходов обработки.
 func (c *KafkaConsumer) countMessage(ctx context.Context, topic, status string) {
-	c.metrics.processed.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("topic", topic),
-		attribute.String("status", status)))
+	c.metrics.processed.Add(ctx, 1, c.opts.get(topic, status).add...)
 }
 
 // runHandler вызывает обработчик с повторами.
@@ -1028,7 +1101,7 @@ func (c *KafkaConsumer) countMessage(ctx context.Context, topic, status string) 
 // Первый результат — «вердикт получен»: false означает, что отмена контекста
 // прервала паузу между попытками и исход сообщения неизвестен.
 func (c *KafkaConsumer) runHandler(
-	ctx context.Context, handler ConsumerHandler, msg IncomingMessage, span trace.Span, log *slog.Logger,
+	ctx context.Context, handler ConsumerHandler, msg IncomingMessage, span trace.Span, log *recordLogger,
 ) (bool, error) {
 	maxRetries := c.config.Consumer.HandlerMaxRetries
 
@@ -1041,7 +1114,7 @@ func (c *KafkaConsumer) runHandler(
 		// Отрицательное значение (-1) означает «повторять бесконечно», ноль —
 		// «без повторов»: attempt считает уже сделанные повторы, а не вызовы.
 		if maxRetries >= 0 && attempt >= maxRetries {
-			log.Error("Handler failed, giving up",
+			log.get().Error("Handler failed, giving up",
 				slog.Int("attempts", attempt+1),
 				slog.Any("error", err))
 			span.RecordError(err)
@@ -1050,11 +1123,11 @@ func (c *KafkaConsumer) runHandler(
 			return true, err
 		}
 
-		log.Warn("Handler failed, retrying",
+		log.get().Warn("Handler failed, retrying",
 			slog.Int("attempt", attempt+1),
 			slog.Int("max_retries", maxRetries),
 			slog.Any("error", err))
-		c.metrics.retries.Add(ctx, 1, metric.WithAttributes(attribute.String("topic", msg.Topic)))
+		c.metrics.retries.Add(ctx, 1, c.opts.get(msg.Topic, noStatus).add...)
 
 		if !waitRetryDelay(ctx, c.config.Consumer.HandlerRetryDelay) {
 			return false, err

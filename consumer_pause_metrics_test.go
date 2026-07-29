@@ -122,8 +122,10 @@ func TestPausedGaugeCountsPartitionsNotMessages(t *testing.T) { //nolint:paralle
 	// poison дёргается напрямую: воспроизводить второе падение обвязки поверх
 	// уже отравленной партиции через kfake значило бы городить подмену
 	// инструмента с ручным подсчётом вызовов ради одного if.
-	c.poison(client, key, w, c.logger, errConsBoom)
-	c.poison(client, key, w, c.logger, errConsBoom)
+	log := &recordLogger{base: c.logger}
+
+	c.poison(client, key, w, log, errConsBoom)
+	c.poison(client, key, w, log, errConsBoom)
 
 	if got := rec.sum(consMetricPaused); got != 1 {
 		t.Fatalf("partitions.paused = %d, want 1: гейдж считает партиции, а не сообщения", got)
