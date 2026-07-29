@@ -7,7 +7,7 @@ $(TOOLS_DIR)/golangci-lint:
 $(TOOLS_DIR)/govulncheck:
 	GOBIN=$(PWD)/$(TOOLS_DIR) $(GO) install -C tools golang.org/x/vuln/cmd/govulncheck
 
-.PHONY: all test test-cover benchmark lint lint-fix fmt vet audit tidy clean help
+.PHONY: all test test-cover lint lint-fix fmt vet audit tidy clean help
 
 all: fmt vet lint test
 
@@ -19,10 +19,6 @@ test:
 test-cover:
 	$(GO) test -race -count=1 -coverprofile=coverage.out ./...
 	$(GO) tool cover -html=coverage.out -o coverage.html
-
-## benchmark: Run benchmarks
-benchmark:
-	$(GO) test -bench=. -benchmem ./...
 
 ## lint: Run golangci-lint
 lint: $(TOOLS_DIR)/golangci-lint

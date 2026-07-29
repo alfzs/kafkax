@@ -5,724 +5,355 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"runtime"
-	"runtime/debug"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"github.com/google/uuid"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/trace"
 )
 
-type tenantWorker struct {
-	// inFlight — число SendMessage, держащих ссылку на этот воркер.
-	// atomic.Int64 вместо atomic.AddInt64/LoadInt64 на обычном int64:
-	// содержит компилятороспознаваемый align64-маркер, гарантирующий
-	// 8-байтовое выравнивание независимо от позиции поля в структуре
-	// (актуально на 32-битных платформах).
-	inFlight    atomic.Int64
-	messageChan chan message
-	// drainCh закрывается, когда все inFlight завершились во время drain.
-	// Позволяет заменить spin-wait (runtime.Gosched) на канальный сигнал.
-	drainCh chan struct{}
-	//nolint:containedctx // lifecycle-контекст воркера (аналог BaseContext), не запросный — см. sprints/context-audit.md
-	ctx          context.Context
-	cancel       context.CancelFunc
-	lastActivity time.Time
-	mu           sync.Mutex
-	// logger декорирован tenant_id один раз при создании воркера, а не на
-	// каждый SendMessage — см. sprints/performance-audit.md.
-	logger *slog.Logger
+// Значения атрибута status у метрик продюсера.
+const (
+	statusSuccess = "success"
+	statusError   = "error"
+)
+
+// PublishRequest — сообщение для отправки в Kafka.
+//
+// Все поля структуры доезжают до брокера: библиотека не съедает ни одного из
+// них у себя. Тому, кому нужна тенантность в Kafka, нужен ключ или заголовок.
+type PublishRequest struct {
+	// Topic — топик назначения. Обязателен.
+	Topic string
+	// Key — ключ сообщения. Определяет партицию: записи с одинаковым ключом
+	// попадают в одну партицию и потому упорядочены между собой.
+	// nil означает партицию по кругу, а не «пустой ключ».
+	Key []byte
+	// Value — тело сообщения. nil — валидное значение: это tombstone,
+	// который compacted-топик трактует как удаление ключа.
+	Value []byte
+	// Headers — пользовательские заголовки. Имена traceparent, tracestate и
+	// baggage зарезервированы за OTel-propagator и отвергаются.
+	Headers Headers
 }
 
-func (w *tenantWorker) updateActivity() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	w.lastActivity = time.Now()
-}
-
-func (w *tenantWorker) getLastActivity() time.Time {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	return w.lastActivity
-}
-
-// message — внутренняя единица очереди воркера тенанта, не часть публичного API.
-type message struct {
-	//nolint:containedctx // message — элемент очереди воркера, передаваемый через канал; см. sprints/context-audit.md
-	Ctx      context.Context
-	TenantID uuid.UUID
-	Topic    string
-	Key      []byte
-	Value    []byte
-	Headers  Headers
-	Result   chan error
-	Timeout  time.Duration
-}
-
-type producerMetrics struct {
-	sent           metric.Int64Counter
-	failed         metric.Int64Counter
-	messageLatency metric.Float64Histogram
-	workersActive  metric.Int64UpDownCounter
-}
-
-// MessageProducer — интерфейс продюсера с tenant-изоляцией.
+// MessageProducer — то, что умеет продюсер. Интерфейс объявлен здесь, чтобы
+// вызывающий код мог подменить продюсер в тестах, не поднимая брокер.
 type MessageProducer interface {
 	SendMessage(ctx context.Context, req PublishRequest) error
-	Close()
+	Close() error
 }
 
-// KafkaProducer — реализация MessageProducer.
-// Для каждого уникального TenantID поддерживается отдельный воркер с буферным каналом,
-// что обеспечивает независимую обработку очередей разных тенантов.
-// Безопасен для конкурентного использования из нескольких горутин.
+// KafkaProducer — продюсер поверх *kgo.Client.
+//
+// Между вызовом и клиентом нет собственного слоя очередей и воркеров: он
+// дублировал бы то, что клиент Kafka делает сам — батчинг, упорядочивание по
+// партиции, ограничение памяти, — но с худшими свойствами, откладывая работу
+// вместо того, чтобы её сокращать, и растягивая бюджет времени на отправку
+// сверх документированного контракта.
+//
+// SendMessage вызывает ProduceSync, а батчингом, повторами и лимитом буфера
+// занимается franz-go.
 type KafkaProducer struct {
-	producer    *kafka.Producer
-	config      Config
-	logger      *slog.Logger
-	tenantPools map[uuid.UUID]*tenantWorker
-	workerLock  sync.RWMutex
-	wg          sync.WaitGroup
-	//nolint:containedctx // lifecycle-контекст компонента (аналог BaseContext), не запросный — см. sprints/context-audit.md
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	closed                chan struct{}
-	isStopping            atomic.Bool
-	inactiveWorkerTTL     time.Duration
-	cleanupWorkerInterval time.Duration
-	flushTimeout          time.Duration
-	messageTimeout        time.Duration
-	messageChanBuffer     int
-	tracer                trace.Tracer
-	propagator            propagation.TextMapPropagator
-	metrics               producerMetrics
+	client *kgo.Client
+	logger *slog.Logger
+
+	messageTimeout  time.Duration
+	flushTimeout    time.Duration
+	gracefulTimeout time.Duration
+
+	// mu защищает closing и приём новых отправок в inflight. RWMutex, а не
+	// atomic.Bool: между проверкой флага и inflight.Add должно быть
+	// невозможно вклиниться Close'у, иначе Wait вернётся раньше отправки,
+	// которая уже прошла проверку, и клиент закроется у неё под руками.
+	mu       sync.RWMutex
+	closing  bool
+	inflight sync.WaitGroup
+
+	sent     metric.Int64Counter
+	failed   metric.Int64Counter
+	duration metric.Float64Histogram
 }
 
-// buildProducerKafkaConfig транслирует Config в kafka.ConfigMap для librdkafka.
-func buildProducerKafkaConfig(config Config) kafka.ConfigMap {
-	kafkaConfig := kafka.ConfigMap{
-		"bootstrap.servers":                     strings.Join(config.Brokers, ","),
-		"client.id":                             config.ClientID,
-		"acks":                                  config.Producer.RequiredAcks,
-		"retries":                               config.Producer.MaxRetries,
-		"request.timeout.ms":                    int(config.Producer.AckTimeout.Milliseconds()),
-		"retry.backoff.ms":                      int(config.Producer.RetryBackoff.Milliseconds()),
-		"enable.idempotence":                    config.Producer.EnableIdempotence,
-		"max.in.flight.requests.per.connection": config.Producer.MaxInflight,
-		"linger.ms":                             int(config.Producer.Linger.Milliseconds()),
-		"batch.num.messages":                    config.Producer.BatchSize,
-		"batch.size":                            config.Producer.BatchBytes,
-		"compression.type":                      config.Producer.CompressionType,
-		"queue.buffering.max.ms":                int(config.Producer.BatchTimeout.Milliseconds()),
-		"security.protocol":                     config.SecurityProtocol,
-		"ssl.endpoint.identification.algorithm": config.TLS.endpointIdentAlgorithm(),
-		"ssl.ca.location":                       config.TLS.CaCertPath,
-		"ssl.certificate.location":              config.TLS.ClientCertPath,
-		"ssl.key.location":                      config.TLS.ClientKeyPath,
-	}
-	// SASL параметры передаются только при соответствующем протоколе;
-	// librdkafka запрещает пустое значение sasl.mechanisms.
-	proto := strings.ToUpper(config.SecurityProtocol)
-	if proto == SecurityProtocolSASLPlaintext || proto == SecurityProtocolSASLSSL {
-		kafkaConfig["sasl.mechanisms"] = config.SASL.Mechanism
-		kafkaConfig["sasl.username"] = config.SASL.Username
-		kafkaConfig["sasl.password"] = config.SASL.Password
+// Проверка на этапе компиляции, а не в тестах: интерфейс объявлен в этом же
+// пакете, и рассинхрон с реализацией — опечатка, а не смена контракта.
+var _ MessageProducer = (*KafkaProducer)(nil)
+
+// NewKafkaProducer создаёт продюсер и подключается к брокерам лениво:
+// franz-go не ходит в сеть при создании клиента, так что ошибка здесь —
+// всегда ошибка конфигурации, а не доступности кластера.
+func NewKafkaProducer(config Config) (*KafkaProducer, error) {
+	if err := config.validateProducer(); err != nil {
+		return nil, fmt.Errorf("invalid producer config: %w", err)
 	}
 
-	return kafkaConfig
-}
+	logger := config.logger("kafka_producer")
 
-// newProducerMetrics регистрирует OTel-инструменты продюсера в переданном meter.
-func newProducerMetrics(meter metric.Meter) producerMetrics {
-	sent, _ := meter.Int64Counter("kafkax.producer.messages.sent",
-		metric.WithDescription("Total messages successfully delivered to Kafka"))
-	failed, _ := meter.Int64Counter("kafkax.producer.messages.failed",
-		metric.WithDescription("Total messages that failed delivery"))
-	latency, _ := meter.Float64Histogram("kafkax.producer.message.duration",
-		metric.WithDescription("End-to-end produce latency from Produce() call to delivery ack"),
-		metric.WithUnit("ms"))
-	workersActive, _ := meter.Int64UpDownCounter("kafkax.producer.workers.active",
-		metric.WithDescription("Number of active tenant worker goroutines"))
-
-	return producerMetrics{
-		sent:           sent,
-		failed:         failed,
-		messageLatency: latency,
-		workersActive:  workersActive,
-	}
-}
-
-// NewKafkaProducer создаёт и запускает продюсер Kafka.
-//
-// ctx используется как родительский контекст продюсера: его отмена эквивалентна
-// вызову Close (запускается та же горутина graceful shutdown). Для управляемого
-// завершения по-прежнему предпочтительнее явный вызов Close — так вызывающий
-// код может дождаться его завершения синхронно, а не полагаться на фоновую
-// горутину-наблюдателя.
-//
-// Инициализирует OTel-инструменты (счётчики, гистограммы, gauge) и запускает
-// фоновую горутину сборщика неактивных воркеров. Возвращает ошибку при невалидной
-// конфигурации или невозможности подключиться к брокеру.
-func NewKafkaProducer(ctx context.Context, config Config) (*KafkaProducer, error) {
-	const op = "new_kafka_producer"
-
-	if err := config.Validate(); err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
-	}
-
-	kafkaConfig := buildProducerKafkaConfig(config)
-
-	producer, err := kafka.NewProducer(&kafkaConfig)
+	opts, err := config.producerOpts(logger)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
+		return nil, fmt.Errorf("building producer options: %w", err)
 	}
 
-	lifecycleCtx, cancel := context.WithCancel(ctx)
-
-	meter := otel.Meter("github.com/alfzs/kafkax/producer")
+	tel := newTelemetry(config.ClientID, "")
+	opts = append(opts, kgo.WithHooks(tel.hooks...))
 
 	p := &KafkaProducer{
-		producer:              producer,
-		config:                config,
-		logger:                slog.Default().With(slog.String("component", "kafka_producer")),
-		tenantPools:           make(map[uuid.UUID]*tenantWorker),
-		ctx:                   lifecycleCtx,
-		cancel:                cancel,
-		closed:                make(chan struct{}),
-		inactiveWorkerTTL:     config.Producer.InactiveWorkerTTL,
-		cleanupWorkerInterval: config.Producer.CleanupWorkerInterval,
-		flushTimeout:          config.Producer.FlushTimeout,
-		messageTimeout:        config.Producer.MessageTimeout,
-		messageChanBuffer:     config.Producer.MessageQueueSize,
-		tracer:                otel.Tracer("github.com/alfzs/kafkax/producer"),
-		propagator:            otel.GetTextMapPropagator(),
-		metrics:               newProducerMetrics(meter),
+		logger:          logger,
+		messageTimeout:  config.Producer.MessageTimeout,
+		flushTimeout:    config.Producer.FlushTimeout,
+		gracefulTimeout: config.GracefulTimeout,
 	}
 
-	// Observable gauge: суммарная глубина очередей всех воркеров.
-	// Захватывает p по указателю — безопасно, т.к. p живёт дольше любого тика метрик.
-	// После Close() tenantPools пуст, callback просто ничего не наблюдает.
-	//
-	// tenant_id как label не используется намеренно: число тенантов неограниченно,
-	// а unbounded label взрывает кардинальность метрики в бэкенде. Поэтому глубина
-	// суммируется по всем тенантам в одно значение.
-	if _, err := meter.Int64ObservableGauge("kafkax.producer.queue.depth",
-		metric.WithDescription("Total messages pending across all tenant worker queues"),
-		metric.WithUnit("{message}"),
-		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
-			p.workerLock.RLock()
-			defer p.workerLock.RUnlock()
-
-			var total int64
-			for _, w := range p.tenantPools {
-				total += int64(len(w.messageChan))
-			}
-
-			o.Observe(total)
-
-			return nil
-		})); err != nil {
-		producer.Close()
-		return nil, fmt.Errorf("%s: registering queue depth gauge: %w", op, err)
+	if err := p.initMetrics(); err != nil {
+		return nil, err
 	}
 
-	p.wg.Go(p.manageWorkers)
+	client, err := kgo.NewClient(opts...)
+	if err != nil {
+		return nil, fmt.Errorf("creating kafka client: %w", err)
+	}
 
-	// Наблюдатель за отменой ctx, переданного вызывающим кодом: доводит
-	// отмену до полноценного Close (Flush + закрытие соединения с брокером).
-	// Не входит в p.wg — иначе wg.Wait() в Close() ждал бы эту же горутину,
-	// которая сама вызывает Close() (self-deadlock/ложный timeout).
-	// Слушает p.closed, а не p.ctx, чтобы не запускать повторный Close()
-	// каждый раз, когда explicit Close() сам отменяет p.ctx.
-	go func() {
-		select {
-		case <-ctx.Done():
-			p.Close()
-		case <-p.closed:
-		}
-	}()
+	p.client = client
 
 	return p, nil
 }
 
-// PublishRequest описывает сообщение для отправки через SendMessage.
-type PublishRequest struct {
-	TenantID uuid.UUID
-	Topic    string
-	Key      []byte
-	Value    []byte
-	Headers  Headers
+// initMetrics регистрирует доменные метрики продюсера.
+//
+// Транспортные счётчики (соединения, байты, ошибки чтения/записи) приезжают
+// из kotel и здесь не дублируются: он снимает их с хуков клиента, куда у
+// этого слоя доступа нет.
+//
+// Счётчика kafkax.producer.panics здесь нет: собственных горутин у продюсера
+// не заведено, восстанавливать паники негде и не из чего. Config.OnPanic
+// вызывается только консьюмером.
+func (p *KafkaProducer) initMetrics() error {
+	meter := otel.GetMeterProvider().Meter(instrumentationName)
+	reg := &instrumentRegistry{}
+
+	sent, err := meter.Int64Counter("kafkax.producer.messages.sent",
+		metric.WithDescription("Number of messages successfully delivered to Kafka"))
+	p.sent = record(reg, "kafkax.producer.messages.sent", sent, err)
+
+	failed, err := meter.Int64Counter("kafkax.producer.messages.failed",
+		metric.WithDescription("Number of messages that failed to be delivered"))
+	p.failed = record(reg, "kafkax.producer.messages.failed", failed, err)
+
+	// Единица — секунды, а не миллисекунды: при записи целыми миллисекундами
+	// всё, что быстрее миллисекунды, попадало бы в гистограмму нулём — то есть
+	// весь happy path при локальном брокере. Секунды к тому же требование OTel
+	// к единицам длительности, и стандартные бакеты подобраны под них.
+	duration, err := meter.Float64Histogram("kafkax.producer.message.duration",
+		metric.WithDescription("End-to-end duration of SendMessage"),
+		metric.WithUnit("s"))
+	p.duration = record(reg, "kafkax.producer.message.duration", duration, err)
+
+	return reg.err()
 }
 
-// SendMessage отправляет сообщение в указанный топик Kafka и блокируется до
-// получения delivery ack от брокера или истечения Config.Producer.MessageTimeout.
+// SendMessage отправляет сообщение и ждёт подтверждения от брокера.
 //
-// ctx может содержать активный OTel-span: продюсер создаст дочерний span
-// (SpanKind=Producer) и инжектирует trace context в Kafka headers, что позволяет
-// консьюмеру восстановить цепочку трассировки.
+// Метод синхронный и потокобезопасный: параллельные вызовы батчатся внутри
+// franz-go, поэтому «синхронный» здесь не означает «по одному запросу на
+// сообщение».
 //
-// Возможные ошибки:
-//   - "producer is shutting down" — Close уже вызван
-//   - "context canceled" / "context canceled while queuing" — ctx отменён
-//   - "timeout queuing message to worker" — воркер переполнен
-//   - "timeout waiting for delivery ack" — брокер не ответил за MessageTimeout
-//   - "tenant worker unavailable" — воркер завершился во время постановки в очередь
-func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) error {
-	if p.isStopping.Load() {
-		return errors.New("producer is shutting down")
+// Бюджет времени один — Producer.MessageTimeout, отсчитывается от входа в
+// метод и покрывает весь путь сообщения целиком, а не отдельные его этапы
+// (постановка в очередь, ожидание результата, доставка), так что худший
+// случай равен документированному значению, а не сумме нескольких таймеров.
+func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) (err error) {
+	if !p.acquire() {
+		return ErrProducerClosed
+	}
+	defer p.inflight.Done()
+
+	start := time.Now()
+
+	// Единственная точка учёта: и счётчики, и гистограмма заполняются здесь,
+	// для любого исхода — включая отбраковку на входе, до похода в брокер.
+	//
+	// Гистограмма только успешных отправок систематически занижает хвост,
+	// потому что таймауты — самые долгие вызовы — из неё выпадают. А счётчик
+	// отказов, не видящий отказы валидации, показывает идеальное здоровье
+	// приложению, которое шлёт один невалидный запрос за другим: сообщения не
+	// доезжают, а kafkax.producer.messages.failed остаётся нулём.
+	defer func() {
+		topic := attribute.String("topic", req.Topic)
+
+		status := statusSuccess
+		if err != nil {
+			status = statusError
+
+			p.failed.Add(ctx, 1, metric.WithAttributes(topic))
+		} else {
+			p.sent.Add(ctx, 1, metric.WithAttributes(topic))
+		}
+
+		p.duration.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(
+			topic, attribute.String("status", status)))
+	}()
+
+	if req.Topic == "" {
+		return fmt.Errorf("send message: %w", ErrEmptyTopic)
 	}
 
 	if err := validateHeaders(req.Headers); err != nil {
-		return err
+		return fmt.Errorf("send message: %w", err)
 	}
 
-	resultChan := make(chan error, 1)
+	// Дедлайн ставится и на контекст, и на запись (RecordDeliveryTimeout в
+	// producerOpts) намеренно. Контекст отпускает вызывающего, но отменяет
+	// батч только по контексту ПЕРВОЙ записи в нём, так что чужой батч может
+	// пережить наш дедлайн; RecordDeliveryTimeout бьёт по каждой записи и
+	// закрывает этот зазор.
+	ctx, cancel := context.WithTimeout(ctx, p.messageTimeout)
+	defer cancel()
 
-	msg := message{
-		Ctx:      ctx,
-		TenantID: req.TenantID,
-		Topic:    req.Topic,
-		Key:      req.Key,
-		Value:    req.Value,
-		Headers:  req.Headers,
-		Result:   resultChan,
-		Timeout:  p.messageTimeout,
+	rec := &kgo.Record{
+		Topic:   req.Topic,
+		Key:     req.Key,
+		Value:   req.Value,
+		Headers: toRecordHeaders(req.Headers),
 	}
 
-	worker, err := p.getOrCreateWorker(req.TenantID)
-	if err != nil {
-		return err
+	// Спан publish целиком на kotel: он стартует его в OnProduceRecordBuffered
+	// из rec.Context (который ProduceSync заполнит нашим ctx), инжектит
+	// traceparent в заголовки записи и закрывает спан в
+	// OnProduceRecordUnbuffered, проставив partition, offset и статус ошибки.
+	if err := p.client.ProduceSync(ctx, rec).FirstErr(); err != nil {
+		return p.produceError(err)
 	}
-	// inFlight держит воркер "занятым" на всё время SendMessage, чтобы cleanup
-	// не отменил его между получением ссылки и записью в messageChan.
-	defer worker.inFlight.Add(-1)
 
-	worker.updateActivity()
+	return nil
+}
 
-	enqueueTimer := time.NewTimer(p.messageTimeout)
-	defer enqueueTimer.Stop()
+// acquire регистрирует отправку, если продюсер ещё принимает сообщения.
+func (p *KafkaProducer) acquire() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 
-	select {
-	case worker.messageChan <- msg:
-		resultTimer := time.NewTimer(p.messageTimeout)
-		defer resultTimer.Stop()
+	if p.closing {
+		return false
+	}
 
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("context canceled: %w", ctx.Err())
-		case err := <-resultChan:
-			return err
-		case <-resultTimer.C:
-			return errors.New("timeout waiting for delivery ack")
-		}
-	// Воркер уже отменён (cleanup или shutdown): возвращаем ошибку немедленно,
-	// не пишем в канал — drain проверяет inFlight перед выходом.
-	case <-worker.ctx.Done():
-		return errors.New("tenant worker unavailable")
-	case <-ctx.Done():
-		return fmt.Errorf("context canceled while queuing: %w", ctx.Err())
-	case <-enqueueTimer.C:
-		return errors.New("timeout queuing message to worker")
+	p.inflight.Add(1)
+
+	return true
+}
+
+// produceError переводит ошибку franz-go в sentinel пакета.
+//
+// Разделение существует ради одного решения вызывающего кода: можно ли
+// повторить отправку, не рискуя дубликатом. ErrDeliveryTimeout означает
+// «запись уже у клиента и могла доехать», ErrProducerClosed — «не доехала
+// точно».
+func (p *KafkaProducer) produceError(err error) error {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, kgo.ErrRecordTimeout):
+		return ErrDeliveryTimeout
+
+	case errors.Is(err, kgo.ErrClientClosed), errors.Is(err, kgo.ErrAborting):
+		// Close успел закрыть клиент между acquire и ProduceSync либо клиент
+		// сбрасывает буфер: с точки зрения вызывающего это тот же
+		// «продюсер закрыт», что и проваленная проверка в acquire.
+		return ErrProducerClosed
+
+	case errors.Is(err, context.Canceled):
+		// Префикс называет операцию, а не причину: ctx.Done() срабатывает и
+		// на отмене, и на дедлайне, и «context canceled: context deadline
+		// exceeded» противоречило бы само себе.
+		return fmt.Errorf("send message: %w", err)
+
+	default:
+		// Двойной %w: errors.Is находит sentinel, errors.As достаёт
+		// *kerr.Error с кодом брокера, по которому и видно, имеет ли смысл
+		// повтор (kerr.MessageTooLarge — нет, kerr.NotEnoughReplicas — да).
+		return fmt.Errorf("send message: %w: %w", ErrDeliveryFailed, err)
 	}
 }
 
-// getOrCreateWorker возвращает существующий воркер тенанта или создаёт новый.
-// Использует double-checked locking: сначала RLock (fast path), затем Lock (slow path).
-// Атомарно инкрементирует inFlight, чтобы cleanup не уничтожил воркер между
-// получением ссылки и записью в messageChan.
-func (p *KafkaProducer) getOrCreateWorker(tenantID uuid.UUID) (*tenantWorker, error) {
-	// fast path
-	p.workerLock.RLock()
-
-	worker, ok := p.tenantPools[tenantID]
-	if ok {
-		worker.inFlight.Add(1)
-	}
-
-	p.workerLock.RUnlock()
-
-	if ok {
-		return worker, nil
-	}
-
-	// slow path — double-checked locking
-	p.workerLock.Lock()
-	defer p.workerLock.Unlock()
-
-	// Close() берёт workerLock перед cancel(), поэтому если isStopping уже true,
-	// wg.Add ниже гарантированно не выполнится после wg.Wait() в Close().
-	if p.isStopping.Load() {
-		return nil, errors.New("producer is shutting down")
-	}
-
-	if worker, ok = p.tenantPools[tenantID]; ok {
-		worker.inFlight.Add(1)
-		return worker, nil
-	}
-
-	// logger декорируется tenant_id один раз здесь, а не на каждый вызов
-	// SendMessage: getOrCreateWorker в fast path (воркер уже существует,
-	// самый частый случай) логгер не использует вовсе.
-	logger := p.logger.With(slog.String("tenant_id", tenantID.String()))
-
-	workerCtx, cancel := context.WithCancel(p.ctx)
-	worker = &tenantWorker{
-		messageChan:  make(chan message, p.messageChanBuffer),
-		drainCh:      make(chan struct{}),
-		ctx:          workerCtx,
-		cancel:       cancel,
-		lastActivity: time.Now(),
-		logger:       logger,
-	}
-	worker.inFlight.Store(1)
-
-	p.tenantPools[tenantID] = worker
-
-	p.wg.Go(func() { p.runWorker(tenantID, worker) })
-
-	p.metrics.workersActive.Add(context.Background(), 1)
-	logger.Info("Created new worker for tenant")
-
-	return worker, nil
-}
-
-// runWorker обрабатывает исходящие сообщения для конкретного тенанта.
+// Close останавливает приём новых сообщений, досылает буферизованные и
+// закрывает клиент. Идемпотентен.
 //
-// Воркер намеренно НЕ удаляет себя из tenantPools при завершении.
-// Удалением занимается только cleanupInactiveWorkers (TTL) и Close (shutdown).
-// Это предотвращает race condition при быстром пересоздании воркера для того
-// же tenantID.
-func (p *KafkaProducer) runWorker(tenantID uuid.UUID, worker *tenantWorker) {
-	defer func() {
-		if r := recover(); r != nil {
-			p.logger.Error("Worker panic",
-				slog.Any("panic", r),
-				slog.String("stack", string(debug.Stack())),
-				slog.String("tenant_id", tenantID.String()))
-		}
-
-		worker.cancel()
-		p.metrics.workersActive.Add(context.Background(), -1)
-		worker.logger.Debug("Worker terminated", slog.String("tenant_id", tenantID.String()))
-	}()
-
-	for {
-		select {
-		case msg := <-worker.messageChan:
-			worker.updateActivity()
-			p.handleMessage(msg, worker.logger)
-
-		case <-worker.ctx.Done():
-			// Drain: сообщения, записанные в messageChan до отмены контекста,
-			// должны быть обработаны — вызывающий ждёт resultChan.
-			//
-			// inFlight check: SendMessage мог пройти fast-path getOrCreateWorker
-			// (inFlight++) до отмены контекста, но ещё не записал в messageChan.
-			// Сигнальная горутина ждёт обнуления inFlight и закрывает drainCh,
-			// чтобы основной цикл не тратил CPU на spin-wait (runtime.Gosched).
-			//
-			// Таймаут drain (GracefulTimeout) предотвращает вечную блокировку,
-			// если inFlight не обнуляется — единообразно с consumer.
-			drainCtx, drainCancel := context.WithTimeout(
-				context.WithoutCancel(worker.ctx), p.config.GracefulTimeout)
-			defer drainCancel()
-
-			go func() {
-				for worker.inFlight.Load() > 0 {
-					select {
-					case <-drainCtx.Done():
-						return
-					default:
-						runtime.Gosched()
-					}
-				}
-
-				close(worker.drainCh)
-			}()
-
-			for {
-				select {
-				case msg := <-worker.messageChan:
-					p.handleMessage(msg, worker.logger)
-				case <-worker.drainCh:
-					return
-				case <-drainCtx.Done():
-					return
-				}
-			}
-		}
-	}
-}
-
-// handleMessage вызывает produce и доставляет результат в msg.Result.
-// Если вызывающая сторона не читает resultChan (контекст отменён или таймаут),
-// результат отбрасывается с предупреждением — produce уже завершился.
-//
-// logger декорирован только tenant_id (общий для воркера, см. getOrCreateWorker).
-// trace_id добавляется здесь, а не заранее в SendMessage: он специфичен для
-// конкретного сообщения, а не для воркера, и нужен только в этих (редких)
-// ветках предупреждений — не на каждый вызов SendMessage.
-func (p *KafkaProducer) handleMessage(msg message, logger *slog.Logger) {
-	err := p.produce(msg)
-
-	timer := time.NewTimer(msg.Timeout)
-	defer timer.Stop()
-
-	select {
-	case msg.Result <- err:
-	case <-msg.Ctx.Done():
-		traceLogger(msg.Ctx, logger).Warn("Message result not delivered - context canceled",
-			slog.String("topic", msg.Topic))
-	case <-timer.C:
-		traceLogger(msg.Ctx, logger).Warn("Message result not delivered - timeout",
-			slog.String("topic", msg.Topic))
-	}
-}
-
-// traceLogger добавляет trace_id к логгеру, если ctx содержит валидный OTel-span.
-func traceLogger(ctx context.Context, logger *slog.Logger) *slog.Logger {
-	if sc := trace.SpanFromContext(ctx).SpanContext(); sc.IsValid() {
-		return logger.With(slog.String("trace_id", sc.TraceID().String()))
-	}
-
-	return logger
-}
-
-// produce отправляет сообщение в Kafka и ожидает подтверждения доставки.
-//
-// Trace context из msg.Ctx инжектируется в Kafka headers — consumer может
-// извлечь его и создать дочерний span для сквозной трассировки.
-//
-// deliveryChan намеренно не закрывается: confluent-kafka-go пишет в него
-// асинхронно из внутреннего event loop'а. Закрытие канала вызвало бы панику
-// в библиотеке при попытке записи в закрытый канал. Буфер на 1 элемент
-// исключает утечку горутин — библиотека запишет событие независимо от того,
-// читаем ли мы его.
-//
-// p.ctx.Done() в select позволяет Close() быстро прервать ожидание delivery
-// и завершить воркеры до вызова producer.Close(). Сообщение при этом могло
-// уже попасть в очередь librdkafka и будет доставлено через Flush() —
-// возврат ошибки не гарантирует недоставку.
-func (p *KafkaProducer) produce(msg message) (err error) {
-	headers := toKafkaHeaders(msg.Headers)
-
-	// Создаём producer-span и инжектируем trace context в headers.
-	ctx, span := p.tracer.Start(msg.Ctx, msg.Topic+" publish",
-		trace.WithSpanKind(trace.SpanKindProducer),
-		trace.WithAttributes(
-			attribute.String("messaging.system", "kafka"),
-			attribute.String("messaging.destination.name", msg.Topic),
-			attribute.String("messaging.operation.name", "publish"),
-		))
-	defer span.End()
-
-	topicAttr := metric.WithAttributes(attribute.String("topic", msg.Topic))
-
-	// Гистограмма latency пишется для любого исхода (не только success),
-	// иначе отправки с ошибкой/таймаутом выпадают из распределения и p99
-	// выглядит здоровым даже при росте доли отказов.
-	start := time.Now()
-
-	defer func() {
-		status := "success"
-		if err != nil {
-			status = "error"
-		}
-
-		p.metrics.messageLatency.Record(ctx, float64(time.Since(start).Milliseconds()),
-			metric.WithAttributes(attribute.String("topic", msg.Topic), attribute.String("status", status)))
-	}()
-
-	p.propagator.Inject(ctx, newKafkaHeaderCarrier(&headers))
-
-	deliveryChan := make(chan kafka.Event, 1)
-
-	if produceErr := p.producer.Produce(&kafka.Message{
-		TopicPartition: kafka.TopicPartition{
-			Topic:     &msg.Topic,
-			Partition: kafka.PartitionAny,
-		},
-		Key:     msg.Key,
-		Value:   msg.Value,
-		Headers: headers,
-	}, deliveryChan); produceErr != nil {
-		span.RecordError(produceErr)
-		span.SetStatus(codes.Error, produceErr.Error())
-		p.metrics.failed.Add(ctx, 1, topicAttr)
-
-		err = fmt.Errorf("produce error: %w", produceErr)
-
-		return err
-	}
-
-	timer := time.NewTimer(msg.Timeout)
-	defer timer.Stop()
-
-	select {
-	case e := <-deliveryChan:
-		m, ok := e.(*kafka.Message)
-		if !ok {
-			unexpectedErr := fmt.Errorf("unexpected event type %T", e)
-			span.RecordError(unexpectedErr)
-			span.SetStatus(codes.Error, unexpectedErr.Error())
-			p.metrics.failed.Add(ctx, 1, topicAttr)
-
-			err = unexpectedErr
-
-			return err
-		}
-
-		if m.TopicPartition.Error != nil {
-			span.RecordError(m.TopicPartition.Error)
-			span.SetStatus(codes.Error, m.TopicPartition.Error.Error())
-			p.metrics.failed.Add(ctx, 1, topicAttr)
-
-			err = fmt.Errorf("delivery error: %w", m.TopicPartition.Error)
-
-			return err
-		}
-
-		p.metrics.sent.Add(ctx, 1, topicAttr)
-		span.SetAttributes(
-			attribute.Int("messaging.kafka.partition", int(m.TopicPartition.Partition)),
-			attribute.Int64("messaging.kafka.offset", int64(m.TopicPartition.Offset)),
-		)
+// Config.GracefulTimeout — общий бюджет на обе фазы, а не на каждую:
+// Producer.FlushTimeout ограничивает сверху только вторую. Иначе закрытие
+// продюсера могло бы занять GracefulTimeout + FlushTimeout, а вызывающий,
+// который завёл общий бюджет на остановку приложения, ждёт одного числа.
+func (p *KafkaProducer) Close() error {
+	p.mu.Lock()
+	if p.closing {
+		p.mu.Unlock()
+		p.logger.Warn("Kafka producer already in stopping state")
 
 		return nil
-	case <-p.ctx.Done():
-		// Нормальное завершение при shutdown — не помечаем span как ошибку.
-		err = errors.New("producer is shutting down")
-		return err
-	case <-msg.Ctx.Done():
-		span.RecordError(msg.Ctx.Err())
-		span.SetStatus(codes.Error, msg.Ctx.Err().Error())
-		err = msg.Ctx.Err()
-
-		return err
-	case <-timer.C:
-		timeoutErr := fmt.Errorf("produce timeout after %v", msg.Timeout)
-		span.RecordError(timeoutErr)
-		span.SetStatus(codes.Error, timeoutErr.Error())
-		err = timeoutErr
-
-		return err
 	}
-}
 
-// manageWorkers — фоновая горутина, периодически вызывающая cleanupInactiveWorkers.
-func (p *KafkaProducer) manageWorkers() {
-	ticker := time.NewTicker(p.cleanupWorkerInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			p.cleanupInactiveWorkers()
-		case <-p.ctx.Done():
-			return
-		}
-	}
-}
-
-// cleanupInactiveWorkers — единственное место, где воркеры удаляются из tenantPools.
-// Воркеры не удаляют себя сами (см. комментарий в runWorker).
-//
-// Воркер с inFlight > 0 не трогаем: значит прямо сейчас есть SendMessage,
-// который получил ссылку на воркер и ещё не записал сообщение в messageChan.
-//
-// security: восстановление после паники — defense-in-depth. Без него необработанная
-// паника здесь (единственный вызов — из тикера manageWorkers) уронила бы весь
-// процесс, а не только это одно фоновое обслуживание, что превращает баг в этой
-// функции в DoS против всего сервиса. Тот же паттерн уже используется в
-// runWorker/runPartitionWorker для паник в пользовательском коде обработчика.
-func (p *KafkaProducer) cleanupInactiveWorkers() {
-	defer func() {
-		if r := recover(); r != nil {
-			p.logger.Error("Panic in cleanupInactiveWorkers",
-				slog.Any("panic", r),
-				slog.String("stack", string(debug.Stack())))
-		}
-	}()
-
-	p.workerLock.Lock()
-	defer p.workerLock.Unlock()
-
-	now := time.Now()
-	inactiveSince := now.Add(-p.inactiveWorkerTTL)
-
-	for tenantID, worker := range p.tenantPools {
-		if worker.inFlight.Load() > 0 {
-			continue
-		}
-
-		lastActive := worker.getLastActivity()
-		if lastActive.Before(inactiveSince) {
-			worker.cancel()
-			delete(p.tenantPools, tenantID)
-			p.logger.Info("Removed inactive worker",
-				slog.String("tenant", tenantID.String()),
-				slog.Time("last_active", lastActive))
-		}
-	}
-}
-
-// Close выполняет graceful shutdown продюсера:
-//  1. Запрещает новые вызовы SendMessage и getOrCreateWorker.
-//  2. Ожидает завершения всех воркеров (drain очередей) до FlushTimeout.
-//  3. Вызывает Flush для доставки сообщений, оставшихся в очереди librdkafka.
-//
-// Безопасен для повторного вызова: последующие вызовы логируют предупреждение и возвращаются немедленно.
-func (p *KafkaProducer) Close() {
-	if !p.isStopping.CompareAndSwap(false, true) {
-		p.logger.Warn("Kafka producer already in stopping state")
-		return
-	}
-	// Сигнализирует наблюдателю за ctx (см. NewKafkaProducer), что Close уже
-	// в процессе — второй вызов Close ему не нужен.
-	close(p.closed)
+	p.closing = true
+	p.mu.Unlock()
 
 	p.logger.Info("Starting kafka producer shutdown")
 
-	// cancel() под workerLock: getOrCreateWorker проверяет isStopping под тем же
-	// локом перед wg.Add, поэтому к моменту wg.Wait() новые wg.Add невозможны.
-	// p.ctx.Done() также прерывает ожидание delivery в produce(), позволяя
-	// воркерам завершиться до истечения flushTimeout.
-	p.workerLock.Lock()
-	p.cancel()
-	p.workerLock.Unlock()
+	deadline := time.Now().Add(p.gracefulTimeout)
 
+	p.awaitInflight(deadline)
+
+	err := p.flush(deadline)
+
+	// Close без бюджета: к этому моменту либо буфер пуст, либо ждать его
+	// больше нечем — оставшиеся записи всё равно провалятся по промису.
+	p.client.Close()
+	p.logger.Info("Kafka producer shutdown completed")
+
+	return err
+}
+
+// awaitInflight ждёт возврата из уже начатых SendMessage.
+//
+// Каждый такой вызов ограничен собственным MessageTimeout, так что ожидание
+// конечно и без бюджета; бюджет здесь — защита от вызывающего, который
+// передал в SendMessage контекст, живущий дольше, чем весь shutdown.
+func (p *KafkaProducer) awaitInflight(deadline time.Time) {
 	done := make(chan struct{})
 
 	go func() {
-		p.wg.Wait()
+		p.inflight.Wait()
 		close(done)
 	}()
 
 	select {
 	case <-done:
-		p.logger.Info("All workers finished")
-	case <-time.After(p.flushTimeout):
-		p.logger.Warn("Shutdown timed out, forcing flush",
-			slog.String("timeout", p.flushTimeout.String()))
+	case <-time.After(time.Until(deadline)):
+		p.logger.Warn("Timed out waiting for in-flight sends, proceeding to flush")
+	}
+}
+
+// flush досылает буферизованные записи в пределах остатка бюджета.
+func (p *KafkaProducer) flush(deadline time.Time) error {
+	budget := min(time.Until(deadline), p.flushTimeout)
+	if budget <= 0 {
+		p.logger.Warn("No time left for flush, dropping buffered records",
+			slog.Int64("buffered", p.client.BufferedProduceRecords()))
+
+		return errors.New("closing producer: flush budget exhausted")
 	}
 
-	remaining := p.producer.Flush(int(p.flushTimeout.Milliseconds()))
-	if remaining > 0 {
-		p.logger.Warn("Messages remaining in queue after flush",
-			slog.Int("count", remaining))
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	// kgo.Flush возвращает только ошибку, поэтому число недосланных сообщений
+	// спрашивается отдельно — оно и есть то, что потеряется при закрытии
+	// клиента.
+	if err := p.client.Flush(ctx); err != nil {
+		remaining := p.client.BufferedProduceRecords()
+		p.logger.Warn("Flush timed out, messages remaining in buffer",
+			slog.Int64("remaining", remaining))
+
+		return fmt.Errorf("closing producer: flushing %d buffered records: %w", remaining, err)
 	}
 
-	p.producer.Close()
-	p.logger.Info("Kafka producer shutdown completed")
+	p.logger.Info("All buffered messages flushed")
+
+	return nil
 }

@@ -8,21 +8,23 @@ import (
 	"maps"
 	"runtime/debug"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
 // IncomingMessage — сообщение Kafka, переданное в ConsumerHandler.
+//
+// Key, Value и Headers ссылаются на буферы записи franz-go и живут ровно
+// столько, сколько длится вызов обработчика. Код, сохраняющий их дольше,
+// обязан копировать.
 type IncomingMessage struct {
 	Topic     string
 	Partition int32
@@ -30,745 +32,1004 @@ type IncomingMessage struct {
 	Key       []byte
 	Value     []byte
 	Headers   Headers
+	// Timestamp — временная метка записи (CreateTime или LogAppendTime, в
+	// зависимости от настройки топика).
+	Timestamp time.Time
 }
 
-// ConsumerHandler is the interface that wraps ProcessMessage.
+// ConsumerHandler обрабатывает одно сообщение.
+//
+// Возвращённая ошибка означает «обработка не удалась»: сообщение пойдёт по
+// пути повторов (Consumer.HandlerMaxRetries), а исчерпав их — попадёт в
+// Config.OnMessageSkipped либо, если хук не задан, остановит свою партицию на
+// непрокоммиченном оффсете. Подробно — в документации пакета, раздел «Политика
+// повторов».
+//
+// Паника внутри ProcessMessage перехватывается и превращается в ошибку,
+// оборачивающую ErrHandlerPanic, то есть идёт тем же путём, что и обычный
+// отказ, а не роняет воркер.
+//
+// Обработчик обязан быть идемпотентным: гарантия пакета — at-least-once, и
+// повторная обработка одного и того же сообщения после ребаланса или
+// перезапуска штатна, а не исключительна.
+//
+// Возврат nil означает «сообщение обработано, оффсет можно двигать». Возвращать
+// nil при неудаче, чтобы «не застревать», — это молчаливая потеря данных; для
+// осознанного пропуска существует OnMessageSkipped.
 type ConsumerHandler interface {
 	ProcessMessage(ctx context.Context, msg IncomingMessage) error
 }
 
-// ConsumerHandlerFunc is an adapter to allow the use of ordinary functions as ConsumerHandler.
-type ConsumerHandlerFunc func(context.Context, IncomingMessage) error
+// ConsumerHandlerFunc адаптирует функцию к ConsumerHandler.
+type ConsumerHandlerFunc func(ctx context.Context, msg IncomingMessage) error
 
-// ProcessMessage calls f(ctx, msg).
+// ProcessMessage реализует ConsumerHandler.
 func (f ConsumerHandlerFunc) ProcessMessage(ctx context.Context, msg IncomingMessage) error {
 	return f(ctx, msg)
 }
 
-type partitionWorker struct {
-	// inFlight — число processMessage, держащих ссылку на этот воркер.
-	// atomic.Int64 вместо atomic.AddInt64/LoadInt64 на обычном int64:
-	// содержит компилятороспознаваемый align64-маркер, гарантирующий
-	// 8-байтовое выравнивание независимо от позиции поля в структуре
-	// (актуально на 32-битных платформах).
-	inFlight    atomic.Int64
-	messageChan chan *kafka.Message
-	//nolint:containedctx // lifecycle-контекст воркера (аналог BaseContext), не запросный — см. sprints/context-audit.md
-	ctx          context.Context
-	cancel       context.CancelFunc
-	lastActivity time.Time
-	mu           sync.Mutex
-	// logger декорирован topic/partition один раз при создании воркера, а не
-	// на каждое сообщение — см. sprints/performance-audit.md.
-	logger *slog.Logger
+// MessageConsumer — контракт консьюмера.
+//
+// Отдельного шага подписки нет: набор топиков задаётся при создании клиента
+// (kgo.ConsumeTopics), топики берутся из зарегистрированных обработчиков, а сам
+// клиент создаётся внутри Start. Stop возвращает ошибку — иначе неудача
+// финального коммита оффсетов оставалась бы видна только в логах.
+type MessageConsumer interface {
+	AddHandler(topic string, handler ConsumerHandler, mws ...ConsumerMiddleware) error
+	Start(ctx context.Context) error
+	Stop() error
 }
 
-func (w *partitionWorker) updateActivity() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+var _ MessageConsumer = (*KafkaConsumer)(nil)
 
-	w.lastActivity = time.Now()
-}
+// Значения атрибута status у метрик kafkax.consumer.messages.processed и
+// kafkax.consumer.message.duration.
+const (
+	// consumerStatusSuccess — обработчик вернул nil, запись отмечена к коммиту.
+	consumerStatusSuccess = "success"
+	// consumerStatusError — обработчик исчерпал повторы и не справился.
+	// Запись НЕ отмечена: at-least-once держится именно на этом.
+	consumerStatusError = "error"
+	// consumerStatusSkipped — до вердикта обработчика дело не дошло: на топик
+	// нет обработчика либо отмена контекста прервала паузу между повторами.
+	consumerStatusSkipped = "skipped"
+)
 
-func (w *partitionWorker) getLastActivity() time.Time {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	return w.lastActivity
-}
-
+// workerKey — адрес партиционного воркера. Структура сравнима, поэтому годится
+// ключом карты без конкатенации строк на горячем пути.
 type workerKey struct {
 	topic     string
 	partition int32
 }
 
+// partitionWorker — очередь и горутина одной топик-партиции. Одна горутина на
+// партицию даёт параллелизм между партициями и строгий порядок внутри.
+type partitionWorker struct {
+	// records — батчи из одного опроса. Буфер ёмкостью
+	// Consumer.MessageQueueSize определяет, насколько цикл опроса может
+	// обгонять обработку; при переполнении опрос блокируется, и это и есть
+	// backpressure.
+	records chan []*kgo.Record
+	// done закрывается горутиной воркера при выходе.
+	done chan struct{}
+	// cancel обрывает обработку жёстко — когда мягкая остановка не уложилась
+	// в бюджет и партицию пора отпустить, чем бы воркер ни был занят.
+	cancel context.CancelFunc
+	// stopOnce защищает records от повторного закрытия: остановить воркер
+	// могут и колбэк ребаланса, и Stop.
+	stopOnce sync.Once
+
+	// poisoned означает, что запись в этой партиции не удалось ни обработать,
+	// ни отдать в OnMessageSkipped, и её оффсет не отмечен.
+	//
+	// Флаг обязателен, а не декоративен: MarkCommitRecords отмечает оффсет, а
+	// не сообщение, поэтому отметка любой ПОСЛЕДУЮЩЕЙ записи сдвинула бы
+	// коммит за проваленную и потеряла бы её. Отказ отмечать одну запись
+	// сохраняет at-least-once только вместе с отказом отмечать всё, что за
+	// ней.
+	//
+	// Читается и пишется исключительно горутиной воркера, поэтому без
+	// синхронизации.
+	poisoned bool
+}
+
+// stop закрывает очередь; воркер дообработает буфер и выйдет сам.
+func (w *partitionWorker) stop() {
+	w.stopOnce.Do(func() { close(w.records) })
+}
+
+// consumerMetrics — собственные метрики домена консьюмера. Транспортный
+// уровень (задержки запросов, размеры батчей, состояние соединений) измеряет
+// kotel, дублировать его здесь нечем.
 type consumerMetrics struct {
-	processed      metric.Int64Counter
-	failed         metric.Int64Counter
-	retried        metric.Int64Counter
-	processingTime metric.Float64Histogram
-	commitErrors   metric.Int64Counter
-	workersActive  metric.Int64UpDownCounter
+	processed     metric.Int64Counter
+	duration      metric.Float64Histogram
+	retries       metric.Int64Counter
+	fetchErrors   metric.Int64Counter
+	workersActive metric.Int64UpDownCounter
+	panics        metric.Int64Counter
 }
 
-// MessageConsumer — интерфейс консьюмера с partition-изоляцией.
-type MessageConsumer interface {
-	AddHandler(topic string, handler ConsumerHandler, mws ...ConsumerMiddleware) error
-	SubscribeAll() error
-	Start(ctx context.Context) error
-	Stop()
-}
-
-// KafkaConsumer — реализация MessageConsumer.
-// Для каждой активной партиции поддерживается отдельный воркер, что обеспечивает
-// параллельную обработку сообщений из разных партиций при сохранении порядка внутри одной.
-// Безопасен для конкурентного использования из нескольких горутин.
-type KafkaConsumer struct {
-	consumer   *kafka.Consumer
-	config     Config
-	logger     *slog.Logger
-	handlers   map[string]ConsumerHandler
-	handlersMu sync.RWMutex
-	workers    map[workerKey]*partitionWorker
-	workersMu  sync.RWMutex
-	wg         sync.WaitGroup
-	//nolint:containedctx // lifecycle-контекст компонента (аналог BaseContext), не запросный — см. sprints/context-audit.md
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	isStopping            atomic.Bool
-	isStarted             atomic.Bool
-	inactiveWorkerTTL     time.Duration
-	cleanupWorkerInterval time.Duration
-	messageReadTimeout    time.Duration
-	readErrorBackoff      time.Duration
-	retryDelay            time.Duration
-	messageChanBuffer     int
-	stopCleanup           chan struct{}
-	tracer                trace.Tracer
-	propagator            propagation.TextMapPropagator
-	metrics               consumerMetrics
-}
-
-// buildConsumerKafkaConfig транслирует Config в kafka.ConfigMap для librdkafka.
-func buildConsumerKafkaConfig(config Config) kafka.ConfigMap {
-	kafkaConfig := kafka.ConfigMap{
-		"bootstrap.servers":                     strings.Join(config.Brokers, ","),
-		"client.id":                             config.ClientID,
-		"group.id":                              config.Consumer.Group,
-		"auto.offset.reset":                     config.Consumer.InitialOffset,
-		"fetch.min.bytes":                       config.Consumer.MinBytes,
-		"fetch.max.bytes":                       config.Consumer.MaxBytes,
-		"fetch.wait.max.ms":                     int(config.Consumer.MaxWait.Milliseconds()),
-		"enable.auto.commit":                    config.Consumer.EnableAutoCommit,
-		"socket.timeout.ms":                     int(config.Consumer.SocketTimeout.Milliseconds()),
-		"session.timeout.ms":                    int(config.Consumer.SessionTimeout.Milliseconds()),
-		"heartbeat.interval.ms":                 int(config.Consumer.HeartbeatInterval.Milliseconds()),
-		"max.poll.interval.ms":                  int(config.Consumer.MaxPollInterval.Milliseconds()),
-		"isolation.level":                       config.Consumer.IsolationLevel,
-		"security.protocol":                     config.SecurityProtocol,
-		"ssl.endpoint.identification.algorithm": config.TLS.endpointIdentAlgorithm(),
-		"ssl.ca.location":                       config.TLS.CaCertPath,
-		"ssl.certificate.location":              config.TLS.ClientCertPath,
-		"ssl.key.location":                      config.TLS.ClientKeyPath,
-	}
-	// SASL параметры передаются только при соответствующем протоколе;
-	// librdkafka запрещает пустое значение sasl.mechanisms.
-	proto := strings.ToUpper(config.SecurityProtocol)
-	if proto == SecurityProtocolSASLPlaintext || proto == SecurityProtocolSASLSSL {
-		kafkaConfig["sasl.mechanisms"] = config.SASL.Mechanism
-		kafkaConfig["sasl.username"] = config.SASL.Username
-		kafkaConfig["sasl.password"] = config.SASL.Password
-	}
-
-	return kafkaConfig
-}
-
-// newConsumerMetrics регистрирует OTel-инструменты консьюмера в переданном meter.
-func newConsumerMetrics(meter metric.Meter) consumerMetrics {
-	processed, _ := meter.Int64Counter("kafkax.consumer.messages.processed",
-		metric.WithDescription("Total messages successfully processed and committed"))
-	failed, _ := meter.Int64Counter("kafkax.consumer.messages.failed",
-		metric.WithDescription("Total messages skipped after exhausting handler retries"))
-	retried, _ := meter.Int64Counter("kafkax.consumer.messages.retried",
-		metric.WithDescription("Total handler retry attempts"))
-	procTime, _ := meter.Float64Histogram("kafkax.consumer.processing.duration",
-		metric.WithDescription("Time spent in ProcessMessage handler"),
-		metric.WithUnit("ms"))
-	commitErrors, _ := meter.Int64Counter("kafkax.consumer.commit.errors",
-		metric.WithDescription("Total failed CommitMessage calls"))
-	workersActive, _ := meter.Int64UpDownCounter("kafkax.consumer.workers.active",
-		metric.WithDescription("Number of active partition worker goroutines"))
-
-	return consumerMetrics{
-		processed:      processed,
-		failed:         failed,
-		retried:        retried,
-		processingTime: procTime,
-		commitErrors:   commitErrors,
-		workersActive:  workersActive,
-	}
-}
-
-// NewKafkaConsumer создаёт консьюмер Kafka.
+// newConsumerMetrics регистрирует инструменты, собирая все ошибки разом.
 //
-// Инициализирует соединение с брокером, OTel-инструменты и внутренний контекст.
-// Горутины запускаются только при вызове Start; NewKafkaConsumer безопасен сам по себе.
-// Возвращает ошибку при невалидной конфигурации или невозможности инициализировать клиент Kafka.
-func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
-	op := "new_kafka_consumer"
+// Ни у одной метрики нет атрибута partition: он умножает кардинальность на
+// число партиций, а диагностическая ценность нулевая — привязку к партиции
+// даёт спан обработки, где она есть и без метрик.
+func newConsumerMetrics(meter metric.Meter) (consumerMetrics, error) {
+	var reg instrumentRegistry
 
-	if err := config.Validate(); err != nil {
+	processedName := "kafkax.consumer.messages.processed"
+	processed, err := meter.Int64Counter(processedName,
+		metric.WithDescription("Messages that reached a terminal outcome, by topic and status"))
+	m := consumerMetrics{processed: record(&reg, processedName, processed, err)}
+
+	// Единица — секунды, а не миллисекунды: Milliseconds() усекает до целого,
+	// и все длительности быстрее миллисекунды попадали бы в нулевую корзину.
+	// Seconds() усечения не делает.
+	durationName := "kafkax.consumer.message.duration"
+	duration, err := meter.Float64Histogram(durationName,
+		metric.WithDescription("End-to-end handler time including all retries and retry delays"),
+		metric.WithUnit("s"))
+	m.duration = record(&reg, durationName, duration, err)
+
+	retriesName := "kafkax.consumer.handler.retries"
+	retries, err := meter.Int64Counter(retriesName,
+		metric.WithDescription("Handler invocations that failed and were retried"))
+	m.retries = record(&reg, retriesName, retries, err)
+
+	fetchErrorsName := "kafkax.consumer.fetch.errors"
+	fetchErrors, err := meter.Int64Counter(fetchErrorsName,
+		metric.WithDescription("Partition-level errors returned by a poll"))
+	m.fetchErrors = record(&reg, fetchErrorsName, fetchErrors, err)
+
+	workersName := "kafkax.consumer.workers.active"
+	workers, err := meter.Int64UpDownCounter(workersName,
+		metric.WithDescription("Partition workers currently running"))
+	m.workersActive = record(&reg, workersName, workers, err)
+
+	panicsName := "kafkax.consumer.panics"
+	panicsCounter, err := meter.Int64Counter(panicsName,
+		metric.WithDescription("Panics recovered inside kafkax consumer goroutines, by site"))
+	m.panics = record(&reg, panicsName, panicsCounter, err)
+
+	return m, reg.err()
+}
+
+// KafkaConsumer — консьюмер Kafka поверх franz-go.
+//
+// На каждую назначенную топик-партицию заводится горутина: обработка разных
+// партиций идёт параллельно, внутри одной партиции — строго по порядку
+// оффсетов. Методы безопасны для вызова из разных горутин.
+type KafkaConsumer struct {
+	config    Config
+	logger    *slog.Logger
+	telemetry telemetry
+	metrics   consumerMetrics
+	panics    panicReporter
+
+	handlersMu sync.RWMutex
+	handlers   map[string]ConsumerHandler
+
+	// workers живёт без мьютекса, и это следствие kgo.BlockRebalanceOnPoll:
+	// опрос и колбэки ребаланса становятся взаимно исключающими, так что
+	// единственные, кто трогает карту, — цикл опроса и колбэки — никогда не
+	// работают одновременно.
+	workers map[workerKey]*partitionWorker
+
+	// mu защищает только переходы жизненного цикла (client, pollCancel):
+	// Start и Stop могут быть вызваны из разных горутин.
+	mu         sync.Mutex
+	client     *kgo.Client
+	pollCancel context.CancelFunc
+
+	// lifeCtx — жизненный цикл консьюмера: от него наследуются воркеры и цикл
+	// опроса. Отмена означает жёсткую остановку без дренажа очередей.
+	//
+	// Контекст в поле — ровно тот случай, против которого containedctx не
+	// возражает по существу: это область жизни объекта, а не контекст запроса.
+	// Передавать его параметром некому — воркеры создаются колбэками ребаланса,
+	// которые вызывает franz-go, и своего контекста у них нет.
+	//
+	//nolint:containedctx // область жизни консьюмера, а не контекст запроса
+	lifeCtx    context.Context
+	lifeCancel context.CancelFunc
+
+	// loopDone закрывается циклом опроса при выходе; Stop ждёт именно его,
+	// прежде чем трогать карту воркеров.
+	loopDone chan struct{}
+
+	started  atomic.Bool
+	stopping atomic.Bool
+}
+
+// NewKafkaConsumer создаёт консьюмера.
+//
+// Соединения здесь не устанавливаются и горутины не запускаются: набор топиков
+// известен только после AddHandler, а franz-go требует его при создании
+// клиента, поэтому сам клиент создаётся в Start. Конструктор проверяет
+// конфигурацию, готовит логгер, метрики и репортер паник.
+func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
+	const op = "new_kafka_consumer"
+
+	if err := config.validateConsumer(); err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
-	kafkaConfig := buildConsumerKafkaConfig(config)
+	logger := config.logger("kafka_consumer").With(slog.String("group", config.Consumer.Group))
 
-	consumer, err := kafka.NewConsumer(&kafkaConfig)
+	metrics, err := newConsumerMetrics(otel.Meter(instrumentationName))
 	if err != nil {
-		return nil, fmt.Errorf("%s: kafka consumer failed init: %w", op, err)
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
-	// ctx/cancel инициализируются здесь, а не только в Start(),
-	// чтобы Stop() не паниковал при вызове без предшествующего Start().
-	ctx, cancel := context.WithCancel(context.Background())
+	lifeCtx, lifeCancel := context.WithCancel(context.Background())
 
-	meter := otel.Meter("github.com/alfzs/kafkax/consumer")
-
-	c := &KafkaConsumer{
-		consumer:              consumer,
-		config:                config,
-		logger:                slog.Default().With(slog.String("component", "kafka_consumer"), slog.String("group", config.Consumer.Group)),
-		handlers:              make(map[string]ConsumerHandler),
-		workers:               make(map[workerKey]*partitionWorker),
-		ctx:                   ctx,
-		cancel:                cancel,
-		inactiveWorkerTTL:     config.Consumer.InactiveWorkerTTL,
-		cleanupWorkerInterval: config.Consumer.CleanupWorkerInterval,
-		messageReadTimeout:    config.Consumer.ReadTimeout,
-		readErrorBackoff:      config.Consumer.ReadErrorBackoff,
-		retryDelay:            config.Consumer.HandlerRetryDelay,
-		messageChanBuffer:     config.Consumer.MessageQueueSize,
-		stopCleanup:           make(chan struct{}),
-		tracer:                otel.Tracer("github.com/alfzs/kafkax/consumer"),
-		propagator:            otel.GetTextMapPropagator(),
-		metrics:               newConsumerMetrics(meter),
-	}
-
-	// Observable gauge: глубина очередей по партициям.
-	if _, err := meter.Int64ObservableGauge("kafkax.consumer.queue.depth",
-		metric.WithDescription("Messages pending in partition worker queues"),
-		metric.WithUnit("{message}"),
-		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
-			c.workersMu.RLock()
-			defer c.workersMu.RUnlock()
-
-			for key, w := range c.workers {
-				o.Observe(int64(len(w.messageChan)),
-					metric.WithAttributes(
-						attribute.String("topic", key.topic),
-						attribute.Int("partition", int(key.partition))))
-			}
-
-			return nil
-		})); err != nil {
-		return nil, fmt.Errorf("%s: registering queue depth gauge: %w", op, errors.Join(err, consumer.Close()))
-	}
-
-	return c, nil
+	return &KafkaConsumer{
+		config:     config,
+		logger:     logger,
+		telemetry:  newTelemetry(config.ClientID, config.Consumer.Group),
+		metrics:    metrics,
+		panics:     panicReporter{logger: logger, panics: metrics.panics, onPanic: config.OnPanic},
+		handlers:   make(map[string]ConsumerHandler),
+		workers:    make(map[workerKey]*partitionWorker),
+		lifeCtx:    lifeCtx,
+		lifeCancel: lifeCancel,
+		loopDone:   make(chan struct{}),
+	}, nil
 }
 
-// AddHandler регистрирует обработчик для указанного топика с опциональной
-// цепочкой ConsumerMiddleware. Middleware применяются по порядку: первый —
-// внешний (выполняется первым). Должен вызываться до Start. Повторная
-// регистрация одного топика возвращает ошибку. Безопасен для конкурентного вызова.
+// AddHandler регистрирует обработчик топика и оборачивает его в mws.
+//
+// Вызывается до Start: после старта набор топиков уже передан в
+// kgo.ConsumeTopics, и добавление обработчика вернуло бы обработчик без
+// подписки. Повторная регистрация того же топика — ошибка, а не тихая замена.
 func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ...ConsumerMiddleware) error {
+	if topic == "" {
+		return fmt.Errorf("add handler: %w", ErrEmptyTopic)
+	}
+
+	// Сравнение с nil ловит только нетипизированный nil; типизированный
+	// nil-указатель в интерфейсе пройдёт, но его паника станет
+	// ErrHandlerPanic — то есть штатной ошибкой обработки.
+	if handler == nil {
+		return fmt.Errorf("add handler for topic %q: %w", topic, ErrNilHandler)
+	}
+
+	if c.started.Load() {
+		return fmt.Errorf("add handler for topic %q: %w", topic, ErrConsumerStarted)
+	}
+
 	c.handlersMu.Lock()
 	defer c.handlersMu.Unlock()
 
-	if _, ok := c.handlers[topic]; ok {
+	if _, exists := c.handlers[topic]; exists {
 		return fmt.Errorf("handler for topic %q already registered", topic)
 	}
 
+	// Цепочка middleware собирается один раз при регистрации, а не на каждое
+	// сообщение: аллокации замыканий на горячем пути ничего не дают.
 	c.handlers[topic] = Chain(handler, mws...)
 
 	return nil
 }
 
-// SubscribeAll подписывает консьюмер на все топики, для которых зарегистрированы обработчики.
-// Должен вызываться после AddHandler и до Start.
-// Возвращает ошибку, если ни одного обработчика не зарегистрировано.
-func (c *KafkaConsumer) SubscribeAll() error {
-	c.handlersMu.RLock()
-	defer c.handlersMu.RUnlock()
-
-	topics := slices.Collect(maps.Keys(c.handlers))
-
-	if len(topics) == 0 {
-		return errors.New("no topics to subscribe")
-	}
-
-	return c.consumer.SubscribeTopics(topics, nil)
-}
-
-// Start запускает consumer loop и фоновый сборщик неактивных воркеров.
+// Start создаёт клиента Kafka и запускает цикл опроса. Не блокирует.
 //
-// ctx используется как родительский контекст для всех воркеров: его отмена
-// равносильна вызову Stop, но без graceful drain и вызова consumer.Close.
-// Для управляемого завершения предпочтительнее явный вызов Stop.
-//
-// Идемпотентен через atomic.Bool: повторный вызов возвращает ошибку немедленно.
-// Требует наличия хотя бы одного зарегистрированного обработчика.
+// Отмена ctx эквивалентна Stop, но без дренажа очередей и без финального
+// коммита: предпочтительнее явный Stop. Повторный вызов возвращает
+// ErrConsumerStarted; консьюмер, прошедший Stop, не перезапускается.
 func (c *KafkaConsumer) Start(ctx context.Context) error {
-	if !c.isStarted.CompareAndSwap(false, true) {
-		return errors.New("consumer already started")
+	const op = "start"
+
+	if !c.started.CompareAndSwap(false, true) {
+		return ErrConsumerStarted
 	}
 
-	// Отменяем background-контекст из NewKafkaConsumer и подменяем его на
-	// контекст с реальным родителем. Безопасно — горутин ещё нет.
-	c.cancel()
-	c.ctx, c.cancel = context.WithCancel(ctx)
-
-	c.handlersMu.RLock()
-
-	topics := slices.Collect(maps.Keys(c.handlers))
-
-	c.handlersMu.RUnlock()
-
+	// Флаг сбрасывается на каждом неуспешном пути: иначе после отказа Start
+	// исправить конфигурацию и повторить запуск было бы нельзя.
+	topics := c.topics()
 	if len(topics) == 0 {
-		return errors.New("no kafka handlers registered")
+		c.started.Store(false)
+
+		return ErrNoHandlers
 	}
 
-	c.wg.Go(c.runConsumerLoop)
-	c.wg.Go(c.runCleanupLoop)
+	if c.stopping.Load() {
+		c.started.Store(false)
+
+		return ErrConsumerClosed
+	}
+
+	opts, err := c.config.consumerOpts(c.logger, topics, rebalanceCallbacks{
+		assigned: c.onPartitionsAssigned,
+		revoked:  c.onPartitionsRevoked,
+		lost:     c.onPartitionsLost,
+	})
+	if err != nil {
+		c.started.Store(false)
+
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	// Хуки kotel питают трейсер: именно OnFetchRecordBuffered кладёт в
+	// rec.Context извлечённый из заголовков W3C trace context, на котором
+	// потом строится спан обработки.
+	opts = append(opts, kgo.WithHooks(c.telemetry.hooks...))
+
+	client, err := kgo.NewClient(opts...)
+	if err != nil {
+		c.started.Store(false)
+
+		return fmt.Errorf("%s: kafka client init: %w", op, err)
+	}
+
+	pollCtx, pollCancel := context.WithCancel(c.lifeCtx)
+
+	c.mu.Lock()
+	c.client = client
+	c.pollCancel = pollCancel
+	c.mu.Unlock()
+
+	go c.watchContext(ctx)
+	go c.runPollLoop(pollCtx, client)
 
 	c.logger.Info("Kafka consumer started", slog.Any("topics", topics))
 
 	return nil
 }
 
-// runConsumerLoop читает сообщения из Kafka и передаёт их в processMessage.
-// Таймаут ReadTimeout предотвращает вечную блокировку — при ErrTimedOut цикл продолжается,
-// что обеспечивает отзывчивость на ctx.Done при отсутствии новых сообщений.
-func (c *KafkaConsumer) runConsumerLoop() {
-	defer c.cancel()
+// watchContext переводит отмену пользовательского ctx в отмену жизненного
+// цикла. Сам завершается вместе с ним, чтобы не пережить консьюмера.
+func (c *KafkaConsumer) watchContext(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		c.lifeCancel()
+	case <-c.lifeCtx.Done():
+	}
+}
+
+// topics возвращает отсортированный набор топиков с обработчиками.
+// Сортировка нужна для воспроизводимости логов и сообщений об ошибках:
+// порядок обхода карты в Go случаен.
+func (c *KafkaConsumer) topics() []string {
+	c.handlersMu.RLock()
+	defer c.handlersMu.RUnlock()
+
+	return slices.Sorted(maps.Keys(c.handlers))
+}
+
+func (c *KafkaConsumer) handler(topic string) (ConsumerHandler, bool) {
+	c.handlersMu.RLock()
+	defer c.handlersMu.RUnlock()
+
+	h, ok := c.handlers[topic]
+
+	return h, ok
+}
+
+// runPollLoop — единственный читатель клиента и единственный писатель в очереди
+// воркеров.
+func (c *KafkaConsumer) runPollLoop(ctx context.Context, client *kgo.Client) {
+	defer close(c.loopDone)
 
 	for {
-		select {
-		case <-c.ctx.Done():
-			c.logger.Debug("Consumer loop stopped")
+		fetches := client.PollRecords(ctx, c.config.Consumer.MaxPollRecords)
+
+		// Оба условия проверяются до разбора ошибок: закрытие клиента и отмена
+		// контекста приезжают синтетическим фетчем с ошибкой в нулевой
+		// партиции, и принимать их за отказ брокера не за чем.
+		if fetches.IsClientClosed() {
 			return
-		default:
-			msg, err := c.consumer.ReadMessage(c.messageReadTimeout)
-			if err != nil {
-				if _, ok := errors.AsType[kafka.Error](err); ok {
-					continue
-				}
-
-				c.logger.Error("Failed to read message", slog.Any("error", err))
-
-				backoffTimer := time.NewTimer(c.readErrorBackoff)
-				select {
-				case <-backoffTimer.C:
-				case <-c.ctx.Done():
-					backoffTimer.Stop()
-				}
-
-				continue
-			}
-
-			if msg == nil {
-				c.logger.Error("Received nil message")
-				continue
-			}
-
-			c.processMessage(msg)
 		}
+
+		if err := fetches.Err0(); errors.Is(err, context.Canceled) {
+			return
+		}
+
+		// Обход ошибок вынесен наружу цикла по записям намеренно: партиция с
+		// фатальной ошибкой и без записей приезжает отдельным пустым фетчем и
+		// изнутри обхода Records не видна вовсе.
+		fetches.EachError(c.reportFetchError)
+
+		fetches.EachPartition(func(ftp kgo.FetchTopicPartition) {
+			c.dispatch(ctx, client, ftp)
+		})
+
+		// Обязательно на каждой итерации: без этого следующий ребаланс —
+		// включая тот, что инициирует закрытие клиента, — повиснет навсегда.
+		client.AllowRebalance()
 	}
 }
 
-// processMessage находит или создаёт воркер для партиции и передаёт сообщение.
-// Лок берётся только на время поиска/создания воркера, а не на время записи в канал.
-// Это предотвращает блокировку consumer loop'а под локом на время записи.
-//
-// Запись в messageChan блокирующая (без enqueue-таймаута): дроп сообщения
-// "из середины" привёл бы к тому, что offset дропнутого окажется меньше
-// закоммиченного следующего — сообщение потеряно навсегда. Обратное давление
-// притормаживает consumer loop (ограничено max.poll.interval.ms).
-//
-// security: восстановление после паники — defense-in-depth. processMessage —
-// единственная точка в runConsumerLoop (у которого нет собственного recover),
-// зависящая от содержимого сообщения из Kafka; необработанная паника здесь
-// уронила бы весь процесс, а не только чтение из одного топика/партиции,
-// что превращает баг обработки одного сообщения в DoS против всего сервиса.
-func (c *KafkaConsumer) processMessage(msg *kafka.Message) {
-	defer func() {
-		if r := recover(); r != nil {
-			c.logger.Error("Panic in processMessage",
-				slog.Any("panic", r),
-				slog.String("stack", string(debug.Stack())))
-		}
-	}()
-
-	if msg.TopicPartition.Topic == nil {
-		c.logger.Error("Received message with nil topic, skipping")
+// reportFetchError фиксирует ошибку уровня партиции.
+func (c *KafkaConsumer) reportFetchError(topic string, partition int32, err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, kgo.ErrClientClosed) {
 		return
 	}
 
-	partition := msg.TopicPartition.Partition
-	topic := *msg.TopicPartition.Topic
+	ctx := context.WithoutCancel(c.lifeCtx)
 
-	worker, err := c.getOrCreateWorker(topic, partition)
-	if err != nil {
-		// Consumer в процессе остановки: сообщение не коммитим,
-		// оно будет переобработано после перезапуска.
-		c.logger.Warn("Dropping message: consumer is shutting down",
-			slog.Int("partition", int(partition)),
-			slog.String("topic", topic),
-			slog.Any("error", err))
+	c.metrics.fetchErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("topic", topic)))
+	c.logger.Error("Partition fetch error",
+		slog.String("topic", topic),
+		slog.Int("partition", int(partition)),
+		slog.Any("error", err))
+}
 
+// dispatch отдаёт батч воркеру партиции.
+//
+// Отправка блокирующая и без таймаута намеренно: батч, выброшенный из-за
+// переполнения очереди, был бы перепрыгнут коммитом следующего, и сообщения
+// потерялись бы молча. Блокировка тормозит опрос, а не теряет данные.
+func (c *KafkaConsumer) dispatch(ctx context.Context, client *kgo.Client, ftp kgo.FetchTopicPartition) {
+	if len(ftp.Records) == 0 {
 		return
 	}
-	defer worker.inFlight.Add(-1)
+
+	worker := c.worker(client, workerKey{topic: ftp.Topic, partition: ftp.Partition})
 
 	select {
-	case worker.messageChan <- msg:
-		worker.updateActivity()
-	case <-worker.ctx.Done():
-		worker.logger.Warn("Worker context done while enqueueing, message not committed")
-	case <-c.ctx.Done():
+	case worker.records <- ftp.Records:
+	// Воркер мог умереть (паника) или уйти по отмене: без этой ветки опрос
+	// встал бы навсегда на партиции, которую некому читать.
+	case <-worker.done:
+	case <-ctx.Done():
 	}
 }
 
-// getOrCreateWorker возвращает существующий воркер партиции или создаёт новый.
-// Использует double-checked locking: сначала RLock (fast path), затем Lock (slow path).
-// Атомарно инкрементирует inFlight, чтобы cleanup не уничтожил воркер между
-// получением ссылки и записью в messageChan.
-func (c *KafkaConsumer) getOrCreateWorker(topic string, partition int32) (*partitionWorker, error) {
-	key := workerKey{topic: topic, partition: partition}
-
-	// fast path
-	c.workersMu.RLock()
-
-	worker, ok := c.workers[key]
-	if ok {
-		worker.inFlight.Add(1)
+// worker возвращает воркера партиции, создавая его при необходимости.
+//
+// Обычно воркер уже создан колбэком назначения; ленивое создание закрывает
+// окно, в котором фетч приезжает раньше колбэка, и стоит одну проверку карты.
+// Мьютекса не требует: см. комментарий у поля workers.
+func (c *KafkaConsumer) worker(client *kgo.Client, key workerKey) *partitionWorker {
+	if w, ok := c.workers[key]; ok {
+		return w
 	}
 
-	c.workersMu.RUnlock()
-
-	if ok {
-		return worker, nil
+	ctx, cancel := context.WithCancel(c.lifeCtx)
+	w := &partitionWorker{
+		records: make(chan []*kgo.Record, c.config.Consumer.MessageQueueSize),
+		done:    make(chan struct{}),
+		cancel:  cancel,
 	}
+	c.workers[key] = w
 
-	// slow path — double-checked locking
-	c.workersMu.Lock()
-	defer c.workersMu.Unlock()
+	c.metrics.workersActive.Add(ctx, 1)
 
-	// Stop() берёт workersMu перед cancel(), поэтому если isStopping уже true,
-	// wg.Add ниже гарантированно не выполнится после wg.Wait() в Stop().
-	if c.isStopping.Load() {
-		return nil, errors.New("consumer is shutting down")
-	}
+	go c.runPartitionWorker(ctx, client, key, w)
 
-	if worker, ok = c.workers[key]; ok {
-		worker.inFlight.Add(1)
-		return worker, nil
-	}
-
-	// logger декорируется topic/partition один раз здесь, а не на каждое
-	// сообщение: processMessage в fast path (воркер уже существует, самый
-	// частый случай) логгер не использует вовсе.
-	logger := c.logger.With(slog.Int("partition", int(partition)), slog.String("topic", topic))
-
-	workerCtx, cancel := context.WithCancel(c.ctx)
-	worker = &partitionWorker{
-		messageChan:  make(chan *kafka.Message, c.messageChanBuffer),
-		ctx:          workerCtx,
-		cancel:       cancel,
-		lastActivity: time.Now(),
-		logger:       logger,
-	}
-	worker.inFlight.Store(1)
-	c.workers[key] = worker
-
-	c.wg.Go(func() { c.runPartitionWorker(key, worker) })
-
-	c.metrics.workersActive.Add(context.Background(), 1)
-	logger.Info("Created new partition worker")
-
-	return worker, nil
+	return w
 }
 
-// runPartitionWorker обрабатывает сообщения для конкретной партиции.
-//
-// При завершении (штатном или по панике) воркер удаляется из мапы немедленно,
-// гарантируя что после паники новые сообщения получат свежий воркер.
-//
-// При штатной остановке (worker.ctx.Done) канал дочитывается до конца (drain),
-// ограниченный drainCtx с тем же GracefulTimeout, что используется в Stop().
-// Это гарантирует, что CommitMessage не вызывается после consumer.Close().
-func (c *KafkaConsumer) runPartitionWorker(key workerKey, worker *partitionWorker) {
-	defer worker.cancel()
+// runPartitionWorker последовательно обрабатывает батчи одной партиции.
+func (c *KafkaConsumer) runPartitionWorker(
+	ctx context.Context, client *kgo.Client, key workerKey, w *partitionWorker,
+) {
+	logger := c.logger.With(slog.String("topic", key.topic), slog.Int("partition", int(key.partition)))
+
+	// Порядок регистрации обратен порядку исполнения: сначала перехват паники,
+	// потом освобождение ресурсов, и только затем сигнал о завершении.
+	defer close(w.done)
+	defer w.cancel()
+	defer c.metrics.workersActive.Add(context.WithoutCancel(ctx), -1)
 	defer func() {
 		if r := recover(); r != nil {
-			c.logger.Error("Partition worker panic",
-				slog.Any("panic", r),
-				slog.String("stack", string(debug.Stack())),
+			// Паника здесь — не в обработчике, а в самом воркере: без
+			// перехвата она уронила бы процесс, потому что чужая горутина
+			// вызывающим кодом не ловится.
+			c.panics.report(context.WithoutCancel(ctx), panicSitePartitionWorker, r, debug.Stack(),
 				slog.String("topic", key.topic),
 				slog.Int("partition", int(key.partition)))
 		}
-		// Удаляем воркер из мапы немедленно — cleanup удаляет только по TTL,
-		// поэтому мёртвый воркер иначе жил бы в мапе до следующего тика.
-		c.workersMu.Lock()
-		if current, ok := c.workers[key]; ok && current == worker {
-			delete(c.workers, key)
-		}
-		c.workersMu.Unlock()
-		c.metrics.workersActive.Add(context.Background(), -1)
 	}()
 
-	for {
-		select {
-		case msg, ok := <-worker.messageChan:
-			if !ok {
+	logger.Debug("Partition worker started")
+
+	for batch := range w.records {
+		for _, rec := range batch {
+			// Проверка внутри батча, а не только на приёме: жёсткая отмена
+			// должна обрывать разбор уже полученного буфера, иначе Stop по
+			// истечении бюджета ждал бы обработки всей очереди.
+			if ctx.Err() != nil {
 				return
 			}
 
-			worker.updateActivity()
-			c.handleMessage(worker.ctx, msg)
-		case <-worker.ctx.Done():
-			drainCtx, cancel := context.WithTimeout(context.WithoutCancel(worker.ctx), c.config.GracefulTimeout)
-			defer cancel()
-
-			for {
-				select {
-				case msg, ok := <-worker.messageChan:
-					if !ok {
-						return
-					}
-
-					c.handleMessage(drainCtx, msg)
-				// Прерываем drain если GracefulTimeout истёк: Stop() уже вызвал
-				// consumer.Close() — дальнейший CommitMessage недопустим.
-				case <-drainCtx.Done():
-					return
-				default:
-					return
-				}
+			// Отравленная партиция: записи вычитываются из очереди, но не
+			// обрабатываются. Выбрасывать их безопасно ровно потому, что
+			// оффсет не отмечен — после ребаланса или перезапуска они приедут
+			// снова. А продолжать читать канал обязательно: перестань воркер
+			// это делать, dispatch упёрся бы в полную очередь и заблокировал
+			// общий цикл опроса, остановив заодно и здоровые партиции.
+			if w.poisoned {
+				continue
 			}
+
+			c.processRecord(ctx, client, rec, key, w, logger)
 		}
 	}
 }
 
-// handleMessage вызывает зарегистрированный handler с retry-логикой и коммитит
-// offset при завершении (успех или исчерпание попыток). ctx передаётся явно:
-// при drain используется ограниченный по времени drainCtx.
-//
-// При HandlerMaxRetries > 0 и исчерпании попыток сообщение пропускается (offset
-// коммитится), чтобы яд-сообщение не блокировало партицию навсегда.
-func (c *KafkaConsumer) handleMessage(ctx context.Context, msg *kafka.Message) {
-	topic := *msg.TopicPartition.Topic
+// processRecord проводит одну запись через трейсинг, обработчик и отметку
+// к коммиту.
+func (c *KafkaConsumer) processRecord(
+	ctx context.Context, client *kgo.Client, rec *kgo.Record,
+	key workerKey, w *partitionWorker, logger *slog.Logger,
+) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Отдельный перехват вокруг обвязки: паника в трейсинге или в
+			// метриках не должна уносить воркера вместе с очередью.
+			c.panics.report(ctx, panicSiteProcessMessage, r, debug.Stack(), recordAttrs(rec)...)
+		}
+	}()
 
-	// Извлекаем trace context из Kafka headers и создаём consumer-span.
-	extractCtx := c.propagator.Extract(ctx, newKafkaHeaderCarrier(new(msg.Headers)))
-
-	ctx, span := c.tracer.Start(extractCtx, topic+" process",
-		trace.WithSpanKind(trace.SpanKindConsumer),
-		trace.WithAttributes(
-			attribute.String("messaging.system", "kafka"),
-			attribute.String("messaging.destination.name", topic),
-			attribute.String("messaging.operation.name", "process"),
-			attribute.String("messaging.kafka.consumer.group", c.config.Consumer.Group),
-			attribute.Int("messaging.kafka.partition", int(msg.TopicPartition.Partition)),
-			attribute.Int64("messaging.kafka.offset", int64(msg.TopicPartition.Offset)),
-		))
+	// Trace context из заголовков записи kotel уже извлёк на хуке фетча,
+	// поэтому ручного propagator-carrier здесь нет.
+	_, span := c.telemetry.tracer.WithProcessSpan(rec)
 	defer span.End()
 
-	// trace_id прикрепляется к логгеру, чтобы можно было перейти от лога к трейсу
-	// (тот же подход, что и в producer.SendMessage).
-	log := c.logger
+	// Контекст спана построен от rec.Context, у которого нет отмены. Обработчику
+	// нужен отменяемый контекст воркера, поэтому спан переносится в него, а не
+	// наоборот.
+	msgCtx := trace.ContextWithSpan(ctx, span)
+
+	log := logger.With(slog.Int64("offset", rec.Offset))
 	if sc := span.SpanContext(); sc.IsValid() {
 		log = log.With(slog.String("trace_id", sc.TraceID().String()))
 	}
 
-	c.handlersMu.RLock()
-	handler, ok := c.handlers[topic]
-	c.handlersMu.RUnlock()
-
+	handler, ok := c.handler(rec.Topic)
 	if !ok {
-		log.Error("No handler for topic", slog.String("topic", topic))
+		// Возможно только при рассинхроне подписки и карты обработчиков.
+		// Оффсет не отмечается: сообщение вернётся, а не исчезнет.
+		log.Error("No handler registered for topic")
+		c.countMessage(msgCtx, rec.Topic, consumerStatusError)
+		c.poison(client, key, w, log, errors.New("no handler registered"))
+
 		return
 	}
 
-	topicAttr := metric.WithAttributes(
-		attribute.String("topic", topic),
-		attribute.String("consumer_group", c.config.Consumer.Group))
+	msg := newIncomingMessage(rec)
 
-	incoming := IncomingMessage{
-		Topic:     topic,
-		Partition: msg.TopicPartition.Partition,
-		Offset:    int64(msg.TopicPartition.Offset),
-		Key:       msg.Key,
-		Value:     msg.Value,
-		Headers:   fromKafkaHeaders(msg.Headers),
-	}
-
-	maxRetries := c.config.Consumer.HandlerMaxRetries
 	start := time.Now()
 
-	var handlerErr error
+	decided, err := c.runHandler(msgCtx, handler, msg, span, log)
+	if !decided {
+		// Отмена застала паузу между попытками: вердикта нет, длительность
+		// мерить нечего.
+		c.countMessage(msgCtx, rec.Topic, consumerStatusSkipped)
 
-	for attempt := 1; ; attempt++ {
-		if err := handler.ProcessMessage(ctx, incoming); err != nil {
-			handlerErr = err
-
-			if maxRetries > 0 && attempt >= maxRetries {
-				log.Error("Skipping message after max retries",
-					slog.String("topic", topic),
-					slog.Int("partition", int(msg.TopicPartition.Partition)),
-					slog.Int64("offset", int64(msg.TopicPartition.Offset)),
-					slog.Int("attempts", attempt),
-					slog.Any("error", err))
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
-				c.metrics.failed.Add(ctx, 1, topicAttr)
-
-				break
-			}
-
-			log.Warn("Handler failed, retrying",
-				slog.String("topic", topic),
-				slog.Int("partition", int(msg.TopicPartition.Partition)),
-				slog.Int64("offset", int64(msg.TopicPartition.Offset)),
-				slog.Int("attempt", attempt),
-				slog.Int("max_retries", maxRetries),
-				slog.Any("error", err))
-			c.metrics.retried.Add(ctx, 1, topicAttr)
-
-			retryTimer := time.NewTimer(c.retryDelay)
-			select {
-			case <-retryTimer.C:
-			case <-ctx.Done():
-				retryTimer.Stop()
-				// Контекст отменён во время паузы между попытками — не коммитим.
-				// При перезапуске сообщение будет обработано заново.
-				return
-			}
-
-			continue
-		}
-
-		handlerErr = nil
-
-		break
+		return
 	}
 
-	c.metrics.processingTime.Record(ctx,
-		float64(time.Since(start).Milliseconds()), topicAttr)
-
-	if handlerErr == nil {
-		c.metrics.processed.Add(ctx, 1, topicAttr)
+	status := consumerStatusSuccess
+	if err != nil {
+		status = c.resolveFailure(msgCtx, client, msg, key, w, err, log)
 	}
 
-	// Коммитим offset в любом случае: при успехе — нормально, при провале
-	// после max retries — пропускаем сообщение (poison pill protection).
-	if _, err := c.consumer.CommitMessage(msg); err != nil {
-		log.Error("Failed to commit message",
-			slog.String("topic", topic),
-			slog.Int("partition", int(msg.TopicPartition.Partition)),
-			slog.Int64("offset", int64(msg.TopicPartition.Offset)),
-			slog.Any("error", err))
-		c.metrics.commitErrors.Add(ctx, 1, topicAttr)
+	// Длительность включает все попытки и все паузы между ними: измеряется
+	// задержка сообщения, а не одного вызова обработчика.
+	c.metrics.duration.Record(msgCtx, time.Since(start).Seconds(),
+		metric.WithAttributes(attribute.String("topic", rec.Topic), attribute.String("status", status)))
+	c.countMessage(msgCtx, rec.Topic, status)
+
+	if status == consumerStatusError {
+		// Неотмеченная запись — и есть гарантия at-least-once: коммит не
+		// сдвинется за неё, и после перезапуска или ребаланса она приедет
+		// снова. Партиция при этом уже отравлена в resolveFailure, иначе
+		// отметка следующей записи сдвинула бы коммит за эту.
+		return
 	}
+
+	// MarkCommitRecords без AutoCommitMarks() был бы no-op, а сдвинуть оффсет
+	// назад он не умеет — порядок отметок внутри партиции гарантирован тем,
+	// что воркер один.
+	client.MarkCommitRecords(rec)
 }
 
-// runCleanupLoop — фоновая горутина, периодически вызывающая cleanupInactiveWorkers.
-// Завершается либо по ctx.Done (штатная остановка), либо по stopCleanup (вызов Stop).
-func (c *KafkaConsumer) runCleanupLoop() {
-	ticker := time.NewTicker(c.cleanupWorkerInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			c.cleanupInactiveWorkers()
-		case <-c.ctx.Done():
-			return
-		case <-c.stopCleanup:
-			return
-		}
-	}
-}
-
-// cleanupInactiveWorkers удаляет воркеры по TTL.
-// Воркер с inFlight > 0 не трогаем: значит прямо сейчас есть processMessage,
-// который получил ссылку на воркер и либо ещё не обновил lastActivity,
-// либо пишет в messageChan — отмена контекста сейчас увела бы воркер в drain
-// до записи сообщения.
+// resolveFailure решает судьбу сообщения, которое обработчик не осилил за все
+// попытки: отдать его OnMessageSkipped или остановить партицию.
 //
-// security: восстановление после паники — defense-in-depth. Без него необработанная
-// паника здесь (единственный вызов — из тикера runCleanupLoop) уронила бы весь
-// процесс, а не только это одно фоновое обслуживание, что превращает баг в этой
-// функции в DoS против всего сервиса. Тот же паттерн уже используется в
-// runWorker/runPartitionWorker для паник в пользовательском коде обработчика.
-func (c *KafkaConsumer) cleanupInactiveWorkers() {
+// Возвращает статус для метрик. consumerStatusError означает, что оффсет
+// отмечать нельзя и партиция отравлена; consumerStatusSkipped — что хук забрал
+// сообщение и коммит может двигаться дальше.
+func (c *KafkaConsumer) resolveFailure(
+	ctx context.Context,
+	client *kgo.Client,
+	msg IncomingMessage,
+	key workerKey,
+	w *partitionWorker,
+	cause error,
+	log *slog.Logger,
+) string {
+	if c.config.OnMessageSkipped == nil {
+		log.Error("Message processing failed and no OnMessageSkipped hook is configured",
+			slog.Any("error", cause))
+		c.poison(client, key, w, log, cause)
+
+		return consumerStatusError
+	}
+
+	if hookErr := c.callSkipHook(ctx, msg, cause); hookErr != nil {
+		log.Error("OnMessageSkipped refused the message",
+			slog.Any("error", cause),
+			slog.Any("hook_error", hookErr))
+		c.poison(client, key, w, log, cause)
+
+		return consumerStatusError
+	}
+
+	log.Warn("Message skipped after exhausting retries", slog.Any("error", cause))
+
+	return consumerStatusSkipped
+}
+
+// callSkipHook вызывает OnMessageSkipped под собственным recover.
+//
+// Хук — чужой код, исполняемый в горутине воркера уже после того, как recover
+// вокруг обработчика отработал: его собственная паника прошла бы мимо и уронила
+// процесс. Паника трактуется как отказ забрать сообщение — иначе упавший хук
+// молча разрешил бы сдвинуть коммит.
+func (c *KafkaConsumer) callSkipHook(ctx context.Context, msg IncomingMessage, cause error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			c.logger.Error("Panic in cleanupInactiveWorkers",
-				slog.Any("panic", r),
-				slog.String("stack", string(debug.Stack())))
+			c.panics.report(ctx, panicSiteMessageSkipped, r, debug.Stack(),
+				slog.String("topic", msg.Topic),
+				slog.Int("partition", int(msg.Partition)),
+				slog.Int64("offset", msg.Offset))
+
+			err = fmt.Errorf("on message skipped: %w", ErrHandlerPanic)
 		}
 	}()
 
-	c.workersMu.Lock()
-	defer c.workersMu.Unlock()
+	return c.config.OnMessageSkipped(ctx, msg, cause)
+}
 
-	now := time.Now()
-	inactiveSince := now.Add(-c.inactiveWorkerTTL)
+// poison останавливает партицию на неотмеченном оффсете.
+//
+// Флага poisoned мало: без паузы клиент продолжил бы тянуть записи, которые
+// воркер обязан выбрасывать, и партиция крутила бы трафик, который всё равно
+// приедет заново. PauseFetchPartitions прекращает выборку, не отдавая
+// партицию: назначение остаётся за нами, лаг растёт и виден в мониторинге.
+//
+// Пауза снимается следующим назначением этой партиции — своим (ребаланс,
+// перезапуск) или чужим — ровно тогда, когда она начнёт читаться с
+// проваленного оффсета заново. Снимает её onPartitionsAssigned: сам по себе
+// ребаланс приостановленную партицию не отпускает, набор пауз в franz-go
+// принадлежит клиенту, а не назначению.
+func (c *KafkaConsumer) poison(
+	client *kgo.Client, key workerKey, w *partitionWorker, log *slog.Logger, cause error,
+) {
+	w.poisoned = true
 
-	for key, worker := range c.workers {
-		if worker.inFlight.Load() > 0 {
-			continue
+	log.Error("Partition paused at uncommitted offset; the message will be redelivered "+
+		"after rebalance or restart",
+		slog.Any("error", cause))
+
+	client.PauseFetchPartitions(map[string][]int32{key.topic: {key.partition}})
+}
+
+// countMessage инкрементирует счётчик исходов обработки.
+func (c *KafkaConsumer) countMessage(ctx context.Context, topic, status string) {
+	c.metrics.processed.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("topic", topic),
+		attribute.String("status", status)))
+}
+
+// runHandler вызывает обработчик с повторами.
+//
+// Первый результат — «вердикт получен»: false означает, что отмена контекста
+// прервала паузу между попытками и исход сообщения неизвестен.
+func (c *KafkaConsumer) runHandler(
+	ctx context.Context, handler ConsumerHandler, msg IncomingMessage, span trace.Span, log *slog.Logger,
+) (bool, error) {
+	maxRetries := c.config.Consumer.HandlerMaxRetries
+
+	for attempt := 0; ; attempt++ {
+		err := c.callHandler(ctx, handler, msg, span)
+		if err == nil {
+			return true, nil
 		}
 
-		lastActive := worker.getLastActivity()
-		if lastActive.Before(inactiveSince) {
-			worker.cancel()
-			delete(c.workers, key)
-			c.logger.Info("Removed inactive worker",
-				slog.String("topic", key.topic),
-				slog.Int("partition", int(key.partition)),
-				slog.Time("last_active", lastActive))
+		// Отрицательное значение (-1) означает «повторять бесконечно», ноль —
+		// «без повторов»: attempt считает уже сделанные повторы, а не вызовы.
+		if maxRetries >= 0 && attempt >= maxRetries {
+			log.Error("Handler failed, giving up",
+				slog.Int("attempts", attempt+1),
+				slog.Any("error", err))
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+
+			return true, err
+		}
+
+		log.Warn("Handler failed, retrying",
+			slog.Int("attempt", attempt+1),
+			slog.Int("max_retries", maxRetries),
+			slog.Any("error", err))
+		c.metrics.retries.Add(ctx, 1, metric.WithAttributes(attribute.String("topic", msg.Topic)))
+
+		if !waitRetryDelay(ctx, c.config.Consumer.HandlerRetryDelay) {
+			return false, err
 		}
 	}
 }
 
-// Stop выполняет graceful shutdown консьюмера:
-//  1. Останавливает фоновый сборщик воркеров.
-//  2. Отменяет контекст всех воркеров партиций, запуская drain их очередей.
-//  3. Ожидает завершения всех горутин до GracefulTimeout.
-//  4. Вызывает consumer.Close для закрытия соединения с брокером.
+// callHandler вызывает обработчик под recover.
 //
-// Безопасен для повторного вызова: последующие вызовы логируют предупреждение и возвращаются немедленно.
-func (c *KafkaConsumer) Stop() {
-	if !c.isStopping.CompareAndSwap(false, true) {
-		c.logger.Warn("Already in stopping state")
+// Паника превращается в обычную ошибку, чтобы сообщение прошло штатный путь
+// повторов, а воркер остался жив: до этого паника обработчика убивала воркера
+// и осиротевшая очередь целиком перепрыгивалась коммитом следующего воркера.
+// Плата — детерминированная паника повторяется HandlerMaxRetries раз.
+func (c *KafkaConsumer) callHandler(
+	ctx context.Context, handler ConsumerHandler, msg IncomingMessage, span trace.Span,
+) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: %v", ErrHandlerPanic, r)
+			span.RecordError(err)
+			c.panics.report(ctx, panicSiteHandler, r, debug.Stack(),
+				slog.String("topic", msg.Topic),
+				slog.Int("partition", int(msg.Partition)),
+				slog.Int64("offset", msg.Offset))
+		}
+	}()
+
+	return handler.ProcessMessage(ctx, msg)
+}
+
+// waitRetryDelay выдерживает паузу; false означает отмену контекста.
+func waitRetryDelay(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// onPartitionsAssigned заводит воркеров назначенных партиций.
+//
+// Снятие паузы — обязательная часть назначения, а не подстраховка. Набор
+// приостановленных партиций в franz-go живёт на уровне клиента и переживает
+// ребаланс: методы Pause*/Resume* — единственное, что его меняет. Без этого
+// вызова партиция, отравленная и приостановленная в poison, при возврате к
+// тому же экземпляру получала бы свежего воркера с poisoned=false, но её
+// фетч оставался бы выключенным навсегда — и обещание «сообщение приедет
+// заново после ребаланса» держалось бы только при переезде на другой процесс.
+func (c *KafkaConsumer) onPartitionsAssigned(_ context.Context, client *kgo.Client, assigned map[string][]int32) {
+	client.ResumeFetchPartitions(assigned)
+
+	for topic, partitions := range assigned {
+		for _, partition := range partitions {
+			c.worker(client, workerKey{topic: topic, partition: partition})
+		}
+	}
+
+	c.logger.Info("Partitions assigned", slog.Any("partitions", assigned))
+}
+
+// onPartitionsRevoked останавливает воркеров отзываемых партиций и фиксирует
+// их оффсеты.
+//
+// Колбэк блокирует ребаланс, и это ровно то, что нужно: пока он не вернулся,
+// партиция не уедет к другому участнику группы.
+//
+// Коммит здесь обязателен, а не «на всякий случай»: собственный
+// OnPartitionsRevoked отключает встроенный defaultRevoke franz-go вместе с его
+// финальным синхронным коммитом, и без явного вызова отмеченные оффсеты
+// потерялись бы вместе с сессией.
+func (c *KafkaConsumer) onPartitionsRevoked(ctx context.Context, client *kgo.Client, revoked map[string][]int32) {
+	drainCtx, cancelDrain := c.rebalanceBudget(ctx)
+	c.stopWorkers(drainCtx, revoked)
+	cancelDrain()
+
+	// Отдельный бюджет, а не остаток от drainCtx: если воркеров пришлось
+	// добивать по таймауту, тот контекст уже отменён, и коммит провалился бы
+	// мгновенно — потеряв ровно те оффсеты, ради которых колбэк и написан.
+	commitCtx, cancelCommit := c.rebalanceBudget(ctx)
+	defer cancelCommit()
+
+	if err := client.CommitMarkedOffsets(commitCtx); err != nil {
+		c.logger.Error("Failed to commit marked offsets on revoke",
+			slog.Any("partitions", revoked),
+			slog.Any("error", err))
+
 		return
+	}
+
+	c.logger.Info("Partitions revoked", slog.Any("partitions", revoked))
+}
+
+// onPartitionsLost останавливает воркеров потерянных партиций.
+//
+// Коммита здесь нет намеренно: партиции потеряны вместе с сессией группы, и
+// коммит либо будет отвергнут координатором, либо перезапишет оффсет,
+// принадлежащий уже другому участнику.
+func (c *KafkaConsumer) onPartitionsLost(ctx context.Context, _ *kgo.Client, lost map[string][]int32) {
+	ctx, cancel := c.rebalanceBudget(ctx)
+	defer cancel()
+
+	c.stopWorkers(ctx, lost)
+
+	c.logger.Warn("Partitions lost", slog.Any("partitions", lost))
+}
+
+// rebalanceBudget ограничивает время, которое колбэк ребаланса проводит в
+// ожидании воркеров.
+//
+// franz-go передаёт в колбэки контекст жизни клиента, а не контекст ребаланса:
+// он отменяется только при закрытии клиента. Без собственного дедлайна
+// зависший обработчик держал бы колбэк дольше RebalanceTimeout, координатор
+// исключил бы участника из группы, и вместо управляемого отзыва партиций
+// случился бы onLost — то есть худший из двух исходов наступал бы сам собой.
+func (c *KafkaConsumer) rebalanceBudget(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, c.config.Consumer.RebalanceTimeout)
+}
+
+// stopWorkers мягко останавливает воркеров перечисленных партиций и дожидается
+// их выхода.
+func (c *KafkaConsumer) stopWorkers(ctx context.Context, partitions map[string][]int32) {
+	stopped := make([]workerKey, 0, len(partitions))
+
+	// Сначала закрываются все очереди, и лишь потом идёт ожидание: иначе
+	// воркеры дренировались бы по очереди, а не параллельно.
+	for topic, parts := range partitions {
+		for _, partition := range parts {
+			key := workerKey{topic: topic, partition: partition}
+			if w, ok := c.workers[key]; ok {
+				w.stop()
+
+				stopped = append(stopped, key)
+			}
+		}
+	}
+
+	c.awaitWorkers(ctx, stopped)
+}
+
+// stopAllWorkers мягко останавливает всех воркеров.
+func (c *KafkaConsumer) stopAllWorkers(ctx context.Context) {
+	stopped := make([]workerKey, 0, len(c.workers))
+
+	for key, w := range c.workers {
+		w.stop()
+
+		stopped = append(stopped, key)
+	}
+
+	c.awaitWorkers(ctx, stopped)
+}
+
+// awaitWorkers ждёт завершения воркеров и убирает их из карты.
+//
+// Воркер, не уложившийся в бюджет, отменяется жёстко: продолжать обработку
+// партиции, которая уже отдана другому участнику группы, хуже, чем оборвать
+// текущее сообщение — оно всё равно не отмечено и приедет снова.
+func (c *KafkaConsumer) awaitWorkers(ctx context.Context, keys []workerKey) {
+	for _, key := range keys {
+		w := c.workers[key]
+		delete(c.workers, key)
+
+		select {
+		case <-w.done:
+		case <-ctx.Done():
+			c.logger.Warn("Partition worker did not stop in time, cancelling",
+				slog.String("topic", key.topic),
+				slog.Int("partition", int(key.partition)))
+			w.cancel()
+		}
+	}
+}
+
+// Stop останавливает консьюмера и закрывает клиента.
+//
+// Порядок фиксирован: остановить цикл опроса, дождаться воркеров, явно
+// закоммитить отмеченные оффсеты (не полагаясь на тикер автокоммита) и лишь
+// затем закрыть клиента. Весь путь ограничен Config.GracefulTimeout; при
+// исчерпании бюджета в лог уходит предупреждение, и завершение продолжается.
+//
+// Закрытие — только CloseAllowingRebalance: обычный Close при
+// BlockRebalanceOnPoll повисает, потому что уход из группы вызывает ребаланс,
+// заблокированный незавершённым опросом.
+//
+// Клиент закрывается и при исчерпании бюджета, даже если воркер ещё жив:
+// отметка оффсета после закрытия — безопасный no-op, а не обращение к
+// освобождённым ресурсам, поэтому удерживать хендл ради опоздавших воркеров
+// не нужно.
+//
+// Идемпотентен: повторный вызов пишет предупреждение и возвращает nil.
+func (c *KafkaConsumer) Stop() error {
+	if !c.stopping.CompareAndSwap(false, true) {
+		c.logger.Warn("Consumer is already stopping")
+
+		return nil
+	}
+
+	c.mu.Lock()
+	client, pollCancel := c.client, c.pollCancel
+	c.mu.Unlock()
+
+	if client == nil {
+		// Start не вызывался или не дошёл до создания клиента.
+		c.lifeCancel()
+
+		return nil
 	}
 
 	c.logger.Info("Starting kafka consumer shutdown")
 
-	// Сначала останавливаем cleanup, затем отменяем контекст воркеров.
-	// Порядок важен: если сначала cancel(), cleanup-loop может попытаться
-	// удалить воркеры, которые уже завершаются — безвредно, но избыточно.
-	close(c.stopCleanup)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.lifeCtx), c.config.GracefulTimeout)
+	defer cancel()
 
-	// cancel() под workersMu: getOrCreateWorker проверяет isStopping под тем же
-	// локом перед wg.Add, поэтому к моменту wg.Wait() новые wg.Add невозможны.
-	c.workersMu.Lock()
-	c.cancel()
-	c.workersMu.Unlock()
+	pollCancel()
 
-	done := make(chan struct{})
-
-	go func() {
-		c.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		c.logger.Info("Kafka consumer fully stopped")
-	case <-time.After(c.config.GracefulTimeout):
-		c.logger.Warn("Shutdown timed out, forcing close",
-			slog.String("timeout", c.config.GracefulTimeout.String()))
+	if waitClosed(ctx, c.loopDone) {
+		c.stopAllWorkers(ctx)
+	} else {
+		// Карта воркеров не защищена мьютексом и принадлежит циклу опроса:
+		// пока цикл жив, трогать её нельзя, поэтому остаётся жёсткая отмена.
+		c.logger.Warn("Poll loop did not stop within graceful timeout",
+			slog.Duration("timeout", c.config.GracefulTimeout))
+		c.lifeCancel()
 	}
 
-	// consumer.Close() безопасен: runConsumerLoop завершился по ctx.Done(),
-	// drain каждого воркера ограничен drainCtx с тем же GracefulTimeout.
-	if err := c.consumer.Close(); err != nil {
-		c.logger.Error("Failed to close consumer", slog.Any("error", err))
+	// Отдельный бюджет вместо остатка от ctx: ровно в том случае, когда
+	// финальный коммит важнее всего — цикл опроса или воркеры не уложились в
+	// GracefulTimeout, — остаток равен нулю, и коммит провалился бы, не сходив
+	// к брокеру. Одна операция к координатору стоит не дороже ребаланса,
+	// поэтому и бюджет тот же.
+	commitCtx, cancelCommit := context.WithTimeout(
+		context.WithoutCancel(c.lifeCtx), c.config.Consumer.RebalanceTimeout)
+	defer cancelCommit()
+
+	var err error
+
+	if commitErr := client.CommitMarkedOffsets(commitCtx); commitErr != nil {
+		c.logger.Error("Failed to commit marked offsets on shutdown", slog.Any("error", commitErr))
+		err = fmt.Errorf("committing marked offsets: %w", commitErr)
 	}
+
+	client.CloseAllowingRebalance()
+	c.lifeCancel()
 
 	c.logger.Info("Kafka consumer shutdown completed")
+
+	return err
+}
+
+// waitClosed ждёт закрытия канала; false означает исчерпание бюджета.
+func waitClosed(ctx context.Context, done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// newIncomingMessage переводит запись franz-go в сообщение публичного API.
+func newIncomingMessage(rec *kgo.Record) IncomingMessage {
+	return IncomingMessage{
+		Topic:     rec.Topic,
+		Partition: rec.Partition,
+		Offset:    rec.Offset,
+		Key:       rec.Key,
+		Value:     rec.Value,
+		Headers:   fromRecordHeaders(rec.Headers),
+		Timestamp: rec.Timestamp,
+	}
+}
+
+// recordAttrs — координаты записи для логов.
+func recordAttrs(rec *kgo.Record) []slog.Attr {
+	return []slog.Attr{
+		slog.String("topic", rec.Topic),
+		slog.Int("partition", int(rec.Partition)),
+		slog.Int64("offset", rec.Offset),
+	}
 }

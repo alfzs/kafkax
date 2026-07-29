@@ -25,17 +25,14 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Build (integration tag)
-        run: go build -tags integration ./...
-
       - name: Test
         run: go test -race -count=1 ./...
 
-      - name: Test (integration tag)
-        run: go test -race -count=1 -tags=integration ./...
-
+      # Линтеры живут в отдельном модуле tools/ и ставятся в .tools/ —
+      # цели Makefile собирают их сами, поэтому шаг не зависит от того,
+      # объявлены ли tool-директивы в основном go.mod.
       - name: Lint
-        run: go tool golangci-lint run --build-tags=integration ./...
+        run: make lint
 
       - name: Vulnerability check
-        run: go tool govulncheck ./...
+        run: make audit
