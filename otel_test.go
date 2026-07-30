@@ -20,6 +20,15 @@ import (
 // трафик быстрее пяти секунд оседает в первом бакете. Гистограмма при этом
 // продолжает исправно считаться и экспортироваться — сломанной она выглядит
 // только на графике квантилей, где p50 и p99 совпадают.
+//
+// Сетки выписаны литералом, а не взяты из consumerDurationBuckets и
+// producerDurationBuckets. Через переменные тест сравнивал значения сами с
+// собой и пропускал любую их правку: и срезанную верхнюю границу продюсера, и
+// выброшенный нижний хвост консьюмера — соседний
+// TestDurationBucketsAreSaneGrids обе мутации переживает, монотонность они не
+// нарушают. Литерал делает изменение сетки осознанным: правка требуется в двух
+// местах, и вторая — здесь, рядом с объяснением, зачем сетка такая
+// (TestDurationBucketsExpressTheirRationale).
 func TestDurationHistogramsDeclareExplicitBuckets(t *testing.T) { //nolint:paralleltest // подменяет глобальный MeterProvider
 	rec := captureMetrics(t)
 
@@ -38,15 +47,81 @@ func TestDurationHistogramsDeclareExplicitBuckets(t *testing.T) { //nolint:paral
 		name string
 		want []float64
 	}{
-		{"kafkax.consumer.message.duration", consumerDurationBuckets},
-		{"kafkax.producer.message.duration", producerDurationBuckets},
+		{
+			"kafkax.consumer.message.duration",
+			[]float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300},
+		},
+		{
+			"kafkax.producer.message.duration",
+			[]float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
+		},
 	}
 
 	for _, tc := range cases {
 		if got := rec.bucketsOf(tc.name); !slices.Equal(got, tc.want) {
-			t.Errorf("%s зарегистрирована с границами %v, want %v", tc.name, got, tc.want)
+			t.Errorf("%s зарегистрирована с границами %v, want %v\n"+
+				"сетка изменилась осознанно? обновите литерал и сверьтесь с "+
+				"TestDurationBucketsExpressTheirRationale", tc.name, got, tc.want)
 		}
 	}
+}
+
+// TestDurationBucketsExpressTheirRationale — границы сеток держатся не на
+// снимке значений, а на причинах, по которым эти значения выбраны.
+//
+// Литеральный снимок соседнего теста ловит любую правку, но одинаково громко
+// кричит и на осмысленную, и на бессмысленную: он знает, что число изменилось,
+// и не знает, чему оно должно равняться. Здесь проверяется именно связь с
+// причиной — такой ассерт переживает согласованное изменение (вырос бюджет
+// доставки — выросла и верхняя граница) и краснеет на рассогласовании, которое
+// снимок пропустил бы, будь литерал обновлён «под факт».
+func TestDurationBucketsExpressTheirRationale(t *testing.T) {
+	t.Parallel()
+
+	t.Run("верхняя граница продюсера равна бюджету доставки", func(t *testing.T) {
+		t.Parallel()
+
+		// Превышение MessageTimeout обязано читаться как переполнение
+		// последнего бакета. Если верхняя граница ниже бюджета, все медленные
+		// отправки уезжают в +Inf и «сколько их было близко к таймауту»
+		// перестаёт быть вопросом к гистограмме.
+		want := DefaultConfig().Producer.MessageTimeout.Seconds()
+
+		if got := producerDurationBuckets[len(producerDurationBuckets)-1]; got != want {
+			t.Errorf("верхняя граница продюсера = %v, want %v (Producer.MessageTimeout по умолчанию)", got, want)
+		}
+	})
+
+	t.Run("консьюмер размечен от миллисекунд", func(t *testing.T) {
+		t.Parallel()
+
+		// Обработчик, отвечающий из памяти, укладывается в доли миллисекунды.
+		// Уедет нижняя граница к сотням миллисекунд — весь быстрый трафик
+		// сольётся в первый бакет, и p50 станет неотличим от p99: ровно та
+		// поломка, от которой явные границы и заводились.
+		const want = 0.001
+
+		if got := consumerDurationBuckets[0]; got > want {
+			t.Errorf("нижняя граница консьюмера = %v, want <= %v", got, want)
+		}
+	})
+
+	t.Run("хвост консьюмера длиннее продюсерского", func(t *testing.T) {
+		t.Parallel()
+
+		// Консьюмер меряет обработку целиком, вместе с повторами и паузами
+		// между ними, продюсер — одну отправку в пределах своего бюджета.
+		// Сравнявшиеся хвосты означали бы, что честная долгая обработка с
+		// повторами больше не отличается от «зависло навсегда».
+		var (
+			consumer = consumerDurationBuckets[len(consumerDurationBuckets)-1]
+			producer = producerDurationBuckets[len(producerDurationBuckets)-1]
+		)
+
+		if consumer <= producer {
+			t.Errorf("хвост консьюмера = %v, продюсера = %v: want строго длиннее", consumer, producer)
+		}
+	})
 }
 
 // TestDurationBucketsAreSaneGrids — сетки строго возрастают и начинаются с
