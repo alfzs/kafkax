@@ -72,10 +72,10 @@ type Config struct {
 	// DialTimeout — таймаут установки TCP/TLS-соединения с брокером.
 	DialTimeout time.Duration `yaml:"dial_timeout" env:"KAFKAX_DIAL_TIMEOUT" env-default:"10s"`
 
-	SASL     SASL     `yaml:"sasl"`
-	TLS      TLS      `yaml:"tls"`
-	Producer Producer `yaml:"producer"`
-	Consumer Consumer `yaml:"consumer"`
+	SASL     SASL           `yaml:"sasl"`
+	TLS      TLS            `yaml:"tls"`
+	Producer ProducerConfig `yaml:"producer"`
+	Consumer ConsumerConfig `yaml:"consumer"`
 
 	// KafkaLogLevel — порог логов самого franz-go: debug, info, warn, error
 	// или none. Умолчание — info.
@@ -330,8 +330,8 @@ func (c Config) transportEncrypted() bool {
 	return c.TLSConfig != nil || c.TLS.enabled()
 }
 
-// Producer содержит параметры Kafka-продюсера.
-type Producer struct {
+// ProducerConfig содержит параметры Kafka-продюсера.
+type ProducerConfig struct {
 	// RequiredAcks — сколько брокеров должны подтвердить запись:
 	// -1 = все реплики ISR (по умолчанию и единственное безопасное значение
 	// при включённой идемпотентности), 1 = только лидер, 0 = без подтверждения.
@@ -405,8 +405,8 @@ type Producer struct {
 	FlushTimeout time.Duration `yaml:"flush_timeout" env:"KAFKAX_PRODUCER_FLUSH_TIMEOUT" env-default:"1m"`
 }
 
-// Consumer содержит параметры Kafka-консьюмера.
-type Consumer struct {
+// ConsumerConfig содержит параметры Kafka-консьюмера.
+type ConsumerConfig struct {
 	// Group — идентификатор consumer group. Обязателен.
 	Group string `yaml:"group" env:"KAFKAX_CONSUMER_GROUP"`
 	// InitialOffset — откуда читать группу без сохранённого оффсета:
@@ -501,7 +501,7 @@ func DefaultConfig() Config {
 		GracefulTimeout: 3 * time.Minute,
 		DialTimeout:     10 * time.Second,
 		KafkaLogLevel:   KafkaLogInfo,
-		Producer: Producer{
+		Producer: ProducerConfig{
 			RequiredAcks:       -1,
 			EnableIdempotence:  true,
 			MaxInflight:        5,
@@ -516,7 +516,7 @@ func DefaultConfig() Config {
 			MessageTimeout:     30 * time.Second,
 			FlushTimeout:       time.Minute,
 		},
-		Consumer: Consumer{
+		Consumer: ConsumerConfig{
 			InitialOffset:     OffsetEarliest,
 			MinBytes:          1,
 			MaxBytes:          52428800,
@@ -540,7 +540,7 @@ func DefaultConfig() Config {
 //
 // Конструкторы вызывают не её, а проверку своей роли: продюсеру незачем
 // требовать consumer.group, а консьюмеру — producer.flush_timeout. Config,
-// прошедший NewKafkaProducer, может не пройти Validate.
+// прошедший NewProducer, может не пройти Validate.
 //
 // Ошибки собираются все разом, а не возвращаются по первой: иначе неполный
 // конфиг чинится по одному полю за перезапуск. Результат отвечает
@@ -560,12 +560,12 @@ func (c Config) Validate() error {
 	return newConfigError("config", errs)
 }
 
-// validateProducer — проверка для NewKafkaProducer: общие поля и секция Producer.
+// validateProducer — проверка для NewProducer: общие поля и секция Producer.
 func (c Config) validateProducer() error {
 	return newConfigError("producer config", append(c.commonErrors(), c.producerErrors()...))
 }
 
-// validateConsumer — проверка для NewKafkaConsumer: общие поля и секция Consumer.
+// validateConsumer — проверка для NewConsumer: общие поля и секция Consumer.
 func (c Config) validateConsumer() error {
 	return newConfigError("consumer config", append(c.commonErrors(), c.consumerErrors()...))
 }
@@ -579,7 +579,7 @@ func (c Config) validateConsumer() error {
 type configError struct {
 	// subject — что именно не прошло проверку: «config», «producer config»
 	// или «consumer config». Роль важна, потому что проверки разные: Config,
-	// прошедший NewKafkaProducer, может не пройти Validate.
+	// прошедший NewProducer, может не пройти Validate.
 	subject string
 	errs    []error
 }

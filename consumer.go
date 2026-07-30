@@ -113,7 +113,7 @@ type MessageConsumer interface {
 	Stop() error
 }
 
-var _ MessageConsumer = (*KafkaConsumer)(nil)
+var _ MessageConsumer = (*Consumer)(nil)
 
 // consumerState — состояние жизненного цикла консьюмера.
 //
@@ -149,12 +149,12 @@ func (s consumerState) lifecycleErr() error {
 	return nil
 }
 
-// KafkaConsumer — консьюмер Kafka поверх franz-go.
+// Consumer — консьюмер Kafka поверх franz-go.
 //
 // На каждую назначенную топик-партицию заводится горутина: обработка разных
 // партиций идёт параллельно, внутри одной партиции — строго по порядку
 // оффсетов. Методы безопасны для вызова из разных горутин.
-type KafkaConsumer struct {
+type Consumer struct {
 	config    Config
 	logger    *slog.Logger
 	telemetry telemetry
@@ -260,13 +260,13 @@ type KafkaConsumer struct {
 	stopErr  error
 }
 
-// NewKafkaConsumer создаёт консьюмера.
+// NewConsumer создаёт консьюмера.
 //
 // Соединения здесь не устанавливаются и горутины не запускаются: набор топиков
 // известен только после AddHandler, а franz-go требует его при создании
 // клиента, поэтому сам клиент создаётся в Start. Конструктор проверяет
 // конфигурацию, готовит логгер, метрики и репортер паник.
-func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
+func NewConsumer(config Config) (*Consumer, error) {
 	const op = "creating consumer"
 
 	// Не оборачивается: у агрегата валидации Unwrap() []error, и fmt.Errorf
@@ -285,7 +285,7 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 
 	lifeCtx, lifeCancel := context.WithCancel(context.Background())
 
-	return &KafkaConsumer{
+	return &Consumer{
 		config:       config,
 		logger:       logger,
 		telemetry:    newTelemetry(config.ClientID, config.Consumer.Group),
@@ -315,7 +315,7 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 // Отказ ничего не меняет: набор обработчиков публикуется целиком, поэтому ни
 // дубликат, ни отказ по жизненному циклу не подменяют уже зарегистрированный
 // обработчик и не добавляют половину нового.
-func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ...ConsumerMiddleware) error {
+func (c *Consumer) AddHandler(topic string, handler ConsumerHandler, mws ...ConsumerMiddleware) error {
 	if topic == "" {
 		return fmt.Errorf("adding handler: %w", ErrEmptyTopic)
 	}
@@ -370,7 +370,7 @@ func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ..
 //
 // nil-указатель разворачивается в nil-карту, а не в панику: чтение из
 // nil-карты законно и означает ровно то, что нужно, — обработчиков нет.
-func (c *KafkaConsumer) loadHandlers() map[string]ConsumerHandler {
+func (c *Consumer) loadHandlers() map[string]ConsumerHandler {
 	if snapshot := c.handlers.Load(); snapshot != nil {
 		return *snapshot
 	}
@@ -379,7 +379,7 @@ func (c *KafkaConsumer) loadHandlers() map[string]ConsumerHandler {
 }
 
 // loadState возвращает текущее состояние жизненного цикла.
-func (c *KafkaConsumer) loadState() consumerState {
+func (c *Consumer) loadState() consumerState {
 	return consumerState(c.state.Load())
 }
 
@@ -388,7 +388,7 @@ func (c *KafkaConsumer) loadState() consumerState {
 //
 // CAS, а не Store: параллельный Stop мог уже перевести консьюмера в
 // consumerClosed, и безусловная запись воскресила бы остановленного.
-func (c *KafkaConsumer) abortStart() {
+func (c *Consumer) abortStart() {
 	c.state.CompareAndSwap(int32(consumerRunning), int32(consumerIdle))
 }
 
@@ -401,7 +401,7 @@ func (c *KafkaConsumer) abortStart() {
 // Повторный вызов уже запущенного консьюмера возвращает ErrConsumerStarted.
 // Консьюмер, прошедший Stop, не перезапускается: Start вернёт ErrConsumerClosed,
 // и отличить это от «уже запущен» можно через errors.Is.
-func (c *KafkaConsumer) Start(ctx context.Context) error {
+func (c *Consumer) Start(ctx context.Context) error {
 	const op = "starting consumer"
 
 	// Гонку двух Start разрешает CAS; проигравший узнаёт причину отказа из
@@ -491,7 +491,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 // себя закрытого клиента и закоммиченные оффсеты. Без этого экземпляр
 // превращался бы в зомби — heartbeat идёт, партиции закреплены, координатор
 // ждёт его на каждом ребалансе, а закрыть клиента уже некому.
-func (c *KafkaConsumer) watchContext(ctx context.Context) {
+func (c *Consumer) watchContext(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		// Возврат некуда отдать: контекст отменил не тот, кто ждёт ошибку.
@@ -505,13 +505,13 @@ func (c *KafkaConsumer) watchContext(ctx context.Context) {
 // topics возвращает отсортированный набор топиков с обработчиками.
 // Сортировка нужна для воспроизводимости логов и сообщений об ошибках:
 // порядок обхода карты в Go случаен.
-func (c *KafkaConsumer) topics() []string {
+func (c *Consumer) topics() []string {
 	return slices.Sorted(maps.Keys(c.loadHandlers()))
 }
 
 // handler ищет обработчик топика. Горячий путь: вызывается на каждое
 // сообщение из горутины воркера партиции, замков не берёт — см. поле handlers.
-func (c *KafkaConsumer) handler(topic string) (ConsumerHandler, bool) {
+func (c *Consumer) handler(topic string) (ConsumerHandler, bool) {
 	h, ok := c.loadHandlers()[topic]
 
 	return h, ok
@@ -544,14 +544,14 @@ func (c *KafkaConsumer) handler(topic string) (ConsumerHandler, bool) {
 // Идемпотентен и блокирующий: завершение выполняется ровно один раз, а всякий
 // вызывающий — включая пришедшего вторым и того, кто просто отменил контекст
 // Start, — дожидается его конца и получает один и тот же результат.
-func (c *KafkaConsumer) Stop() error {
+func (c *Consumer) Stop() error {
 	c.stopOnce.Do(func() { c.stopErr = c.shutdown() })
 
 	return c.stopErr
 }
 
 // shutdown — тело остановки, выполняемое ровно один раз.
-func (c *KafkaConsumer) shutdown() error {
+func (c *Consumer) shutdown() error {
 	// Терминальное состояние взводится до захвата c.mu — на этом порядке
 	// держится защита от «осиротевшего» клиента в Start, см. комментарий там.
 	c.state.Store(int32(consumerClosed))

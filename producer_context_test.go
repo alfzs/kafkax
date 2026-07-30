@@ -29,7 +29,7 @@ func TestProducerSendContextBudget(t *testing.T) {
 	// умолчание в 30s: обе ветки должны выбираться однозначно.
 	const messageTimeout = 10 * time.Second
 
-	p := &KafkaProducer{messageTimeout: messageTimeout}
+	p := &Producer{messageTimeout: messageTimeout}
 
 	t.Run("дедлайн вызывающего раньше — своего контекста нет", func(t *testing.T) {
 		t.Parallel()

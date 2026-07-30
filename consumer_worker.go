@@ -78,7 +78,7 @@ func (w *partitionWorker) stop() {
 // целиком, поэтому непойманного пути отсюда быть не должно. Консьюмер после
 // такого перестаёт потреблять: закрытие loopDone разблокирует Stop, но сам
 // Stop обязан позвать вызывающий.
-func (c *KafkaConsumer) runPollLoop(ctx context.Context, client *kgo.Client) {
+func (c *Consumer) runPollLoop(ctx context.Context, client *kgo.Client) {
 	// Порядок регистрации обратен порядку исполнения: сначала перехват паники,
 	// и только затем сигнал о завершении — иначе Stop пошёл бы закрывать
 	// клиента, пока паника ещё разматывается.
@@ -100,7 +100,7 @@ func (c *KafkaConsumer) runPollLoop(ctx context.Context, client *kgo.Client) {
 // в теле цикла есть два ранних выхода и возможная паника, которые его миновали
 // бы. Без него следующий ребаланс — включая тот, что инициирует закрытие
 // клиента, — повис бы навсегда.
-func (c *KafkaConsumer) pollOnce(ctx context.Context, client *kgo.Client) bool {
+func (c *Consumer) pollOnce(ctx context.Context, client *kgo.Client) bool {
 	defer client.AllowRebalance()
 
 	fetches := client.PollRecords(ctx, c.config.Consumer.MaxPollRecords)
@@ -133,7 +133,7 @@ func (c *KafkaConsumer) pollOnce(ctx context.Context, client *kgo.Client) bool {
 // Отправка блокирующая и без таймаута намеренно: батч, выброшенный из-за
 // переполнения очереди, был бы перепрыгнут коммитом следующего, и сообщения
 // потерялись бы молча. Блокировка тормозит опрос, а не теряет данные.
-func (c *KafkaConsumer) dispatch(ctx context.Context, client *kgo.Client, ftp kgo.FetchTopicPartition) {
+func (c *Consumer) dispatch(ctx context.Context, client *kgo.Client, ftp kgo.FetchTopicPartition) {
 	if len(ftp.Records) == 0 {
 		return
 	}
@@ -177,7 +177,7 @@ func (c *KafkaConsumer) dispatch(ctx context.Context, client *kgo.Client, ftp kg
 //
 // Вызывается из горутины цикла опроса. Читать поля воркера здесь нельзя, а
 // трогать набор пауз можно: pausePartition держит его под pausedMu.
-func (c *KafkaConsumer) abandonDeadWorker(
+func (c *Consumer) abandonDeadWorker(
 	ctx context.Context, client *kgo.Client, key workerKey, records []*kgo.Record,
 ) {
 	dropCtx := context.WithoutCancel(ctx)
@@ -202,7 +202,7 @@ func (c *KafkaConsumer) abandonDeadWorker(
 // Обычно воркер уже создан колбэком назначения; ленивое создание закрывает
 // окно, в котором фетч приезжает раньше колбэка, и стоит один незанятый захват
 // мьютекса.
-func (c *KafkaConsumer) worker(client *kgo.Client, key workerKey) *partitionWorker {
+func (c *Consumer) worker(client *kgo.Client, key workerKey) *partitionWorker {
 	c.workersMu.Lock()
 	defer c.workersMu.Unlock()
 
@@ -233,7 +233,7 @@ func (c *KafkaConsumer) worker(client *kgo.Client, key workerKey) *partitionWork
 }
 
 // runPartitionWorker последовательно обрабатывает батчи одной партиции.
-func (c *KafkaConsumer) runPartitionWorker(
+func (c *Consumer) runPartitionWorker(
 	ctx context.Context, client *kgo.Client, key workerKey, w *partitionWorker,
 ) {
 	logger := c.logger.With(slog.String("topic", key.topic), slog.Int("partition", int(key.partition)))
@@ -343,7 +343,7 @@ func (l *recordLogger) get() *slog.Logger {
 
 // processRecord проводит одну запись через трейсинг, обработчик и отметку
 // к коммиту.
-func (c *KafkaConsumer) processRecord(
+func (c *Consumer) processRecord(
 	ctx context.Context, client *kgo.Client, rec *kgo.Record,
 	key workerKey, w *partitionWorker, logger *slog.Logger,
 ) {
@@ -477,7 +477,7 @@ func (c *KafkaConsumer) processRecord(
 // то есть ровно ту причину, по которой на Error перестают реагировать.
 // Отравление партиции, наоборот, всегда Error — но одной записью, а не тремя на
 // трёх уровнях стека.
-func (c *KafkaConsumer) resolveFailure(
+func (c *Consumer) resolveFailure(
 	ctx context.Context,
 	client *kgo.Client,
 	msg IncomingMessage,
@@ -517,7 +517,7 @@ func (c *KafkaConsumer) resolveFailure(
 // вокруг обработчика отработал: его собственная паника прошла бы мимо и уронила
 // процесс. Паника трактуется как отказ забрать сообщение — иначе упавший хук
 // молча разрешил бы сдвинуть коммит.
-func (c *KafkaConsumer) callSkipHook(ctx context.Context, msg IncomingMessage, cause error) (err error) {
+func (c *Consumer) callSkipHook(ctx context.Context, msg IncomingMessage, cause error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			c.panics.report(ctx, PanicSiteMessageSkipped, r, debug.Stack(),
@@ -552,7 +552,7 @@ func (c *KafkaConsumer) callSkipHook(ctx context.Context, msg IncomingMessage, c
 // resolveFailure, ошибка хука. Запись здесь единственная на весь отказ, поэтому
 // всё, что о нём известно, обязано приехать в неё, а не в отдельные строки
 // уровнем выше.
-func (c *KafkaConsumer) poison(
+func (c *Consumer) poison(
 	client *kgo.Client, key workerKey, w *partitionWorker, log *recordLogger,
 	cause error, extra ...slog.Attr,
 ) {
@@ -582,7 +582,7 @@ func (c *KafkaConsumer) poison(
 //
 // Вызывается из двух горутин: воркерной (через poison) и цикла опроса (через
 // abandonDeadWorker), поэтому набор пауз живёт под pausedMu.
-func (c *KafkaConsumer) pausePartition(client *kgo.Client, key workerKey) bool {
+func (c *Consumer) pausePartition(client *kgo.Client, key workerKey) bool {
 	client.PauseFetchPartitions(map[string][]int32{key.topic: {key.partition}})
 
 	c.pausedMu.Lock()
@@ -612,7 +612,7 @@ func (c *KafkaConsumer) pausePartition(client *kgo.Client, key workerKey) bool {
 // бы оставить её на паузе навсегда, если воркера всё-таки пересоздали, и
 // наоборот — снять паузу с партиции, чей отравленный воркер жив и продолжает
 // выбрасывать записи.
-func (c *KafkaConsumer) resumePartition(client *kgo.Client, key workerKey) {
+func (c *Consumer) resumePartition(client *kgo.Client, key workerKey) {
 	c.pausedMu.Lock()
 
 	_, wasPaused := c.paused[key]
@@ -642,7 +642,7 @@ func (c *KafkaConsumer) resumePartition(client *kgo.Client, key workerKey) {
 // Отдельный метод, а не две строки в processRecord: это единственная точка,
 // где на каждое сообщение трогаются оба инструмента разом, и её цена
 // измеряется бенчмарком.
-func (c *KafkaConsumer) recordOutcome(ctx context.Context, topic, status string, elapsed time.Duration) {
+func (c *Consumer) recordOutcome(ctx context.Context, topic, status string, elapsed time.Duration) {
 	// Один поиск в кэше на оба инструмента: набор атрибутов у них общий.
 	opts := c.opts.get(topic, status)
 
@@ -651,7 +651,7 @@ func (c *KafkaConsumer) recordOutcome(ctx context.Context, topic, status string,
 }
 
 // countMessage инкрементирует счётчик исходов обработки.
-func (c *KafkaConsumer) countMessage(ctx context.Context, topic, status string) {
+func (c *Consumer) countMessage(ctx context.Context, topic, status string) {
 	c.metrics.processed.Add(ctx, 1, c.opts.get(topic, status).add...)
 }
 
@@ -662,7 +662,7 @@ func (c *KafkaConsumer) countMessage(ctx context.Context, topic, status string) 
 // сделанных вызовов обработчика: судьбу сообщения решает resolveFailure, и это
 // единственный способ довести до его записи в журнале, сколько попыток стоило
 // сообщение.
-func (c *KafkaConsumer) runHandler(
+func (c *Consumer) runHandler(
 	ctx context.Context, handler ConsumerHandler, msg IncomingMessage, span trace.Span, log *recordLogger,
 ) (bool, int, error) {
 	maxRetries := c.config.Consumer.HandlerMaxRetries
@@ -716,7 +716,7 @@ func (c *KafkaConsumer) runHandler(
 // времени: «одно сообщение крутится сутки» стало бы неотличимо от «упало N
 // разных». Сами повторы при этом не молчат — каждый пишет Warn с текстом
 // паники, а спан получает её от runHandler на исчерпании.
-func (c *KafkaConsumer) callHandler(
+func (c *Consumer) callHandler(
 	ctx context.Context, handler ConsumerHandler, msg IncomingMessage, attempt int,
 ) (err error) {
 	defer func() {

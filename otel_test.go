@@ -29,7 +29,7 @@ func TestDurationHistogramsDeclareExplicitBuckets(t *testing.T) { //nolint:paral
 		t.Fatalf("newConsumerMetrics: %v", err)
 	}
 
-	p := &KafkaProducer{}
+	p := &Producer{}
 	if err := p.initMetrics(otel.GetMeterProvider().Meter(instrumentationName)); err != nil {
 		t.Fatalf("initMetrics: %v", err)
 	}

@@ -22,7 +22,7 @@ import (
 // resumePartition. Балансировщик franz-go по умолчанию кооперативный, и
 // assigned содержит только вновь добавленные партиции: снятие паузы по этому
 // списку промахивалось бы мимо всех, кто остался за тем же экземпляром.
-func (c *KafkaConsumer) onPartitionsAssigned(_ context.Context, client *kgo.Client, assigned map[string][]int32) {
+func (c *Consumer) onPartitionsAssigned(_ context.Context, client *kgo.Client, assigned map[string][]int32) {
 	for topic, partitions := range assigned {
 		for _, partition := range partitions {
 			c.worker(client, workerKey{topic: topic, partition: partition})
@@ -42,7 +42,7 @@ func (c *KafkaConsumer) onPartitionsAssigned(_ context.Context, client *kgo.Clie
 // OnPartitionsRevoked отключает встроенный defaultRevoke franz-go вместе с его
 // финальным синхронным коммитом, и без явного вызова отмеченные оффсеты
 // потерялись бы вместе с сессией.
-func (c *KafkaConsumer) onPartitionsRevoked(ctx context.Context, client *kgo.Client, revoked map[string][]int32) {
+func (c *Consumer) onPartitionsRevoked(ctx context.Context, client *kgo.Client, revoked map[string][]int32) {
 	drainCtx, cancelDrain := c.rebalanceBudget(ctx)
 	c.stopWorkers(drainCtx, client, revoked)
 	cancelDrain()
@@ -75,7 +75,7 @@ func (c *KafkaConsumer) onPartitionsRevoked(ctx context.Context, client *kgo.Cli
 // Коммита здесь нет намеренно: партиции потеряны вместе с сессией группы, и
 // коммит либо будет отвергнут координатором, либо перезапишет оффсет,
 // принадлежащий уже другому участнику.
-func (c *KafkaConsumer) onPartitionsLost(ctx context.Context, client *kgo.Client, lost map[string][]int32) {
+func (c *Consumer) onPartitionsLost(ctx context.Context, client *kgo.Client, lost map[string][]int32) {
 	ctx, cancel := c.rebalanceBudget(ctx)
 	defer cancel()
 
@@ -101,7 +101,7 @@ func (c *KafkaConsumer) onPartitionsLost(ctx context.Context, client *kgo.Client
 // зависший обработчик держал бы колбэк дольше RebalanceTimeout, координатор
 // исключил бы участника из группы, и вместо управляемого отзыва партиций
 // случился бы onLost — то есть худший из двух исходов наступал бы сам собой.
-func (c *KafkaConsumer) rebalanceBudget(ctx context.Context) (context.Context, context.CancelFunc) {
+func (c *Consumer) rebalanceBudget(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, c.config.Consumer.RebalanceTimeout)
 }
 
@@ -114,7 +114,7 @@ type keyedWorker struct {
 
 // stopWorkers мягко останавливает воркеров перечисленных партиций и дожидается
 // их выхода.
-func (c *KafkaConsumer) stopWorkers(ctx context.Context, client *kgo.Client, partitions map[string][]int32) {
+func (c *Consumer) stopWorkers(ctx context.Context, client *kgo.Client, partitions map[string][]int32) {
 	c.workersMu.Lock()
 
 	stopped := make([]keyedWorker, 0, len(partitions))
@@ -136,7 +136,7 @@ func (c *KafkaConsumer) stopWorkers(ctx context.Context, client *kgo.Client, par
 }
 
 // stopAllWorkers мягко останавливает всех воркеров.
-func (c *KafkaConsumer) stopAllWorkers(ctx context.Context, client *kgo.Client) {
+func (c *Consumer) stopAllWorkers(ctx context.Context, client *kgo.Client) {
 	c.workersMu.Lock()
 
 	stopped := make([]keyedWorker, 0, len(c.workers))
@@ -156,7 +156,7 @@ func (c *KafkaConsumer) stopAllWorkers(ctx context.Context, client *kgo.Client) 
 //
 // Сначала закрываются все очереди, и лишь потом идёт ожидание: иначе воркеры
 // дренировались бы по очереди, а не параллельно.
-func (c *KafkaConsumer) closeAndAwait(ctx context.Context, client *kgo.Client, stopped []keyedWorker) {
+func (c *Consumer) closeAndAwait(ctx context.Context, client *kgo.Client, stopped []keyedWorker) {
 	for _, kw := range stopped {
 		kw.worker.stop()
 	}
@@ -181,7 +181,7 @@ func (c *KafkaConsumer) closeAndAwait(ctx context.Context, client *kgo.Client, s
 // текущее сообщение — оно всё равно не отмечено и приедет снова. Но и после
 // отмены его выхода приходится дождаться: живой воркер продолжает отмечать
 // оффсеты и трогать клиента параллельно с финальным коммитом и закрытием.
-func (c *KafkaConsumer) awaitWorkers(ctx context.Context, stopped []keyedWorker) {
+func (c *Consumer) awaitWorkers(ctx context.Context, stopped []keyedWorker) {
 	i := 0
 	for ; i < len(stopped); i++ {
 		if !waitClosed(ctx, stopped[i].worker.done) {
@@ -232,7 +232,7 @@ func (c *KafkaConsumer) awaitWorkers(ctx context.Context, stopped []keyedWorker)
 // разблокируются и dispatch, упёршийся в полную очередь, и сам воркер, если он
 // стоял на приёме. Не помочь она может только тогда, когда цикл висит в чужом
 // коде, отмену не проверяющем, — в slog.Handler или в экспортёре метрик.
-func (c *KafkaConsumer) awaitPollLoop(ctx context.Context) bool {
+func (c *Consumer) awaitPollLoop(ctx context.Context) bool {
 	if waitClosed(ctx, c.loopDone) {
 		return true
 	}

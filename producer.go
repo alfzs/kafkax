@@ -54,7 +54,7 @@ type MessageProducer interface {
 	Close() error
 }
 
-// KafkaProducer — продюсер поверх *kgo.Client.
+// Producer — продюсер поверх *kgo.Client.
 //
 // Между вызовом и клиентом нет собственного слоя очередей и воркеров: он
 // дублировал бы то, что клиент Kafka делает сам — батчинг, упорядочивание по
@@ -64,7 +64,7 @@ type MessageProducer interface {
 //
 // SendMessage вызывает ProduceSync, а батчингом, повторами и лимитом буфера
 // занимается franz-go.
-type KafkaProducer struct {
+type Producer struct {
 	client *kgo.Client
 	logger *slog.Logger
 
@@ -92,12 +92,12 @@ type KafkaProducer struct {
 
 // Проверка на этапе компиляции, а не в тестах: интерфейс объявлен в этом же
 // пакете, и рассинхрон с реализацией — опечатка, а не смена контракта.
-var _ MessageProducer = (*KafkaProducer)(nil)
+var _ MessageProducer = (*Producer)(nil)
 
-// NewKafkaProducer создаёт продюсер и подключается к брокерам лениво:
+// NewProducer создаёт продюсер и подключается к брокерам лениво:
 // franz-go не ходит в сеть при создании клиента, так что ошибка здесь —
 // всегда ошибка конфигурации, а не доступности кластера.
-func NewKafkaProducer(config Config) (*KafkaProducer, error) {
+func NewProducer(config Config) (*Producer, error) {
 	// Не оборачивается: у агрегата валидации Unwrap() []error, и fmt.Errorf
 	// подменил бы его на Unwrap() error — документированный разбор списка
 	// перестал бы работать ровно там, где он нужен.
@@ -115,7 +115,7 @@ func NewKafkaProducer(config Config) (*KafkaProducer, error) {
 	tel := newTelemetry(config.ClientID, "")
 	opts = append(opts, kgo.WithHooks(tel.hooks...))
 
-	p := &KafkaProducer{
+	p := &Producer{
 		logger:          logger,
 		messageTimeout:  config.Producer.MessageTimeout,
 		flushTimeout:    config.Producer.FlushTimeout,
@@ -147,7 +147,7 @@ func NewKafkaProducer(config Config) (*KafkaProducer, error) {
 // Счётчика kafkax.producer.panics здесь нет: собственных горутин у продюсера
 // не заведено, восстанавливать паники негде и не из чего. Config.OnPanic
 // вызывается только консьюмером.
-func (p *KafkaProducer) initMetrics(meter metric.Meter) error {
+func (p *Producer) initMetrics(meter metric.Meter) error {
 	reg := &instrumentRegistry{}
 	p.opts = newOptsCache(producerOptsLimit)
 
@@ -196,7 +196,7 @@ func (p *KafkaProducer) initMetrics(meter metric.Meter) error {
 // Дедлайн ctx этот бюджет только сокращает: срабатывает тот из двух, который
 // раньше. Отмена ctx возвращает context.Canceled без сентинела пакета —
 // отменил отправку сам вызывающий, а не Kafka.
-func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) (err error) {
+func (p *Producer) SendMessage(ctx context.Context, req PublishRequest) (err error) {
 	if !p.acquire() {
 		return fmt.Errorf("sending message: %w", ErrProducerClosed)
 	}
@@ -288,7 +288,7 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) (er
 // Ноль в messageTimeout сделал бы ветку неэквивалентной (свой контекст истёк
 // бы немедленно, а чужой — нет), но валидация конфигурации требует минимум 1s,
 // см. producerErrors.
-func (p *KafkaProducer) sendContext(ctx context.Context) (context.Context, context.CancelFunc) {
+func (p *Producer) sendContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= p.messageTimeout {
 		// Отменять нечего: контекст чужой. Пустая функция без захватов
 		// компилируется в статическое значение и не аллоцирует, поэтому
@@ -305,7 +305,7 @@ func (p *KafkaProducer) sendContext(ctx context.Context) (context.Context, conte
 // Вынесено из тела defer в SendMessage отдельным методом, потому что это
 // единственная точка учёта исхода на горячем пути: её цена измеряется
 // бенчмарком, а измерить замыкание внутри defer нечем.
-func (p *KafkaProducer) recordSend(ctx context.Context, topic string, elapsed time.Duration, err error) {
+func (p *Producer) recordSend(ctx context.Context, topic string, elapsed time.Duration, err error) {
 	// Два обращения к кэшу, а не одно: у счётчиков доставки атрибут только
 	// topic — status у них был бы избыточен (само имя инструмента и есть
 	// исход), а у гистограммы он нужен, иначе таймауты сливаются с успехами.
@@ -324,12 +324,12 @@ func (p *KafkaProducer) recordSend(ctx context.Context, topic string, elapsed ti
 }
 
 // reject считает сообщение, отвергнутое валидацией входа.
-func (p *KafkaProducer) reject(ctx context.Context, reason string) {
+func (p *Producer) reject(ctx context.Context, reason string) {
 	p.rejected.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
 }
 
 // acquire регистрирует отправку, если продюсер ещё принимает сообщения.
-func (p *KafkaProducer) acquire() bool {
+func (p *Producer) acquire() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -355,7 +355,7 @@ func (p *KafkaProducer) acquire() bool {
 // приводят к одному и тому же ErrDeliveryTimeout, но означают разные проблемы
 // (мал бюджет вызова против неспособности клиента дослать запись), и без
 // причины они неразличимы.
-func (p *KafkaProducer) produceError(topic string, err error) error {
+func (p *Producer) produceError(topic string, err error) error {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, kgo.ErrRecordTimeout):
 		return fmt.Errorf("sending message: %w: %w", ErrDeliveryTimeout, err)
@@ -388,7 +388,7 @@ func (p *KafkaProducer) produceError(topic string, err error) error {
 // Producer.FlushTimeout ограничивает сверху только вторую. Иначе закрытие
 // продюсера могло бы занять GracefulTimeout + FlushTimeout, а вызывающий,
 // который завёл общий бюджет на остановку приложения, ждёт одного числа.
-func (p *KafkaProducer) Close() error {
+func (p *Producer) Close() error {
 	p.mu.Lock()
 	if p.closing {
 		p.mu.Unlock()
@@ -421,7 +421,7 @@ func (p *KafkaProducer) Close() error {
 // Каждый такой вызов ограничен собственным MessageTimeout, так что ожидание
 // конечно и без бюджета; бюджет здесь — защита от вызывающего, который
 // передал в SendMessage контекст, живущий дольше, чем весь shutdown.
-func (p *KafkaProducer) awaitInflight(deadline time.Time) {
+func (p *Producer) awaitInflight(deadline time.Time) {
 	done := make(chan struct{})
 
 	go func() {
@@ -444,7 +444,7 @@ func (p *KafkaProducer) awaitInflight(deadline time.Time) {
 // FlushError.Remaining, а не текстом: иначе оно либо оставалось бы в строке
 // лога, не связанной с ErrFlushIncomplete, либо плодило по шаблону сообщения
 // на каждое своё значение.
-func (p *KafkaProducer) flush(deadline time.Time) error {
+func (p *Producer) flush(deadline time.Time) error {
 	budget := min(time.Until(deadline), p.flushTimeout)
 	if budget <= 0 {
 		return fmt.Errorf("closing producer: %w: %w",

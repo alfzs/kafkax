@@ -25,7 +25,7 @@ const prodHeaderRetry = "x-retry"
 // prodFetchRecords вычитывает из топика ровно want записей сырым клиентом
 // franz-go.
 //
-// Читает не KafkaConsumer: тест продюсера, проверяющий себя через консьюмер
+// Читает не Consumer: тест продюсера, проверяющий себя через консьюмер
 // того же пакета, зелёный и при симметричной ошибке в обоих — например если бы
 // продюсер и консьюмер одинаково перепутали местами ключ и значение.
 // Группы нет намеренно: координация группы добавила бы к тесту продюсера
@@ -707,7 +707,7 @@ func TestProducerSendMessageBrokerError(t *testing.T) {
 // Спан publish создаёт kotel, а не пакет.
 //
 // Своего трейсинга у пакета нет, и единственное, что удерживает спан на
-// месте, — регистрация хуков kotel в NewKafkaProducer. Тест ловит их пропажу;
+// месте, — регистрация хуков kotel в NewProducer. Тест ловит их пропажу;
 // содержимое спана проверяет kotel у себя.
 //
 //nolint:paralleltest // подменяет глобальный TracerProvider
@@ -720,7 +720,7 @@ func TestProducerSendMessageStartsSpan(t *testing.T) {
 	otel.SetTracerProvider(prodTracerProvider{tracer: tracer})
 	t.Cleanup(func() { otel.SetTracerProvider(prev) })
 
-	// Провайдер читается в NewKafkaProducer, поэтому продюсер создаётся уже
+	// Провайдер читается в NewProducer, поэтому продюсер создаётся уже
 	// после подмены.
 	p := mustProducer(t, testConfig(t, brokers...))
 

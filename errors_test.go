@@ -40,7 +40,7 @@ var errSentinels = map[string]error{
 // конструктор. Если функция когда-нибудь начнёт читать поля получателя, этот
 // вызов упадёт паникой — что и будет сигналом пересмотреть тест.
 func errProduceError(err error) error {
-	return (&KafkaProducer{}).produceError(testTopic, err)
+	return (&Producer{}).produceError(testTopic, err)
 }
 
 func TestSentinelsAreDistinct(t *testing.T) {
@@ -517,7 +517,7 @@ func TestErrorPrefixesFollowGerundRule(t *testing.T) {
 func TestConfigAggregateStaysUnprefixed(t *testing.T) {
 	t.Parallel()
 
-	_, err := NewKafkaConsumer(Config{})
+	_, err := NewConsumer(Config{})
 	if err == nil {
 		t.Fatal("пустая конфигурация принята")
 	}

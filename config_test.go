@@ -190,7 +190,7 @@ func TestConfigValidateSectionsAreIndependent(t *testing.T) {
 	// Гарантия, ради которой конструкторы вызывают не Validate, а свою
 	// ролевую проверку: продюсеру незачем требовать consumer.group, а
 	// консьюмеру — producer.compression_type. Если проверки склеятся,
-	// NewKafkaProducer начнёт отказывать на конфиге без секции Consumer.
+	// NewProducer начнёт отказывать на конфиге без секции Consumer.
 	t.Run("дефект consumer не мешает продюсеру", func(t *testing.T) {
 		t.Parallel()
 
@@ -474,27 +474,27 @@ func TestConfigValidateProducerFields(t *testing.T) {
 
 	tests := []struct {
 		name   string
-		mutate func(*Producer)
+		mutate func(*ProducerConfig)
 		want   string
 	}{
 		{
 			name:   "нулевой message_timeout",
-			mutate: func(p *Producer) { p.MessageTimeout = 0 },
+			mutate: func(p *ProducerConfig) { p.MessageTimeout = 0 },
 			want:   cfgLabel("Producer.MessageTimeout") + " must be positive",
 		},
 		{
 			name:   "отрицательный flush_timeout",
-			mutate: func(p *Producer) { p.FlushTimeout = -time.Second },
+			mutate: func(p *ProducerConfig) { p.FlushTimeout = -time.Second },
 			want:   cfgLabel("Producer.FlushTimeout") + " must be positive",
 		},
 		{
 			name:   "нулевой ack_timeout",
-			mutate: func(p *Producer) { p.AckTimeout = 0 },
+			mutate: func(p *ProducerConfig) { p.AckTimeout = 0 },
 			want:   cfgLabel("Producer.AckTimeout") + " must be positive",
 		},
 		{
 			name:   "нулевой max_buffered_records",
-			mutate: func(p *Producer) { p.MaxBufferedRecords = 0 },
+			mutate: func(p *ProducerConfig) { p.MaxBufferedRecords = 0 },
 			want:   cfgLabel("Producer.MaxBufferedRecords") + " must be positive",
 		},
 		{
@@ -502,22 +502,22 @@ func TestConfigValidateProducerFields(t *testing.T) {
 			// выключенной идемпотентности, и ошибка всплыла бы без указания
 			// на поле конфигурации.
 			name:   "нулевой max_inflight",
-			mutate: func(p *Producer) { p.MaxInflight = 0 },
+			mutate: func(p *ProducerConfig) { p.MaxInflight = 0 },
 			want:   cfgLabel("Producer.MaxInflight") + " must be positive",
 		},
 		{
 			name:   "отрицательный max_retries",
-			mutate: func(p *Producer) { p.MaxRetries = -1 },
+			mutate: func(p *ProducerConfig) { p.MaxRetries = -1 },
 			want:   cfgLabel("Producer.MaxRetries") + " must not be negative",
 		},
 		{
 			name:   "нулевой batch_bytes",
-			mutate: func(p *Producer) { p.BatchBytes = 0 },
+			mutate: func(p *ProducerConfig) { p.BatchBytes = 0 },
 			want:   cfgLabel("Producer.BatchBytes") + " must be positive",
 		},
 		{
 			name:   "неизвестный compression_type",
-			mutate: func(p *Producer) { p.CompressionType = "brotli" },
+			mutate: func(p *ProducerConfig) { p.CompressionType = "brotli" },
 			want:   cfgLabel("Producer.CompressionType") + " must be one of",
 		},
 		{
@@ -525,24 +525,24 @@ func TestConfigValidateProducerFields(t *testing.T) {
 			// yaml, и незаполненное поле должно быть видно, а не молча
 			// превращаться в none.
 			name:   "пустой compression_type",
-			mutate: func(p *Producer) { p.CompressionType = "" },
+			mutate: func(p *ProducerConfig) { p.CompressionType = "" },
 			want:   cfgLabel("Producer.CompressionType") + " must be one of",
 		},
 		{
 			name:   "нулевой max_retries допустим",
-			mutate: func(p *Producer) { p.MaxRetries = 0 },
+			mutate: func(p *ProducerConfig) { p.MaxRetries = 0 },
 		},
 		{
 			// opts.go ставит kgo.MaxBufferedBytes только при значении > 0, так
 			// что минус означал бы «без лимита» — то же, что ноль, но не тем
 			// способом, каким это написано в godoc поля.
 			name:   "отрицательный max_buffered_bytes",
-			mutate: func(p *Producer) { p.MaxBufferedBytes = -1 },
+			mutate: func(p *ProducerConfig) { p.MaxBufferedBytes = -1 },
 			want:   cfgLabel("Producer.MaxBufferedBytes") + " must not be negative",
 		},
 		{
 			name:   "нулевой max_buffered_bytes допустим — это «без лимита»",
-			mutate: func(p *Producer) { p.MaxBufferedBytes = 0 },
+			mutate: func(p *ProducerConfig) { p.MaxBufferedBytes = 0 },
 		},
 	}
 
@@ -635,7 +635,7 @@ func TestConfigValidateAcksAndIdempotence(t *testing.T) {
 // пустая строка означает «конфиг обязан пройти».
 type consumerFieldCase struct {
 	name   string
-	mutate func(*Consumer)
+	mutate func(*ConsumerConfig)
 	want   string
 }
 
@@ -653,46 +653,46 @@ func consumerTimingFieldCases() []consumerFieldCase {
 	return []consumerFieldCase{
 		{
 			name:   "пустая группа",
-			mutate: func(c *Consumer) { c.Group = "" },
+			mutate: func(c *ConsumerConfig) { c.Group = "" },
 			want:   cfgLabel("Consumer.Group") + " must not be empty",
 		},
 		{
 			name:   "нулевой session_timeout",
-			mutate: func(c *Consumer) { c.SessionTimeout = 0 },
+			mutate: func(c *ConsumerConfig) { c.SessionTimeout = 0 },
 			want:   cfgLabel("Consumer.SessionTimeout") + " must be positive",
 		},
 		{
 			name:   "нулевой heartbeat_interval",
-			mutate: func(c *Consumer) { c.HeartbeatInterval = 0 },
+			mutate: func(c *ConsumerConfig) { c.HeartbeatInterval = 0 },
 			want:   cfgLabel("Consumer.HeartbeatInterval") + " must be positive",
 		},
 		{
 			name:   "нулевой rebalance_timeout",
-			mutate: func(c *Consumer) { c.RebalanceTimeout = 0 },
+			mutate: func(c *ConsumerConfig) { c.RebalanceTimeout = 0 },
 			want:   cfgLabel("Consumer.RebalanceTimeout") + " must be positive",
 		},
 		{
 			name:   "нулевой commit_interval",
-			mutate: func(c *Consumer) { c.CommitInterval = 0 },
+			mutate: func(c *ConsumerConfig) { c.CommitInterval = 0 },
 			want:   cfgLabel("Consumer.CommitInterval") + " must be positive",
 		},
 		{
 			name:   "нулевой max_wait",
-			mutate: func(c *Consumer) { c.MaxWait = 0 },
+			mutate: func(c *ConsumerConfig) { c.MaxWait = 0 },
 			want:   cfgLabel("Consumer.MaxWait") + " must be positive",
 		},
 		{
 			// Heartbeat не короче сессии означает, что группа развалится по
 			// таймауту раньше первого удара сердца.
 			name: "heartbeat_interval равен session_timeout",
-			mutate: func(c *Consumer) {
+			mutate: func(c *ConsumerConfig) {
 				c.HeartbeatInterval = c.SessionTimeout
 			},
 			want: "must not exceed a third of Consumer.SessionTimeout",
 		},
 		{
 			name: "heartbeat_interval больше session_timeout",
-			mutate: func(c *Consumer) {
+			mutate: func(c *ConsumerConfig) {
 				c.HeartbeatInterval = c.SessionTimeout + time.Second
 			},
 			want: "must not exceed a third of Consumer.SessionTimeout",
@@ -703,7 +703,7 @@ func consumerTimingFieldCases() []consumerFieldCase {
 			// Прежняя проверка такую конфигурацию пропускала, хотя godoc
 			// запрещал её с самого начала.
 			name: "heartbeat_interval между третью session_timeout и им самим",
-			mutate: func(c *Consumer) {
+			mutate: func(c *ConsumerConfig) {
 				c.HeartbeatInterval = c.SessionTimeout/3 + time.Millisecond
 			},
 			want: "must not exceed a third of Consumer.SessionTimeout",
@@ -712,39 +712,39 @@ func consumerTimingFieldCases() []consumerFieldCase {
 			// Отрицательное значение уронило бы make(chan, n) паникой уже
 			// после того, как конструктор вернул nil-ошибку.
 			name:   "отрицательный message_queue_size",
-			mutate: func(c *Consumer) { c.MessageQueueSize = -1 },
+			mutate: func(c *ConsumerConfig) { c.MessageQueueSize = -1 },
 			want:   cfgLabel("Consumer.MessageQueueSize") + " must be positive",
 		},
 		{
 			name:   "нулевой max_poll_records",
-			mutate: func(c *Consumer) { c.MaxPollRecords = 0 },
+			mutate: func(c *ConsumerConfig) { c.MaxPollRecords = 0 },
 			want:   cfgLabel("Consumer.MaxPollRecords") + " must be positive",
 		},
 		{
 			name:   "неизвестный initial_offset",
-			mutate: func(c *Consumer) { c.InitialOffset = "beginning" },
+			mutate: func(c *ConsumerConfig) { c.InitialOffset = "beginning" },
 			want:   cfgLabel("Consumer.InitialOffset") + " must be",
 		},
 		{
 			name:   "пустой initial_offset",
-			mutate: func(c *Consumer) { c.InitialOffset = "" },
+			mutate: func(c *ConsumerConfig) { c.InitialOffset = "" },
 			want:   cfgLabel("Consumer.InitialOffset") + " must be",
 		},
 		{
 			name:   "неизвестный isolation_level",
-			mutate: func(c *Consumer) { c.IsolationLevel = "read_dirty" },
+			mutate: func(c *ConsumerConfig) { c.IsolationLevel = "read_dirty" },
 			want:   cfgLabel("Consumer.IsolationLevel") + " must be",
 		},
 		{
 			name:   "handler_max_retries меньше -1",
-			mutate: func(c *Consumer) { c.HandlerMaxRetries = -2 },
+			mutate: func(c *ConsumerConfig) { c.HandlerMaxRetries = -2 },
 			want:   cfgLabel("Consumer.HandlerMaxRetries") + " must be -1",
 		},
 		{
 			// Ретраи включены, а паузы между ними нет: партиция закрутилась бы
 			// в busy loop на первом же отравленном сообщении.
 			name: "ретраи без задержки",
-			mutate: func(c *Consumer) {
+			mutate: func(c *ConsumerConfig) {
 				c.HandlerMaxRetries = 3
 				c.HandlerRetryDelay = 0
 			},
@@ -754,14 +754,14 @@ func consumerTimingFieldCases() []consumerFieldCase {
 			// При выключенных ретраях задержка не используется, и требовать
 			// её значило бы отвергать вполне рабочий конфиг.
 			name: "нулевая задержка без ретраев",
-			mutate: func(c *Consumer) {
+			mutate: func(c *ConsumerConfig) {
 				c.HandlerMaxRetries = 0
 				c.HandlerRetryDelay = 0
 			},
 		},
 		{
 			name: "бесконечные ретраи с задержкой",
-			mutate: func(c *Consumer) {
+			mutate: func(c *ConsumerConfig) {
 				c.HandlerMaxRetries = -1
 				c.HandlerRetryDelay = time.Second
 			},
@@ -770,11 +770,11 @@ func consumerTimingFieldCases() []consumerFieldCase {
 			// Регистр значений из yaml не фиксирован, сравнение идёт через
 			// ToLower.
 			name:   "initial_offset в верхнем регистре",
-			mutate: func(c *Consumer) { c.InitialOffset = "LATEST" },
+			mutate: func(c *ConsumerConfig) { c.InitialOffset = "LATEST" },
 		},
 		{
 			name:   "isolation_level в верхнем регистре",
-			mutate: func(c *Consumer) { c.IsolationLevel = "READ_COMMITTED" },
+			mutate: func(c *ConsumerConfig) { c.IsolationLevel = "READ_COMMITTED" },
 		},
 	}
 }
@@ -789,22 +789,22 @@ func consumerFetchSizeCases() []consumerFieldCase {
 	return []consumerFieldCase{
 		{
 			name:   "нулевой min_bytes",
-			mutate: func(c *Consumer) { c.MinBytes = 0 },
+			mutate: func(c *ConsumerConfig) { c.MinBytes = 0 },
 			want:   cfgLabel("Consumer.MinBytes") + " must be positive",
 		},
 		{
 			name:   "отрицательный min_bytes",
-			mutate: func(c *Consumer) { c.MinBytes = -1 },
+			mutate: func(c *ConsumerConfig) { c.MinBytes = -1 },
 			want:   cfgLabel("Consumer.MinBytes") + " must be positive",
 		},
 		{
 			name:   "нулевой max_bytes",
-			mutate: func(c *Consumer) { c.MaxBytes = 0 },
+			mutate: func(c *ConsumerConfig) { c.MaxBytes = 0 },
 			want:   cfgLabel("Consumer.MaxBytes") + " must be positive",
 		},
 		{
 			name:   "нулевой max_partition_bytes",
-			mutate: func(c *Consumer) { c.MaxPartitionBytes = 0 },
+			mutate: func(c *ConsumerConfig) { c.MaxPartitionBytes = 0 },
 			want:   cfgLabel("Consumer.MaxPartitionBytes") + " must be positive",
 		},
 		{
@@ -812,14 +812,14 @@ func consumerFetchSizeCases() []consumerFieldCase {
 			// (kgo/config.go), то есть настройка перестаёт значить написанное, и
 			// узнать об этом можно только по трафику.
 			name:   "max_partition_bytes больше max_bytes",
-			mutate: func(c *Consumer) { c.MaxPartitionBytes = c.MaxBytes + 1 },
+			mutate: func(c *ConsumerConfig) { c.MaxPartitionBytes = c.MaxBytes + 1 },
 			want:   "must not exceed Consumer.MaxBytes=1048576, got 1048577",
 		},
 		{
 			// Равенство — законная граница: одна партиция вправе занять ответ
 			// целиком.
 			name:   "max_partition_bytes равен max_bytes",
-			mutate: func(c *Consumer) { c.MaxPartitionBytes = c.MaxBytes },
+			mutate: func(c *ConsumerConfig) { c.MaxPartitionBytes = c.MaxBytes },
 		},
 	}
 }

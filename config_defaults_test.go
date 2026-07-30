@@ -162,12 +162,12 @@ func TestValidationErrorsCarryInvalidConfigSentinel(t *testing.T) {
 	cases := map[string]error{
 		"Validate": Config{}.Validate(),
 		"validateProducer": func() error {
-			_, err := NewKafkaProducer(Config{})
+			_, err := NewProducer(Config{})
 
 			return err
 		}(),
 		"validateConsumer": func() error {
-			_, err := NewKafkaConsumer(Config{})
+			_, err := NewConsumer(Config{})
 
 			return err
 		}(),

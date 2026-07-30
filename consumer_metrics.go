@@ -217,7 +217,7 @@ func newConsumerMetrics(meter metric.Meter) (consumerMetrics, error) {
 // MaxWait=500ms это минимум две в секунду на партицию, а при мгновенном ответе
 // брокера на порядки больше. Счётчик при этом мерил бы частоту опроса вместо
 // масштаба проблемы.
-func (c *KafkaConsumer) reportFetchError(topic string, partition int32, err error) {
+func (c *Consumer) reportFetchError(topic string, partition int32, err error) {
 	if errors.Is(err, context.Canceled) || errors.Is(err, kgo.ErrClientClosed) {
 		return
 	}
@@ -315,7 +315,7 @@ func fetchErrorReason(err error) string {
 // структуры, свежие на каждом фетче, и == сравнивал бы адреса. Текст же
 // содержит и код ошибки, и её параметры, поэтому смена причины отказа
 // распознаётся как новый эпизод.
-func (c *KafkaConsumer) firstReport(key workerKey, err error) bool {
+func (c *Consumer) firstReport(key workerKey, err error) bool {
 	text := err.Error()
 
 	c.pausedMu.Lock()
@@ -334,7 +334,7 @@ func (c *KafkaConsumer) firstReport(key workerKey, err error) bool {
 //
 // Без сброса повторение той же ошибки после выздоровления не было бы сообщено
 // вовсе — дедуп превратился бы в «сообщаем один раз за жизнь процесса».
-func (c *KafkaConsumer) clearFetchError(key workerKey) {
+func (c *Consumer) clearFetchError(key workerKey) {
 	c.pausedMu.Lock()
 	defer c.pausedMu.Unlock()
 

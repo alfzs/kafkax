@@ -105,7 +105,7 @@ func TestConsumerHandlerSnapshotRejectedRegistrations(t *testing.T) {
 func TestConsumerHandlerSnapshotZeroValue(t *testing.T) {
 	t.Parallel()
 
-	var c KafkaConsumer
+	var c Consumer
 
 	if _, ok := c.handler(testTopic); ok {
 		t.Fatal("нулевой консьюмер нашёл обработчик в пустом снимке")

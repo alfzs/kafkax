@@ -34,7 +34,7 @@ import (
 // Прямой вызов здесь не годится: оба сценария держат внутри консьюмера что-то
 // незавершённое, и Stop, который всё-таки решит этого дождаться, обязан валить
 // тест по своему потолку, а не вешать весь прогон до общего таймаута go test.
-func consStopAsync(t *testing.T, c *KafkaConsumer) error {
+func consStopAsync(t *testing.T, c *Consumer) error {
 	t.Helper()
 
 	stopped := make(chan error, 1)

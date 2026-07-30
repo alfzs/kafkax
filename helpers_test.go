@@ -94,7 +94,7 @@ func testConfig(t *testing.T, brokers ...string) Config {
 		GracefulTimeout: 5 * time.Second,
 		DialTimeout:     2 * time.Second,
 		Logger:          testLogger(t),
-		Producer: Producer{
+		Producer: ProducerConfig{
 			RequiredAcks:       -1,
 			EnableIdempotence:  true,
 			MaxInflight:        5,
@@ -108,7 +108,7 @@ func testConfig(t *testing.T, brokers ...string) Config {
 			MessageTimeout:     3 * time.Second,
 			FlushTimeout:       3 * time.Second,
 		},
-		Consumer: Consumer{
+		Consumer: ConsumerConfig{
 			Group:             testGroup,
 			InitialOffset:     "earliest",
 			MinBytes:          1,
@@ -146,12 +146,12 @@ func captureMetrics(t *testing.T) *recordedMetrics {
 }
 
 // mustProducer создаёт продюсер и закрывает его по завершении теста.
-func mustProducer(t *testing.T, cfg Config) *KafkaProducer {
+func mustProducer(t *testing.T, cfg Config) *Producer {
 	t.Helper()
 
-	p, err := NewKafkaProducer(cfg)
+	p, err := NewProducer(cfg)
 	if err != nil {
-		t.Fatalf("NewKafkaProducer: %v", err)
+		t.Fatalf("NewProducer: %v", err)
 	}
 
 	// Провал закрытия в Cleanup сам по себе тест не валит: сценарий уже
@@ -170,12 +170,12 @@ func mustProducer(t *testing.T, cfg Config) *KafkaProducer {
 // mustConsumer создаёт консьюмер и останавливает его по завершении теста.
 // Повторный Stop идемпотентен, поэтому Cleanup не мешает тесту остановить
 // консьюмер самому.
-func mustConsumer(t *testing.T, cfg Config) *KafkaConsumer {
+func mustConsumer(t *testing.T, cfg Config) *Consumer {
 	t.Helper()
 
-	c, err := NewKafkaConsumer(cfg)
+	c, err := NewConsumer(cfg)
 	if err != nil {
-		t.Fatalf("NewKafkaConsumer: %v", err)
+		t.Fatalf("NewConsumer: %v", err)
 	}
 
 	t.Cleanup(func() {
@@ -189,7 +189,7 @@ func mustConsumer(t *testing.T, cfg Config) *KafkaConsumer {
 
 // mustAddHandler регистрирует обработчик и валит тест при отказе: AddHandler
 // в подготовительной части сценария — не то место, где ошибку можно потерять.
-func mustAddHandler(t *testing.T, c *KafkaConsumer, topic string, h ConsumerHandler, mws ...ConsumerMiddleware) {
+func mustAddHandler(t *testing.T, c *Consumer, topic string, h ConsumerHandler, mws ...ConsumerMiddleware) {
 	t.Helper()
 
 	if err := c.AddHandler(topic, h, mws...); err != nil {

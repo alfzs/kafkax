@@ -20,6 +20,27 @@ import "github.com/alfzs/kafkax/v2"
 
 Требуется Go 1.26+.
 
+## Миграция: имена типов
+
+Заикание `kafkax.KafkaProducer` убрано. Хорошие имена были заняты секциями
+конфигурации, поэтому переехали обе стороны:
+
+| Было | Стало |
+|---|---|
+| `kafkax.KafkaProducer` | `kafkax.Producer` |
+| `kafkax.KafkaConsumer` | `kafkax.Consumer` |
+| `kafkax.NewKafkaProducer` | `kafkax.NewProducer` |
+| `kafkax.NewKafkaConsumer` | `kafkax.NewConsumer` |
+| `kafkax.Producer` (секция конфигурации) | `kafkax.ProducerConfig` |
+| `kafkax.Consumer` (секция конфигурации) | `kafkax.ConsumerConfig` |
+
+**Имена полей `Config` не менялись:** `cfg.Producer` и `cfg.Consumer` работают
+как раньше, сменился только тип значения. Так `cfg.Producer.MaxRetries` остаётся
+читаемым — вариант с переименованием и поля дал бы `cfg.ProducerConfig.MaxRetries`.
+
+Переименование механическое, компилятор укажет каждое место. Ничего, кроме имён,
+в этом изменении нет: сигнатуры, поведение и набор методов прежние.
+
 ## Быстрый старт
 
 ### Продюсер
@@ -30,7 +51,7 @@ cfg := kafkax.Config{
     ClientID:        "my-service",
     GracefulTimeout: 3 * time.Minute,
     DialTimeout:     10 * time.Second,
-    Producer: kafkax.Producer{
+    Producer: kafkax.ProducerConfig{
         RequiredAcks:      -1,
         EnableIdempotence: true,
         MessageTimeout:    30 * time.Second,
@@ -38,7 +59,7 @@ cfg := kafkax.Config{
     },
 }
 
-producer, err := kafkax.NewKafkaProducer(cfg)
+producer, err := kafkax.NewProducer(cfg)
 if err != nil {
     log.Fatal(err)
 }
@@ -90,7 +111,7 @@ func (h *orderHandler) ProcessMessage(ctx context.Context, msg kafkax.IncomingMe
     return h.store(ctx, msg.Value)
 }
 
-cfg.Consumer = kafkax.Consumer{
+cfg.Consumer = kafkax.ConsumerConfig{
     Group:             "my-service.group",
     InitialOffset:     kafkax.OffsetEarliest,
     SessionTimeout:    45 * time.Second,
@@ -101,7 +122,7 @@ cfg.Consumer = kafkax.Consumer{
     HandlerRetryDelay: time.Second,
 }
 
-consumer, err := kafkax.NewKafkaConsumer(cfg)
+consumer, err := kafkax.NewConsumer(cfg)
 if err != nil {
     log.Fatal(err)
 }
@@ -679,7 +700,7 @@ cfg.Consumer.Group = "my-service.group"
 `Config.Validate()` проверяет обе секции сразу — для приложения, создающего из
 одного `Config` и продюсер, и консьюмер. Конструкторы вызывают проверку только
 своей роли: продюсеру незачем требовать `consumer.group`, консьюмеру —
-`producer.flush_timeout`. Поэтому `Config`, прошедший `NewKafkaProducer`, может
+`producer.flush_timeout`. Поэтому `Config`, прошедший `NewProducer`, может
 не пройти `Validate`.
 
 Ошибки собираются все разом, а не возвращаются по первой: иначе неполный конфиг
@@ -730,7 +751,7 @@ KAFKAX_SASL_PASSWORD=secret
 (`env-required`): без них `ReadEnv` вернёт ошибку и до конструктора дело не
 дойдёт. `KAFKAX_CONSUMER_GROUP` тегом не помечен — он обязателен только для
 консьюмера, и его отсутствие всплывает позже, при валидации конфигурации в
-`NewKafkaConsumer`.
+`NewConsumer`.
 
 ## Graceful shutdown
 

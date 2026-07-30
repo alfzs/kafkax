@@ -52,7 +52,7 @@ const consMarkerValue = "cons-marker"
 
 // consProducer — продюсер с ручным выбором партиции.
 //
-// Публичный KafkaProducer выбирает партицию по хешу ключа, а половина сценариев
+// Публичный Producer выбирает партицию по хешу ключа, а половина сценариев
 // здесь строится на том, что одна конкретная партиция встала, а соседняя
 // работает. Подбирать ключи под нужную партицию — хрупко, поэтому сырой клиент
 // franz-go с ManualPartitioner.
@@ -226,7 +226,7 @@ func consUpToMarker(values []string) []string {
 // фоне. Дожидается её именно блокирующий Stop из cleanup'а mustConsumer — без
 // него логи завершения и его обращения к фейковому брокеру пришлись бы на уже
 // закончившийся тест.
-func consStart(t *testing.T, c *KafkaConsumer) {
+func consStart(t *testing.T, c *Consumer) {
 	t.Helper()
 
 	if err := c.Start(t.Context()); err != nil {

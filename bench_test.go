@@ -94,10 +94,10 @@ func benchMeters() map[string]metric.Meter {
 
 // benchProducer собирает продюсер без клиента: recordSend трогает только
 // инструменты, поэтому всё остальное намеренно нулевое.
-func benchProducer(b *testing.B, meter metric.Meter) *KafkaProducer {
+func benchProducer(b *testing.B, meter metric.Meter) *Producer {
 	b.Helper()
 
-	p := &KafkaProducer{}
+	p := &Producer{}
 	if err := p.initMetrics(meter); err != nil {
 		b.Fatalf("initMetrics: %v", err)
 	}
@@ -107,12 +107,12 @@ func benchProducer(b *testing.B, meter metric.Meter) *KafkaProducer {
 
 // benchConsumer собирает консьюмер без клиента и с зарегистрированным
 // обработчиком: набор топиков консьюмера — это набор его обработчиков.
-func benchConsumer(b *testing.B, meter metric.Meter) *KafkaConsumer {
+func benchConsumer(b *testing.B, meter metric.Meter) *Consumer {
 	b.Helper()
 
-	// Поля повторяют NewKafkaConsumer в той части, которой касается путь
+	// Поля повторяют NewConsumer в той части, которой касается путь
 	// сообщения: клиент, конфигурация и жизненный контекст здесь не нужны.
-	c := &KafkaConsumer{opts: newOptsCache(0)}
+	c := &Consumer{opts: newOptsCache(0)}
 
 	m, err := newConsumerMetrics(meter)
 	if err != nil {
@@ -145,10 +145,10 @@ var benchLookupSink atomic.Int64
 // benchLookupConsumer собирает консьюмер ради одной только карты обработчиков:
 // поиск не трогает ни клиента, ни метрики. opts нужен потому, что AddHandler
 // прогревает кэш опций.
-func benchLookupConsumer(b *testing.B) *KafkaConsumer {
+func benchLookupConsumer(b *testing.B) *Consumer {
 	b.Helper()
 
-	c := &KafkaConsumer{opts: newOptsCache(0)}
+	c := &Consumer{opts: newOptsCache(0)}
 
 	for _, topic := range benchLookupTopics {
 		if err := c.AddHandler(topic, &mockHandler{}); err != nil {
@@ -241,7 +241,7 @@ func BenchmarkProducerRecordSend(b *testing.B) {
 //   - no_deadline — общий случай, полный context.WithTimeout. Он здесь как
 //     точка отсчёта: без него нулю в первой ветке не с чем сравниться.
 func BenchmarkProducerSendContext(b *testing.B) {
-	p := &KafkaProducer{messageTimeout: 30 * time.Second}
+	p := &Producer{messageTimeout: 30 * time.Second}
 
 	withDeadline, cancel := context.WithTimeout(b.Context(), time.Second)
 	defer cancel()

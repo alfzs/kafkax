@@ -144,9 +144,9 @@ func TestProducerCloseWaitsForAcceptedSends(t *testing.T) {
 	cfg := testConfig(t, brokers...)
 	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
 
-	p, err := NewKafkaProducer(cfg)
+	p, err := NewProducer(cfg)
 	if err != nil {
-		t.Fatalf("NewKafkaProducer: %v", err)
+		t.Fatalf("NewProducer: %v", err)
 	}
 
 	// Close идемпотентен и на повторе обязан вернуть nil, поэтому страховочное
@@ -226,9 +226,9 @@ func TestProducerCloseRaceWithSends(t *testing.T) {
 	cfg := testConfig(t, brokers...)
 	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
 
-	p, err := NewKafkaProducer(cfg)
+	p, err := NewProducer(cfg)
 	if err != nil {
-		t.Fatalf("NewKafkaProducer: %v", err)
+		t.Fatalf("NewProducer: %v", err)
 	}
 
 	// Close идемпотентен и на повторе обязан вернуть nil, поэтому страховочное
@@ -349,9 +349,9 @@ func TestProducerCloseFlushBudgetExhausted(t *testing.T) {
 	hook := &prodBufferedHook{}
 	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
 
-	p, err := NewKafkaProducer(cfg)
+	p, err := NewProducer(cfg)
 	if err != nil {
-		t.Fatalf("NewKafkaProducer: %v", err)
+		t.Fatalf("NewProducer: %v", err)
 	}
 
 	sendDone := make(chan error, 1)
@@ -624,9 +624,9 @@ func TestProducerCloseBoundedByGracefulTimeout(t *testing.T) {
 	hook := &prodBufferedHook{}
 	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
 
-	p, err := NewKafkaProducer(cfg)
+	p, err := NewProducer(cfg)
 	if err != nil {
-		t.Fatalf("NewKafkaProducer: %v", err)
+		t.Fatalf("NewProducer: %v", err)
 	}
 
 	sendDone := make(chan error, 1)
