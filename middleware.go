@@ -64,7 +64,7 @@ func MatchKeyMiddleware(parts ...encoding.KeyPart) ConsumerMiddleware {
 	return func(next ConsumerHandler) ConsumerHandler {
 		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
 			if err := want.ValidateLength(msg.Key); err != nil {
-				return fmt.Errorf("match key middleware: %w", err)
+				return fmt.Errorf("matching message key: %w", err)
 			}
 
 			if !want.Match(msg.Key) {

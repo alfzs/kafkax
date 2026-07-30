@@ -177,7 +177,7 @@ func (c Config) saslMechanism() (sasl.Mechanism, error) {
 	case SASLMechanismScramSHA512:
 		return scram.Auth{User: c.SASL.Username, Pass: c.SASL.Password}.AsSha512Mechanism(), nil
 	default:
-		return nil, fmt.Errorf("unsupported sasl.mechanism %q", c.SASL.Mechanism)
+		return nil, fmt.Errorf("unsupported %s %q", cfgField("SASL.Mechanism"), c.SASL.Mechanism)
 	}
 }
 
@@ -299,7 +299,8 @@ func compressionCodec(name string) (kgo.CompressionCodec, error) {
 		return kgo.ZstdCompression(), nil
 	default:
 		return kgo.CompressionCodec{}, fmt.Errorf(
-			"producer.compression_type must be one of %s, %s, %s, %s, %s; got %q",
+			"%s must be one of %s, %s, %s, %s, %s; got %q",
+			cfgField("Producer.CompressionType"),
 			CompressionNone, CompressionGzip, CompressionSnappy,
 			CompressionLZ4, CompressionZstd, name)
 	}
