@@ -514,8 +514,12 @@ func TestCommonOptsAttachSASL(t *testing.T) {
 		t.Fatalf("SASL-механизм не попал в опции клиента: %#v", mechs)
 	}
 
-	if got := mechs[0].Name(); got != "SCRAM-SHA-512" {
-		t.Errorf("Name() = %q, want %q", got, "SCRAM-SHA-512")
+	// Литерал, а не SASLMechanismScramSHA512: имя механизма едет к брокеру в
+	// протокольном кадре, и сверка константы с ней же ничего бы не сказала.
+	const wantMech = "SCRAM-SHA-512"
+
+	if got := mechs[0].Name(); got != wantMech {
+		t.Errorf("Name() = %q, want %q", got, wantMech)
 	}
 
 	cfg.SASL.Mechanism = "GSSAPI"
@@ -617,6 +621,86 @@ func TestCommonOptsWarnsOnUnencryptedSASL(t *testing.T) {
 
 			if !strings.Contains(got, tt.wantWarn) {
 				t.Errorf("в логе нет предупреждения %q:\n%s", tt.wantWarn, got)
+			}
+
+			if !strings.Contains(got, "level=WARN") {
+				t.Errorf("предупреждение записано не на уровне WARN:\n%s", got)
+			}
+		})
+	}
+}
+
+// TestCommonOptsWarnsOnInsecureTLS — отключённая проверка сертификата не
+// проходит молча.
+//
+// Предупреждение — единственный след этого решения в работающем процессе:
+// ошибкой оно не делается (отладочный сценарий законный), в метрики не идёт, а
+// сама конфигурация обычно приезжает из локального стенда и уезжает в прод
+// незамеченной. Проверяются оба входа в tlsConfig — секция TLS и готовый
+// Config.TLSConfig, — потому что предупреждение в них выдаётся разными
+// ветками, и потерять его можно в любой поодиночке.
+func TestCommonOptsWarnsOnInsecureTLS(t *testing.T) {
+	t.Parallel()
+
+	const wantWarn = "TLS certificate verification is disabled (InsecureSkipVerify)"
+
+	tests := []struct {
+		name     string
+		mutate   func(*Config)
+		wantWarn bool
+	}{
+		{
+			name:     "секция TLS с insecure_skip_verify",
+			mutate:   func(c *Config) { c.TLS = TLS{Enabled: true, InsecureSkipVerify: true} },
+			wantWarn: true,
+		},
+		{
+			name: "готовый TLSConfig с InsecureSkipVerify",
+			mutate: func(c *Config) {
+				c.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true} //nolint:gosec // ровно то, о чём тест
+			},
+			wantWarn: true,
+		},
+		{
+			name:   "секция TLS с проверкой",
+			mutate: func(c *Config) { c.TLS = TLS{Enabled: true} },
+		},
+		{
+			name:   "готовый TLSConfig с проверкой",
+			mutate: func(c *Config) { c.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13} },
+		},
+		{
+			name:   "TLS выключен",
+			mutate: func(*Config) {},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var buf bytes.Buffer
+
+			cfg := testConfig(t)
+			tt.mutate(&cfg)
+
+			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+			if _, err := cfg.producerOpts(logger); err != nil {
+				t.Fatalf("producerOpts: %v", err)
+			}
+
+			got := buf.String()
+
+			if !tt.wantWarn {
+				if strings.Contains(got, wantWarn) {
+					t.Errorf("предупреждение выдано при включённой проверке сертификата:\n%s", got)
+				}
+
+				return
+			}
+
+			if !strings.Contains(got, wantWarn) {
+				t.Errorf("в логе нет предупреждения %q:\n%s", wantWarn, got)
 			}
 
 			if !strings.Contains(got, "level=WARN") {
