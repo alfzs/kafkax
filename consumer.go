@@ -267,7 +267,7 @@ type KafkaConsumer struct {
 // клиента, поэтому сам клиент создаётся в Start. Конструктор проверяет
 // конфигурацию, готовит логгер, метрики и репортер паник.
 func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
-	const op = "new_kafka_consumer"
+	const op = "creating consumer"
 
 	// Не оборачивается: у агрегата валидации Unwrap() []error, и fmt.Errorf
 	// подменил бы его на Unwrap() error — документированный разбор списка
@@ -317,18 +317,18 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 // обработчик и не добавляют половину нового.
 func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ...ConsumerMiddleware) error {
 	if topic == "" {
-		return fmt.Errorf("add handler: %w", ErrEmptyTopic)
+		return fmt.Errorf("adding handler: %w", ErrEmptyTopic)
 	}
 
 	// Сравнение с nil ловит только нетипизированный nil; типизированный
 	// nil-указатель в интерфейсе пройдёт, но его паника станет
 	// ErrHandlerPanic — то есть штатной ошибкой обработки.
 	if handler == nil {
-		return fmt.Errorf("add handler for topic %q: %w", topic, ErrNilHandler)
+		return fmt.Errorf("adding handler for topic %q: %w", topic, ErrNilHandler)
 	}
 
 	if err := c.loadState().lifecycleErr(); err != nil {
-		return fmt.Errorf("add handler for topic %q: %w", topic, err)
+		return fmt.Errorf("adding handler for topic %q: %w", topic, err)
 	}
 
 	c.handlersMu.Lock()
@@ -336,7 +336,7 @@ func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ..
 
 	current := c.loadHandlers()
 	if _, exists := current[topic]; exists {
-		return fmt.Errorf("add handler for topic %q: %w", topic, ErrDuplicateHandler)
+		return fmt.Errorf("adding handler for topic %q: %w", topic, ErrDuplicateHandler)
 	}
 
 	// Карта копируется целиком, а не правится на месте: опубликованный снимок
@@ -402,7 +402,7 @@ func (c *KafkaConsumer) abortStart() {
 // Консьюмер, прошедший Stop, не перезапускается: Start вернёт ErrConsumerClosed,
 // и отличить это от «уже запущен» можно через errors.Is.
 func (c *KafkaConsumer) Start(ctx context.Context) error {
-	const op = "start"
+	const op = "starting consumer"
 
 	// Гонку двух Start разрешает CAS; проигравший узнаёт причину отказа из
 	// состояния. К моменту чтения оно могло вернуться в consumerIdle — если
@@ -451,7 +451,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 	if err != nil {
 		c.abortStart()
 
-		return fmt.Errorf("%s: kafka client init: %w", op, err)
+		return fmt.Errorf("%s: creating kafka client: %w", op, err)
 	}
 
 	pollCtx, pollCancel := context.WithCancel(c.lifeCtx)

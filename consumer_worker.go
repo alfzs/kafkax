@@ -530,7 +530,7 @@ func (c *KafkaConsumer) callSkipHook(ctx context.Context, msg IncomingMessage, c
 			// уходит в отдельную запись репортера, а в hook_error, который
 			// resolveFailure кладёт рядом с решением отравить партицию,
 			// приезжает голый сентинел, одинаковый на любую причину.
-			err = fmt.Errorf("on message skipped: %w: %v", ErrHandlerPanic, r)
+			err = fmt.Errorf("calling OnMessageSkipped: %w: %v", ErrHandlerPanic, r)
 		}
 	}()
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -423,5 +424,115 @@ func TestFlushErrorTextIsCountFree(t *testing.T) {
 
 	if few != many {
 		t.Errorf("текст зависит от числа записей: %q против %q", few, many)
+	}
+}
+
+// TestErrorPrefixesFollowGerundRule — обёртки ошибок консьюмера называют
+// операцию герундием, как требует правило в шапке errors.go.
+//
+// Текст ошибки контрактом пакета не является, и сторожить его построчно было бы
+// вредно. Сторожится другое: единственность правила. До волны 7 в пакете жили
+// пять стилей префикса сразу, включая `new_kafka_consumer:` в snake_case, и
+// разъехались они именно потому, что каждый новый вызов писался по образцу
+// ближайшего соседа, а не по общему правилу. Записанное правило без проверки
+// повторило бы эту историю с нуля.
+//
+// Проверяется префикс до причины, а не сообщение целиком: причина за ним
+// меняется свободно, в этом и смысл разделения.
+func TestErrorPrefixesFollowGerundRule(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		err    func(*testing.T) error
+		prefix string
+	}{
+		{
+			name:   "пустой топик в AddHandler",
+			prefix: "adding handler:",
+			err: func(t *testing.T) error {
+				t.Helper()
+
+				return mustConsumer(t, testConfig(t)).AddHandler("", &mockHandler{})
+			},
+		},
+		{
+			name:   "nil-обработчик",
+			prefix: `adding handler for topic "`,
+			err: func(t *testing.T) error {
+				t.Helper()
+
+				return mustConsumer(t, testConfig(t)).AddHandler(testTopic, nil)
+			},
+		},
+		{
+			// Единственная обёртка внутри Start, до которой можно дойти
+			// снаружи: конфигурация проходит Validate (диска она не трогает
+			// намеренно) и ломается уже при сборке опций клиента.
+			name:   "нечитаемый CA при запуске",
+			prefix: "starting consumer:",
+			err: func(t *testing.T) error {
+				t.Helper()
+
+				cfg := testConfig(t)
+				cfg.TLS.Enabled = true
+				cfg.TLS.CACertPath = filepath.Join(t.TempDir(), "absent.pem")
+
+				c := mustConsumer(t, cfg)
+				mustAddHandler(t, c, testTopic, &mockHandler{})
+
+				return c.Start(t.Context())
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tc.err(t)
+			if err == nil {
+				t.Fatal("ожидалась ошибка")
+			}
+
+			if !strings.HasPrefix(err.Error(), tc.prefix) {
+				t.Fatalf("текст %q не начинается с %q — правило префиксов "+
+					"из шапки errors.go разошлось с кодом", err, tc.prefix)
+			}
+		})
+	}
+}
+
+// TestConfigAggregateStaysUnprefixed — агрегат валидации конфигурации намеренно
+// живёт вне правила префиксов.
+//
+// Это исключение записано в шапке errors.go, и у него есть цена, которую легко
+// потерять из виду при следующей уборке текстов: обёртка через fmt.Errorf
+// подменила бы у агрегата Unwrap() []error на Unwrap() error, и
+// документированный разбор претензий по одной перестал бы работать. То есть
+// «привести к общему стилю» здесь означает сломать контракт, а не текст.
+//
+// Проверяется поэтому не отсутствие префикса само по себе, а то, ради чего его
+// нет: список претензий по-прежнему разворачивается.
+func TestConfigAggregateStaysUnprefixed(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewKafkaConsumer(Config{})
+	if err == nil {
+		t.Fatal("пустая конфигурация принята")
+	}
+
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("ошибка %v не опознана как ErrInvalidConfig", err)
+	}
+
+	var list interface{ Unwrap() []error }
+	if !errors.As(err, &list) {
+		t.Fatalf("агрегат %v не разворачивается через Unwrap() []error — "+
+			"его завернули в fmt.Errorf, и разбор претензий по одной сломан", err)
+	}
+
+	if len(list.Unwrap()) < 2 {
+		t.Fatalf("развернулось %d претензий, ожидались все сразу", len(list.Unwrap()))
 	}
 }
