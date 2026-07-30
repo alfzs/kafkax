@@ -29,6 +29,18 @@ var errConsBoom = errors.New("boom")
 // именно на нём, а тест затем ищет его же в том, что доехало.
 const consPoisonValue = "poison"
 
+// consProbeValue — контрольное сообщение в заведомо ЗДОРОВУЮ партицию.
+//
+// Им заменены паузы в доказательствах «больная партиция встала». Ожидание по
+// часам доказывает такое утверждение ложно-отрицательно: тест зеленеет и тогда,
+// когда пауза сломана, а запись из больной партиции просто не успела приехать.
+// Контрольное сообщение отправляется уже после отказа и переводит проверку в
+// позитивную: раз консьюмер успел сходить к брокеру за записью, которой в
+// момент отказа ещё не существовало, то за записью больной партиции — лежащей
+// на брокере с самого начала — он тем более успел бы сходить. Её отсутствие
+// после этого означает именно паузу.
+const consProbeValue = "healthy-probe"
+
 // consWaitTerminal ждёт, пока сообщение получит окончательный исход в метрике.
 //
 // Ключевой приём для тестов повторов: как только счётчик processed вырос,
@@ -245,23 +257,20 @@ func TestFailureWithoutSkipHookPausesPartition(t *testing.T) { //nolint:parallel
 		return consHasValue(h.messages(), "p1-first")
 	})
 
-	// Проверка того, что чего-то НЕ произошло, — единственное место, где нужна
-	// пауза. За 300 мс здоровая партиция успевает несколько циклов опроса
-	// (MaxWait=50ms), так что отсутствие «p0-after» означает именно паузу
-	// партиции, а не «не успели».
-	time.Sleep(300 * time.Millisecond)
+	// Контрольное сообщение: соседняя партиция обязана продолжать принимать
+	// новое — отравленное сообщение останавливает свою партицию, а не консьюмер
+	// целиком, — и оно же служит опорой для проверки ниже (см. consProbeValue).
+	prod.send(t, topic, 1, consProbeValue)
 
+	waitFor(t, consWait, "здоровая партиция приняла контрольное сообщение", func() bool {
+		return consHasValue(h.messages(), consProbeValue)
+	})
+
+	// «p0-after» лежит на брокере с начала теста, то есть был доступен раньше
+	// контрольного сообщения. Раз то доехало, а это нет — партиция стоит.
 	if consHasValue(h.messages(), "p0-after") {
 		t.Fatal("сообщение за отравленным обработано: коммит уедет за непрокоммиченный оффсет")
 	}
-
-	// Соседняя партиция обязана продолжать принимать новое: отравленное
-	// сообщение останавливает свою партицию, а не консьюмер целиком.
-	prod.send(t, topic, 1, "p1-second")
-
-	waitFor(t, consWait, "здоровая партиция продолжает работать", func() bool {
-		return consHasValue(h.messages(), "p1-second")
-	})
 
 	if got := rec.sum(consMetricProcessed,
 		attribute.String("topic", topic),
@@ -376,12 +385,16 @@ func TestSkipHookNilCommitsAndContinues(t *testing.T) { //nolint:paralleltest //
 // Отказ хука — это «я не смог забрать сообщение», и трактовать его иначе
 // значило бы терять данные ровно там, где потребитель пытался их сохранить
 // (недоступный DLQ — типичный случай).
+//
+// Вторая партиция здесь нужна не сценарию, а доказательству: остановку
+// партиции нельзя утверждать по тому, что за какое-то время ничего не приехало
+// (см. consProbeValue).
 func TestSkipHookErrorPausesPartition(t *testing.T) { //nolint:paralleltest // captureMetrics подменяет глобальный MeterProvider: параллельный сосед смешал бы записи
 	const topic = "kafkax-skip-err-topic"
 
 	rec := captureMetrics(t)
 
-	brokers := newFakeCluster(t, 1, topic)
+	brokers := newFakeCluster(t, 2, topic)
 	cfg := testConfig(t, brokers...)
 	cfg.OnMessageSkipped = func(context.Context, IncomingMessage, error) error {
 		return errors.New("dlq unavailable")
@@ -405,9 +418,13 @@ func TestSkipHookErrorPausesPartition(t *testing.T) { //nolint:paralleltest // c
 
 	consWaitTerminal(t, rec, topic, consumerStatusError, 1)
 
-	// Партиция обязана встать: см. комментарий о паузе в
-	// TestFailureWithoutSkipHookPausesPartition.
-	time.Sleep(300 * time.Millisecond)
+	// Контрольное сообщение в здоровую партицию: оно отправлено позже «next» и
+	// доехало, значит у «next» время было.
+	prod.send(t, topic, 1, consProbeValue)
+
+	waitFor(t, consWait, "здоровая партиция приняла контрольное сообщение", func() bool {
+		return consHasValue(h.messages(), consProbeValue)
+	})
 
 	if consHasValue(h.messages(), "next") {
 		t.Fatal("партиция поехала дальше после отказа хука: оффсет отравленного сообщения будет перепрыгнут")
@@ -429,12 +446,15 @@ func TestSkipHookErrorPausesPartition(t *testing.T) { //nolint:paralleltest // c
 // обработчика отработал: без собственного recover его паника уронила бы процесс.
 // А «упал» обязано значить «не забрал»: иначе упавший хук молча разрешал бы
 // сдвинуть коммит.
+//
+// Вторая партиция, как и в TestSkipHookErrorPausesPartition, — опора
+// доказательства, а не часть сценария (см. consProbeValue).
 func TestSkipHookPanicPausesPartition(t *testing.T) { //nolint:paralleltest // captureMetrics подменяет глобальный MeterProvider: параллельный сосед смешал бы записи
 	const topic = "kafkax-skip-panic-topic"
 
 	rec := captureMetrics(t)
 
-	brokers := newFakeCluster(t, 1, topic)
+	brokers := newFakeCluster(t, 2, topic)
 	cfg := testConfig(t, brokers...)
 	cfg.OnMessageSkipped = func(context.Context, IncomingMessage, error) error {
 		panic("hook exploded")
@@ -472,7 +492,12 @@ func TestSkipHookPanicPausesPartition(t *testing.T) { //nolint:paralleltest // c
 	}
 
 	// Партиция встала — паника хука не отличается по последствиям от его отказа.
-	time.Sleep(300 * time.Millisecond)
+	// Доказывается контрольным сообщением в здоровую партицию, а не выдержкой.
+	prod.send(t, topic, 1, consProbeValue)
+
+	waitFor(t, consWait, "здоровая партиция приняла контрольное сообщение", func() bool {
+		return consHasValue(h.messages(), consProbeValue)
+	})
 
 	if consHasValue(h.messages(), "next") {
 		t.Fatal("партиция поехала дальше после паники хука")

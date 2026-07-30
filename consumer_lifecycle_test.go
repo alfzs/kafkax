@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync"
+	"slices"
 	"testing"
 	"time"
 
@@ -211,12 +211,30 @@ func TestStartContextCancelStopsConsumer(t *testing.T) {
 	}
 }
 
+// Шаги дренажа in-flight сообщения, из порядка которых собирается
+// доказательство в TestGracefulStopDrainsInFlightMessage.
+const (
+	drainStepHandlerEntered  = "handler-entered"
+	drainStepStopEntered     = "stop-entered"
+	drainStepHandlerReturned = "handler-returned"
+	drainStepStopReturned    = "stop-returned"
+)
+
 // TestGracefulStopDrainsInFlightMessage — сообщение, обрабатываемое в момент
 // Stop, дообрабатывается и коммитится.
 //
 // Без этого graceful shutdown был бы фикцией: каждое развёртывание сервиса
 // оставляло бы столько повторно обработанных сообщений, сколько воркеров было
 // занято, и at-least-once начинал бы стоить заметных денег.
+//
+// «Stop не бросил обработчика» — утверждение о порядке, а не о длительности, и
+// снимается оно порядком меток в общем журнале. Прежняя проверка «за 200 мс
+// Stop не вернулся» отказывала ложно-отрицательно: на загруженной машине
+// брошенный обработчик успел бы не уложиться в это окно, и тест позеленел бы.
+// Метка stop-entered снимается с терминального состояния консьюмера, которое
+// взводится первой же строкой завершения: с этого момента любой возврат Stop до
+// метки handler-returned означает брошенного обработчика — в каком бы порядке
+// метки затем ни легли.
 func TestGracefulStopDrainsInFlightMessage(t *testing.T) {
 	t.Parallel()
 
@@ -227,14 +245,13 @@ func TestGracefulStopDrainsInFlightMessage(t *testing.T) {
 	prod := consNewProducer(t, brokers)
 	prod.send(t, testTopic, 0, "in-flight")
 
-	entered := make(chan struct{})
+	steps := &consTrace{}
 	release := make(chan struct{})
 
-	var enterOnce sync.Once
-
 	h := &mockHandler{fn: func(int, IncomingMessage) error {
-		enterOnce.Do(func() { close(entered) })
+		steps.add(drainStepHandlerEntered)
 		<-release
+		steps.add(drainStepHandlerReturned)
 
 		return nil
 	}}
@@ -243,39 +260,55 @@ func TestGracefulStopDrainsInFlightMessage(t *testing.T) {
 	mustAddHandler(t, c, testTopic, h)
 	consStart(t, c)
 
-	select {
-	case <-entered:
-	case <-time.After(consWait):
-		t.Fatal("обработчик так и не начал работу")
-	}
+	waitFor(t, consWait, "обработчик начал работу", func() bool {
+		return consHasStep(steps, drainStepHandlerEntered)
+	})
 
 	stopped := make(chan error, 1)
-	go func() { stopped <- c.Stop() }()
 
-	// Единственная возможная проверка того, что Stop НЕ бросил обработчика:
-	// убедиться, что он не вернулся, пока обработка не завершена. Пауза
-	// короткая — весь бюджет Stop здесь 5 секунд.
-	select {
-	case err := <-stopped:
-		t.Fatalf("Stop вернулся, не дождавшись обработчика: %v", err)
-	case <-time.After(200 * time.Millisecond):
-	}
+	go func() {
+		err := c.Stop()
+
+		steps.add(drainStepStopReturned)
+
+		stopped <- err
+	}()
+
+	// Завершение началось — обработчик при этом всё ещё стоит на release.
+	waitFor(t, consWait, "Stop вошёл в завершение", func() bool {
+		return c.loadState() == consumerClosed
+	})
+	steps.add(drainStepStopEntered)
 
 	close(release)
 
-	select {
-	case err := <-stopped:
-		if err != nil {
-			t.Fatalf("Stop = %v, want nil", err)
-		}
-	case <-time.After(consWait):
-		t.Fatal("Stop не завершился после того, как обработчик вернул управление")
+	waitFor(t, consWait, "Stop завершился после возврата обработчика", func() bool {
+		return len(steps.snapshot()) == 4
+	})
+
+	if err := <-stopped; err != nil {
+		t.Fatalf("Stop = %v, want nil", err)
+	}
+
+	want := []string{
+		drainStepHandlerEntered,
+		drainStepStopEntered,
+		drainStepHandlerReturned,
+		drainStepStopReturned,
+	}
+	if got := steps.snapshot(); !slices.Equal(got, want) {
+		t.Fatalf("порядок шагов %v, want %v: Stop не дождался обработчика", got, want)
 	}
 
 	got := consDrainFresh(t, cfg, prod, testTopic, 0)
 	if len(got) != 1 || got[0] != consMarkerValue {
 		t.Fatalf("свежий консьюмер получил %v, want только маркер: дообработанное сообщение не закоммичено", got)
 	}
+}
+
+// consHasStep сообщает, попал ли шаг в журнал.
+func consHasStep(steps *consTrace, step string) bool {
+	return slices.Contains(steps.snapshot(), step)
 }
 
 // TestConsumerRebalanceSharesPartitions — два консьюмера одной группы делят
