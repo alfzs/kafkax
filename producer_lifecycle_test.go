@@ -14,6 +14,7 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -670,5 +671,80 @@ func TestProducerCloseBoundedByGracefulTimeout(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("SendMessage не вернулся после Close")
+	}
+}
+
+// TestProducerCloseFlushTimesOut — flush начался, но не успел: вторая ветка
+// отказа, соседняя с TestProducerCloseFlushBudgetExhausted.
+//
+// Класс дефекта тот же — потеря данных при закрытии, — но различает ветки
+// только FlushError.Err: у «бюджета не осталось» причины нет, flush не
+// начинался, у этой она есть. Сентинел же общий, поэтому тест, проверяющий одну
+// лишь `errors.Is(err, ErrFlushIncomplete)`, зеленел бы, попав не туда. Именно
+// так эта ветка и осталась непокрытой, когда RF-TEST-18 закрывала соседнюю.
+//
+// Предпосылка — непустой буфер клиента при отсутствии отправок в полёте —
+// ставится прямым client.Produce, а не через SendMessage, и это не срезание
+// угла: через публичный путь такого состояния не бывает по свойству, которое
+// пакет сам документирует (см. godoc Producer.MessageTimeout). При включённой
+// идемпотентности franz-go не может провалить запись в полёте, поэтому
+// SendMessage не возвращается, пока его запись не разрешена, — то есть либо
+// буфер пуст, либо отправка ещё в полёте и awaitInflight съест весь бюджет,
+// уведя тест в соседнюю ветку. Сама ветка при этом достижима в бою всегда,
+// когда к моменту Close в буфере остались записи, а брокер отвечает медленнее
+// FlushTimeout: flush смотрит только на буфер клиента и знать не знает, чем он
+// наполнен.
+func TestProducerCloseFlushTimesOut(t *testing.T) {
+	t.Parallel()
+
+	cluster := prodCluster(t, 1, testTopic)
+	release := make(chan struct{})
+
+	// Удерживается КАЖДЫЙ Produce, а не только первый: franz-go повторяет
+	// отправку, и на неудержанном повторе запись ушла бы, оставив буфер пустым.
+	cluster.KeepControl()
+	cluster.ControlKey(kmsg.Produce.Int16(), func(kmsg.Request) (kmsg.Response, error, bool) {
+		cluster.SleepControl(func() { <-release })
+
+		return nil, nil, false
+	})
+
+	// Освобождение в Cleanup: удержание обязано пережить и Produce, и Close —
+	// обе фазы теста стоят на нём.
+	t.Cleanup(func() { close(release) })
+
+	cfg := testConfig(t, cluster.ListenAddrs()...)
+	// Заведомо больше FlushTimeout: бюджет обязан достаться flush, а не
+	// кончиться раньше, иначе тест попадёт в соседнюю ветку.
+	cfg.GracefulTimeout = 10 * time.Second
+	cfg.Producer.FlushTimeout = 300 * time.Millisecond
+
+	p := mustProducer(t, cfg)
+
+	// Асинхронно и мимо SendMessage: счётчик inflight не трогается, поэтому
+	// awaitInflight пройдёт мгновенно и бюджет достанется flush целиком.
+	p.client.Produce(t.Context(), &kgo.Record{Topic: testTopic, Value: []byte("stuck")}, nil)
+
+	waitFor(t, consWait, "запись легла в буфер клиента", func() bool {
+		return p.client.BufferedProduceRecords() > 0
+	})
+
+	closeErr := p.Close()
+	if !errors.Is(closeErr, ErrFlushIncomplete) {
+		t.Fatalf("Close = %v, ожидался ErrFlushIncomplete", closeErr)
+	}
+
+	var flushErr *FlushError
+	if !errors.As(closeErr, &flushErr) {
+		t.Fatalf("из %v не достаётся *FlushError", closeErr)
+	}
+
+	// То самое, что отличает эту ветку от соседней.
+	if flushErr.Err == nil {
+		t.Fatal("FlushError.Err пуст — тест попал в ветку «бюджета не осталось», а не в «Flush не успел»")
+	}
+
+	if flushErr.Remaining < 1 {
+		t.Fatalf("FlushError.Remaining = %d, want >= 1: потерянные записи не сосчитаны", flushErr.Remaining)
 	}
 }
