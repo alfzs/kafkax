@@ -14,7 +14,6 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
-	"github.com/twmb/franz-go/pkg/kmsg"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -694,26 +693,24 @@ func TestProducerCloseBoundedByGracefulTimeout(t *testing.T) {
 // когда к моменту Close в буфере остались записи, а брокер отвечает медленнее
 // FlushTimeout: flush смотрит только на буфер клиента и знать не знает, чем он
 // наполнен.
+//
+// Брокер поэтому недоступен, а не удержан управляющей функцией kfake. Держать
+// ответ через SleepControl тест умеет (см. prodHoldProduce), но там удержание
+// снимается посреди сценария и брокер доживает до конца теста живым. Здесь
+// снять его было бы негде: буфер обязан оставаться непустым и во время Close,
+// то есть до самого Cleanup, — а Cleanup освобождает удержание и закрывает
+// кластер подряд, без единой точки синхронизации между ними. Гонка на этом
+// стыке приводила к вечно заблокированной горутине внутри самого kfake, и
+// ловил её не этот тест, а goleak в конце всего прогона (см. leaks_test.go).
+// Недоступный брокер даёт ту же предпосылку без управляющих функций вовсе:
+// «отвечает медленнее FlushTimeout» — это предельный случай «не отвечает
+// никогда», а flush по обе стороны видит ровно одно и то же.
 func TestProducerCloseFlushTimesOut(t *testing.T) {
 	t.Parallel()
 
-	cluster := prodCluster(t, 1, testTopic)
-	release := make(chan struct{})
-
-	// Удерживается КАЖДЫЙ Produce, а не только первый: franz-go повторяет
-	// отправку, и на неудержанном повторе запись ушла бы, оставив буфер пустым.
-	cluster.KeepControl()
-	cluster.ControlKey(kmsg.Produce.Int16(), func(kmsg.Request) (kmsg.Response, error, bool) {
-		cluster.SleepControl(func() { <-release })
-
-		return nil, nil, false
-	})
-
-	// Освобождение в Cleanup: удержание обязано пережить и Produce, и Close —
-	// обе фазы теста стоят на нём.
-	t.Cleanup(func() { close(release) })
-
-	cfg := testConfig(t, cluster.ListenAddrs()...)
+	// Без брокеров: testConfig подставит адрес, на котором никто не слушает,
+	// поэтому запись остаётся в буфере клиента, пока её оттуда не выбросят.
+	cfg := testConfig(t)
 	// Заведомо больше FlushTimeout: бюджет обязан достаться flush, а не
 	// кончиться раньше, иначе тест попадёт в соседнюю ветку.
 	cfg.GracefulTimeout = 10 * time.Second
