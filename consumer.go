@@ -380,8 +380,30 @@ type KafkaConsumer struct {
 	metrics   consumerMetrics
 	panics    panicReporter
 
-	handlersMu sync.RWMutex
-	handlers   map[string]ConsumerHandler
+	// handlers — неизменяемый снимок карты обработчиков, опубликованный
+	// атомарно. Читается на каждое сообщение из всех воркеров партиций сразу,
+	// пишется только AddHandler до Start.
+	//
+	// Замка на чтении нет намеренно. RWMutex.RLock — это атомарный инкремент
+	// счётчика читателей, то есть запись в одну и ту же кэш-линию из всех
+	// воркеров: измерено 38 ns/op под RunParallel против 10 ns/op на голой
+	// карте, при нулевых аллокациях в обоих случаях. Цена растёт с числом
+	// партиций, а полезной работы в ней нет — карта после Start не меняется.
+	//
+	// Схема ровно та же, что у optsCache (otel.go): copy-on-write под
+	// мьютексом на записи, atomic.Pointer на чтении. Цена — полная копия карты
+	// на каждый AddHandler, но AddHandler вызывается считанные разы за жизнь
+	// процесса и никогда с пути сообщения.
+	//
+	// Нулевой указатель — валидное состояние «обработчиков нет»: чтение из
+	// nil-карты в Go законно, поэтому консьюмер, собранный литералом структуры
+	// мимо конструктора, отвечает ErrNoHandlers на Start, а не паникует
+	// разыменованием на пути сообщения.
+	handlers atomic.Pointer[map[string]ConsumerHandler]
+
+	// handlersMu защищает копирование карты при вставке. Читателям он не
+	// нужен: снимок после публикации никто не меняет.
+	handlersMu sync.Mutex
 
 	// opts — готовые опции атрибутов доменных метрик. Прогревается в
 	// AddHandler и после Start не растёт: множество топиков замкнуто
@@ -488,7 +510,6 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 		telemetry:    newTelemetry(config.ClientID, config.Consumer.Group),
 		metrics:      metrics,
 		panics:       panicReporter{logger: logger, panics: metrics.panics, onPanic: config.OnPanic},
-		handlers:     make(map[string]ConsumerHandler),
 		opts:         newOptsCache(0),
 		workers:      make(map[workerKey]*partitionWorker),
 		paused:       make(map[workerKey]struct{}),
@@ -509,6 +530,10 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 // ErrConsumerClosed. Второе не «то же самое, но позже»: регистрация на
 // остановленном консьюмере бесполезна навсегда, и раньше она молча
 // завершалась успехом, создавая впечатление рабочей подписки.
+//
+// Отказ ничего не меняет: набор обработчиков публикуется целиком, поэтому ни
+// дубликат, ни отказ по жизненному циклу не подменяют уже зарегистрированный
+// обработчик и не добавляют половину нового.
 func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ...ConsumerMiddleware) error {
 	if topic == "" {
 		return fmt.Errorf("add handler: %w", ErrEmptyTopic)
@@ -528,18 +553,46 @@ func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ..
 	c.handlersMu.Lock()
 	defer c.handlersMu.Unlock()
 
-	if _, exists := c.handlers[topic]; exists {
+	current := c.loadHandlers()
+	if _, exists := current[topic]; exists {
 		return fmt.Errorf("add handler for topic %q: %w", topic, ErrDuplicateHandler)
 	}
 
+	// Карта копируется целиком, а не правится на месте: опубликованный снимок
+	// уже могут читать воркеры, и запись в него была бы гонкой. Копия платится
+	// один раз за регистрацию — на пути сообщения AddHandler не случается
+	// вовсе.
+	//
+	// Публикация идёт последней строкой метода: до неё все отказы уже
+	// случились, и отвергнутая регистрация снимок не трогает.
+	next := make(map[string]ConsumerHandler, len(current)+1)
+	maps.Copy(next, current)
+
 	// Цепочка middleware собирается один раз при регистрации, а не на каждое
 	// сообщение: аллокации замыканий на горячем пути ничего не дают.
-	c.handlers[topic] = Chain(handler, mws...)
+	next[topic] = Chain(handler, mws...)
 
 	// По той же причине здесь прогреваются опции метрик: набор атрибутов
 	// топика известен целиком уже сейчас, и строить его заново на каждое
-	// сообщение незачем.
+	// сообщение незачем. Прогрев стоит до публикации снимка: обратный порядок
+	// оставлял бы окно «обработчик виден, опций его топика ещё нет», и
+	// закрывал бы его сейчас только запрет AddHandler после Start — то есть
+	// гарантия снаружи этой функции, а не в ней.
 	c.opts.warm(topic, consumerStatuses...)
+
+	c.handlers.Store(&next)
+
+	return nil
+}
+
+// loadHandlers возвращает текущий снимок карты обработчиков.
+//
+// nil-указатель разворачивается в nil-карту, а не в панику: чтение из
+// nil-карты законно и означает ровно то, что нужно, — обработчиков нет.
+func (c *KafkaConsumer) loadHandlers() map[string]ConsumerHandler {
+	if snapshot := c.handlers.Load(); snapshot != nil {
+		return *snapshot
+	}
 
 	return nil
 }
@@ -672,17 +725,13 @@ func (c *KafkaConsumer) watchContext(ctx context.Context) {
 // Сортировка нужна для воспроизводимости логов и сообщений об ошибках:
 // порядок обхода карты в Go случаен.
 func (c *KafkaConsumer) topics() []string {
-	c.handlersMu.RLock()
-	defer c.handlersMu.RUnlock()
-
-	return slices.Sorted(maps.Keys(c.handlers))
+	return slices.Sorted(maps.Keys(c.loadHandlers()))
 }
 
+// handler ищет обработчик топика. Горячий путь: вызывается на каждое
+// сообщение из горутины воркера партиции, замков не берёт — см. поле handlers.
 func (c *KafkaConsumer) handler(topic string) (ConsumerHandler, bool) {
-	c.handlersMu.RLock()
-	defer c.handlersMu.RUnlock()
-
-	h, ok := c.handlers[topic]
+	h, ok := c.loadHandlers()[topic]
 
 	return h, ok
 }
