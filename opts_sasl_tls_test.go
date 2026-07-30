@@ -1,6 +1,17 @@
 package kafkax
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -66,8 +77,8 @@ func authConfig(t *testing.T, brokers []string, mech string) Config {
 		Mechanism: mech,
 		Username:  saslTestUser,
 		Password:  saslTestPass,
-		// PLAIN без TLS не проходит валидацию без явного опт-аута; тесты с
-		// шифрованным транспортом снимают флаг сами.
+		// PLAIN без TLS не проходит валидацию без явного опт-аута; тесты
+		// шифрованного транспорта ниже задают его сами.
 		AllowPlaintext: true,
 	}
 
@@ -221,4 +232,277 @@ func TestSASLRejectedByBroker(t *testing.T) {
 			authRoundTrip(t, good)
 		})
 	}
+}
+
+// TestTLSVerificationAgainstBroker — проверка сертификата брокера настоящая.
+//
+// До этого теста TLS-путь проверялся только структурно: «в *tls.Config лежит
+// непустой RootCAs», «ServerName переписан», «InsecureSkipVerify=true».
+// Соответствует ли это тому, что делает рукопожатие, из структуры не видно —
+// потерянный RootCAs выглядит там ровно так же, как применённый.
+//
+// MinVersion в этом наборе намеренно отсутствует, и проверено, что иначе быть
+// не может: у клиента crypto/tls нижняя граница по умолчанию и так TLS 1.2
+// (измерено на go1.26 против слушателя с MaxVersion=TLS1.1 — рукопожатие
+// отвергается одинаково и с явным MinVersion, и без него). Поведенческого
+// теста, различающего эти два случая, не существует; строка в tls.Config
+// защищена только структурным ассертом в TestTLSConfigFromSection и остаётся
+// страховкой на случай смены умолчания Go.
+func TestTLSVerificationAgainstBroker(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		section func(testPKI) TLS
+		wantOK  bool
+	}{
+		{
+			name:    "корень из конфигурации",
+			section: func(p testPKI) TLS { return TLS{Enabled: true, CACertPath: p.caPath} },
+			wantOK:  true,
+		},
+		{
+			// Сертификат брокера подписан корнем, которого нет в системном
+			// хранилище: без ca_cert_path клиенту довериться нечем.
+			name:    "корень неизвестен",
+			section: func(testPKI) TLS { return TLS{Enabled: true} },
+		},
+		{
+			// Единственное, ради чего InsecureSkipVerify существует. Если
+			// значение перестанет доезжать до рукопожатия, отладочный сценарий
+			// сломается молча — и молча же починится «добавлением CA».
+			name:    "insecure_skip_verify пропускает недоверенный корень",
+			section: func(testPKI) TLS { return TLS{Enabled: true, InsecureSkipVerify: true} },
+			wantOK:  true,
+		},
+		{
+			// Имя из SAN сертификата. Клиент дозванивается на 127.0.0.1, так
+			// что успех здесь означает именно то, что ServerName доехал и был
+			// использован вместо адреса.
+			name: "имя сервера из сертификата",
+			section: func(p testPKI) TLS {
+				return TLS{Enabled: true, CACertPath: p.caPath, ServerName: "localhost"}
+			},
+			wantOK: true,
+		},
+		{
+			name: "чужое имя сервера",
+			section: func(p testPKI) TLS {
+				return TLS{Enabled: true, CACertPath: p.caPath, ServerName: "not-the-broker.example"}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			pki := newTestPKI(t)
+			brokers := newTestCluster(t, kfake.TLS(pki.brokerTLS(false)))
+
+			cfg := testConfig(t, brokers...)
+			cfg.TLS = tt.section(pki)
+
+			if tt.wantOK {
+				authRoundTrip(t, cfg)
+
+				return
+			}
+
+			wantBrokerRejects(t, cfg)
+		})
+	}
+}
+
+// TestMTLSAgainstBroker — клиентская пара доезжает до рукопожатия.
+//
+// Раньше про неё было известно только то, что tls.LoadX509KeyPair положил её в
+// Certificates. Брокер, требующий клиентский сертификат, в интеграции выключен
+// (KAFKA_SSL_CLIENT_AUTH: "none"), так что вторая сторона этой пары не
+// проверялась нигде.
+func TestMTLSAgainstBroker(t *testing.T) {
+	t.Parallel()
+
+	t.Run("без клиентской пары — отказ", func(t *testing.T) {
+		t.Parallel()
+
+		pki := newTestPKI(t)
+		brokers := newTestCluster(t, kfake.TLS(pki.brokerTLS(true)))
+
+		cfg := testConfig(t, brokers...)
+		cfg.TLS = TLS{Enabled: true, CACertPath: pki.caPath}
+
+		wantBrokerRejects(t, cfg)
+	})
+
+	t.Run("с клиентской парой — круг проходит", func(t *testing.T) {
+		t.Parallel()
+
+		pki := newTestPKI(t)
+		brokers := newTestCluster(t, kfake.TLS(pki.brokerTLS(true)))
+
+		cfg := testConfig(t, brokers...)
+		cfg.TLS = TLS{
+			Enabled:        true,
+			CACertPath:     pki.caPath,
+			ClientCertPath: pki.clientCertPath,
+			ClientKeyPath:  pki.clientKeyPath,
+		}
+
+		authRoundTrip(t, cfg)
+	})
+}
+
+// TestSASLOverTLSRoundTripAgainstBroker — обе защиты вместе.
+//
+// Ровно та конфигурация, которую библиотека предлагает для прода: SCRAM поверх
+// проверенного TLS. Проверяется как целое, потому что порядок здесь имеет
+// значение — SASL-рукопожатие идёт уже внутри установленного TLS-соединения, и
+// ошибка в сборке опций способна разорвать эту связку, оставив обе половины
+// формально настроенными.
+func TestSASLOverTLSRoundTripAgainstBroker(t *testing.T) {
+	t.Parallel()
+
+	pki := newTestPKI(t)
+	brokers := newAuthCluster(t,
+		kfake.TLS(pki.brokerTLS(false)),
+		kfake.Superuser(SASLMechanismScramSHA512, saslTestUser, saslTestPass),
+	)
+
+	cfg := authConfig(t, brokers, SASLMechanismScramSHA512)
+	cfg.SASL.AllowPlaintext = false
+	cfg.TLS = TLS{Enabled: true, CACertPath: pki.caPath}
+
+	authRoundTrip(t, cfg)
+}
+
+// testPKI — самоподписанный корень и выпущенные им пары для брокера и клиента.
+//
+// Настоящая PKI нужна потому, что библиотека принимает пути к файлам, а не
+// готовые *x509.Certificate: путь к CA — это ещё и чтение файла, и разбор PEM,
+// и попадание RootCAs в тот самый tls.Config, с которым клиент пойдёт на
+// рукопожатие.
+type testPKI struct {
+	caPath         string // PEM корня для TLS.CACertPath
+	clientCertPath string
+	clientKeyPath  string
+
+	serverCert tls.Certificate
+	caPool     *x509.CertPool
+}
+
+// brokerTLS — конфигурация слушателя kfake. requireClientCert включает mTLS.
+func (p testPKI) brokerTLS(requireClientCert bool) *tls.Config {
+	cfg := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{p.serverCert},
+	}
+
+	if requireClientCert {
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		cfg.ClientCAs = p.caPool
+	}
+
+	return cfg
+}
+
+// newTestPKI выпускает корень, серверную пару на localhost/127.0.0.1 и
+// клиентскую пару для mTLS.
+func newTestPKI(t *testing.T) testPKI {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	caKey, caDER := issueCert(t, &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "kafkax test CA"},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}, nil, nil)
+
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatalf("разбор корневого сертификата: %v", err)
+	}
+
+	// kfake слушает на 127.0.0.1 и его же объявляет в метаданных, поэтому в
+	// сертификате нужен IP-SAN. Имя localhost добавлено для проверки
+	// ServerName: клиент, назвавший его явно, должен пройти, а назвавший
+	// чужое — нет.
+	serverKey, serverDER := issueCert(t, &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "kafkax test broker"},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}, caCert, caKey)
+
+	clientKey, clientDER := issueCert(t, &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: "kafkax test client"},
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}, caCert, caKey)
+
+	pool := x509.NewCertPool()
+	pool.AddCert(caCert)
+
+	return testPKI{
+		caPath:         writePEM(t, filepath.Join(dir, "ca.pem"), "CERTIFICATE", caDER),
+		clientCertPath: writePEM(t, filepath.Join(dir, "client.pem"), "CERTIFICATE", clientDER),
+		clientKeyPath:  writePEM(t, filepath.Join(dir, "client-key.pem"), "EC PRIVATE KEY", marshalECKey(t, clientKey)),
+		serverCert:     tls.Certificate{Certificate: [][]byte{serverDER}, PrivateKey: serverKey},
+		caPool:         pool,
+	}
+}
+
+// issueCert подписывает tmpl ключом parentKey; при parent == nil сертификат
+// самоподписанный.
+func issueCert(t *testing.T, tmpl, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) (*ecdsa.PrivateKey, []byte) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("генерация ключа: %v", err)
+	}
+
+	tmpl.NotBefore = time.Now().Add(-time.Hour)
+	tmpl.NotAfter = time.Now().Add(time.Hour)
+
+	if tmpl.KeyUsage == 0 {
+		tmpl.KeyUsage = x509.KeyUsageDigitalSignature
+	}
+
+	if parent == nil {
+		parent, parentKey = tmpl, key
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, parentKey)
+	if err != nil {
+		t.Fatalf("выпуск сертификата: %v", err)
+	}
+
+	return key, der
+}
+
+func marshalECKey(t *testing.T, key *ecdsa.PrivateKey) []byte {
+	t.Helper()
+
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("сериализация ключа: %v", err)
+	}
+
+	return der
+}
+
+// writePEM кладёт блок в файл и отдаёт путь.
+func writePEM(t *testing.T, path, blockType string, der []byte) string {
+	t.Helper()
+
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: blockType, Bytes: der}), 0o600); err != nil {
+		t.Fatalf("запись %s: %v", path, err)
+	}
+
+	return path
 }
