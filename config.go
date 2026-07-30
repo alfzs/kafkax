@@ -190,6 +190,12 @@ type Config struct {
 // хуки), заменены признаком наличия: их значение всё равно нечитаемо, а вот
 // факт, что хук задан, объясняет поведение, которого не видно в остальных
 // полях.
+//
+// Список полей здесь ручной, и разъехаться с самой структурой он может молча —
+// пропавшее поле не ломает ни компиляцию, ни чтение лога, оно просто перестаёт
+// в нём быть. Сторожит соответствие TestConfigLogValueCoversEveryField: он
+// обходит Config рефлексией и требует ключ на каждое поле, кроме тех, что
+// помечены yaml:"-" и разобраны в списке исключений поимённо.
 func (c Config) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.Any("brokers", c.Brokers),
@@ -200,6 +206,7 @@ func (c Config) LogValue() slog.Value {
 		slog.Any("tls", c.TLS),
 		slog.Any("producer", c.Producer),
 		slog.Any("consumer", c.Consumer),
+		slog.String("kafka_log_level", c.KafkaLogLevel),
 		slog.Bool("tls_config_set", c.TLSConfig != nil),
 		slog.Int("extra_opts", len(c.ExtraOpts)),
 		slog.Bool("on_panic_set", c.OnPanic != nil),
