@@ -305,21 +305,39 @@ type telemetry struct {
 // group передаётся только консьюмером: kotel добавляет messaging.kafka.
 // consumer.group в спаны receive/process, и для продюсера это поле бессмысленно.
 func newTelemetry(clientID, group string) telemetry {
-	tracerOpts := []kotel.TracerOpt{
-		kotel.TracerProvider(otel.GetTracerProvider()),
-		kotel.TracerPropagator(otel.GetTextMapPropagator()),
-		kotel.ClientID(clientID),
-	}
-
-	if group != "" {
-		tracerOpts = append(tracerOpts, kotel.ConsumerGroup(group))
-	}
-
-	tracer := kotel.NewTracer(tracerOpts...)
+	tracer := kotel.NewTracer(tracerOpts(clientID, group)...)
 	meter := kotel.NewMeter(kotel.MeterProvider(otel.GetMeterProvider()))
 
 	return telemetry{
 		tracer: tracer,
 		hooks:  kotel.NewKotel(kotel.WithTracer(tracer), kotel.WithMeter(meter)).Hooks(),
 	}
+}
+
+// tracerOpts собирает опции трейсера kotel для одной роли.
+//
+// Отдельная функция ради проверяемости: у kotel.Tracer все поля неэкспортные, а
+// ConsumerGroup("") записывает в поле ту же пустую строку, что там и была, —
+// то есть по готовому трейсеру «опции не было» и «опция была с пустым
+// значением» неразличимы, и состав списка проверяется до NewTracer.
+//
+// TracerProvider и TracerPropagator повторяют то, что kotel подставил бы сам:
+// оба его умолчания — те же глобали OTel, прочитанные в тот же момент. Опции
+// оставлены явными, потому что зависимость от глобального состояния лучше
+// видеть в коде, чем узнавать из чужого README; наблюдаемого поведения они не
+// меняют, и теста на них поэтому нет.
+func tracerOpts(clientID, group string) []kotel.TracerOpt {
+	opts := []kotel.TracerOpt{
+		kotel.TracerProvider(otel.GetTracerProvider()),
+		kotel.TracerPropagator(otel.GetTextMapPropagator()),
+		kotel.ClientID(clientID),
+	}
+
+	// Группа — консьюмерский атрибут: kotel кладёт её в спаны receive/process,
+	// и у продюсера она означала бы принадлежность к группе, которой нет.
+	if group != "" {
+		opts = append(opts, kotel.ConsumerGroup(group))
+	}
+
+	return opts
 }
