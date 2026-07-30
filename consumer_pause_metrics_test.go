@@ -3,6 +3,7 @@ package kafkax
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -251,5 +252,98 @@ func TestGroupSessionErrorCountedSeparately(t *testing.T) { //nolint:paralleltes
 
 	if got := rec.sum(consMetricFetchErrors); got != 0 {
 		t.Fatalf("fetch.errors = %d, want 0: групповой отказ утёк в партиционный счётчик", got)
+	}
+}
+
+// TestPoisonStopsFetchingFromPausedPartition — отравленная партиция перестаёт
+// вычитываться с брокера, а не только выбрасываться воркером.
+//
+// Флага poisoned достаточно, чтобы записи не доходили до обработчика: воркер
+// вычитывает их из очереди и считает как dropped. Поэтому вырезанный
+// PauseFetchPartitions не ломает ни один тест, который смотрит на обработчик, а
+// смысл самой паузы — не тянуть с брокера то, что всё равно будет выброшено —
+// остаётся непроверенным. В проде это трафик и память на партицию, которая
+// стоит; стоит она ровно столько, сколько дежурный разбирает инцидент, а не
+// миллисекунды.
+//
+// Наблюдается это счётчиком dropped: он считает ровно те записи, которые
+// консьюмер вытянул и выбросил, поэтому «выборка прекратилась» — это «dropped
+// не вырос до размера непрочитанного хвоста». Верхняя граница берётся из
+// ёмкости конвейера, а не с потолка: очередь воркера в один батч по одной
+// записи плюс батч в руках цикла опроса — единицы записей против двух сотен в
+// хвосте.
+//
+// Барьер, доказывающий, что клиент вообще продолжает ходить к брокеру, — это
+// соседняя партиция того же топика. Проба, доехавшая до обработчика уже после
+// паузы, означает, что источник собрал и отправил запрос выборки после неё, —
+// а отравленная партиция попала бы в тот же запрос, не будь она снята с
+// выборки. Ждать «ничего не приехало» по таймеру не понадобилось: у теста есть
+// событие, наступающее строго после, а не спустя.
+//
+// Против kfake это видно так же, как против настоящей Kafka: пауза живёт в
+// клиенте franz-go, и он не только не кладёт снятую партицию в запрос, но и
+// вычёркивает её из уже набранного буфера.
+func TestPoisonStopsFetchingFromPausedPartition(t *testing.T) { //nolint:paralleltest // captureMetrics подменяет глобальный MeterProvider
+	const (
+		topic = "kafkax-paused-fetch-topic"
+		// Хвост за отравившей записью. Настолько длиннее конвейера, что
+		// «выбросили буфер» и «вычитали партицию до конца» не спутать.
+		tail = 200
+		// Потолок выброшенного: батч в обработке, батч в очереди и батч в руках
+		// заблокированного цикла опроса — по одной записи каждый. Запас поверх
+		// взят на планировщик, а не на «примерно столько».
+		maxDropped = 10
+		// Проб больше одной для запаса: каждая доказывает отдельный поход к
+		// брокеру, случившийся уже после паузы.
+		probes = 3
+	)
+
+	rec := captureMetrics(t)
+
+	brokers := newFakeCluster(t, 2, topic)
+	cfg := testConfig(t, brokers...)
+	// Конвейер сжат до минимума: чем меньше записей успевает утечь в очередь
+	// воркера до паузы, тем резче разница между «выбросили набранное» и
+	// «вычитали хвост».
+	cfg.Consumer.MaxPollRecords = 1
+	cfg.Consumer.MessageQueueSize = 1
+
+	prod := consNewProducer(t, brokers)
+	prod.send(t, topic, 0, consPoisonValue)
+
+	for i := range tail {
+		prod.send(t, topic, 0, fmt.Sprintf("tail-%d", i))
+	}
+
+	h := &mockHandler{fn: func(_ int, msg IncomingMessage) error {
+		if string(msg.Value) == consPoisonValue {
+			return errConsBoom
+		}
+
+		return nil
+	}}
+
+	c := mustConsumer(t, cfg)
+	mustAddHandler(t, c, topic, h)
+	consStart(t, c)
+
+	waitFor(t, consWait, "отравленная партиция снята с выборки", func() bool {
+		return rec.sum(consMetricPaused) == 1
+	})
+
+	for i := range probes {
+		probe := fmt.Sprintf("probe-%d", i)
+		prod.send(t, topic, 1, probe)
+
+		waitFor(t, consWait, "проба соседней партиции доехала после паузы", func() bool {
+			return consHasValue(h.messages(), probe)
+		})
+	}
+
+	if got := rec.sum(consMetricProcessed,
+		attribute.String("topic", topic),
+		attribute.String("status", consumerStatusDropped)); got > maxDropped {
+		t.Fatalf("dropped = %d при хвосте в %d записей, want <= %d: партиция не снята "+
+			"с выборки и вычитывается в никуда", got, tail, maxDropped)
 	}
 }
