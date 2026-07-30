@@ -531,3 +531,164 @@ func TestOnPanicHookPanicDoesNotCrashConsumer(t *testing.T) {
 		t.Fatalf("panics(site=%s) = %d, want 1", PanicSiteHandler, got)
 	}
 }
+
+// TestStopDrainsWorkersBeforeFinalCommit — оффсет сообщения, дообработанного на
+// остановке, коммитит сам Stop, а не колбэк отзыва внутри закрытия клиента.
+//
+// Фаза дренажа в Stop выглядит дублированием, и в наблюдаемом поведении почти
+// им и является: CloseAllowingRebalance выводит участника из группы, уход
+// вызывает onPartitionsRevoked, а тот делает и тот же дренаж, и тот же
+// CommitMarkedOffsets. Разница не в том, что происходит, а в том, кому
+// достаётся отказ. Коммит из колбэка отзыва вернуть некому — колбэк зовёт
+// franz-go, а не приложение, — поэтому его провал существует только как строка
+// в логе и счётчик с phase=revoke.
+//
+// Убери фазу дренажа, и к финальному коммиту in-flight сообщение ещё не
+// отмечено: коммитить нечего, franz-go отвечает nil, не сходив к брокеру, Stop
+// возвращает «всё хорошо», а отмеченный уже после этого оффсет уезжает в
+// коммит отзыва — и там теряется молча. Дежурный узнаёт о потере по дубликатам
+// после следующего деплоя, и никак иначе.
+//
+// Обработчик отпускается не по таймеру, а по исчезновению своего воркера с
+// карты консьюмера: снятие с карты — первое, что делает фаза дренажа, и оно
+// строго предшествует финальному коммиту. С вырезанной фазой карту чистит уже
+// onPartitionsRevoked, то есть после коммита, так что тест краснеет
+// детерминированно, а не по стечению таймингов.
+//
+//nolint:paralleltest // captureMetrics подменяет глобальный MeterProvider
+func TestStopDrainsWorkersBeforeFinalCommit(t *testing.T) {
+	const topic = "kafkax-stop-drain-commit-topic"
+
+	rec := captureMetrics(t)
+	cluster, brokers := newFakeClusterHandle(t, 1, topic)
+	failOffsetCommits(cluster)
+
+	cfg := testConfig(t, brokers...)
+	// Логи franz-go выключены: отвергнутый коммит он комментирует своими
+	// записями Error, а к предмету теста они отношения не имеют.
+	cfg.KafkaLogLevel = KafkaLogNone
+	// Автокоммит не должен успеть: иначе оффсет уедет тикером до Stop, и
+	// финальному коммиту снова будет нечего отправлять.
+	cfg.Consumer.CommitInterval = time.Hour
+	// NOT_COORDINATOR ретраибелен, и franz-go повторяет коммит до конца
+	// бюджета. Бюджет — RebalanceTimeout, поэтому он взят близким к минимуму:
+	// иначе тест простаивал бы в повторах дважды, на обоих коммитах.
+	cfg.Consumer.RebalanceTimeout = 500 * time.Millisecond
+
+	prod := consNewProducer(t, brokers)
+	prod.send(t, topic, 0, "in-flight")
+
+	key := workerKey{topic: topic, partition: 0}
+	entered := make(chan struct{})
+
+	c := mustConsumer(t, cfg)
+	mustAddHandler(t, c, topic, ConsumerHandlerFunc(func(ctx context.Context, _ IncomingMessage) error {
+		close(entered)
+		consAwaitWorkerDropped(ctx, c, key)
+
+		return nil
+	}))
+	consStart(t, c)
+
+	select {
+	case <-entered:
+	case <-time.After(consWait):
+		t.Fatal("обработчик не получил сообщение")
+	}
+
+	err := c.Stop()
+	if !errors.Is(err, ErrCommitFailed) {
+		t.Fatalf("Stop = %v, want ErrCommitFailed: оффсет дообработанного сообщения "+
+			"коммитится не финальным коммитом, и его провал вызывающему не виден", err)
+	}
+
+	if got := rec.sum(consMetricCommitErrors, attribute.String("phase", phaseShutdown)); got != 1 {
+		t.Fatalf("commit.errors{phase=%s} = %d, want 1: отказ повешен не на ту фазу",
+			phaseShutdown, got)
+	}
+}
+
+// consAwaitWorkerDropped ждёт, пока воркер партиции исчезнет с карты консьюмера.
+//
+// Отмена контекста прекращает ожидание: без неё обработчик, которого никто не
+// снял с карты, держал бы дренаж до жёсткой отмены и превращал бы падение теста
+// в таймаут всего пакета.
+func consAwaitWorkerDropped(ctx context.Context, c *Consumer, key workerKey) {
+	for {
+		c.workersMu.Lock()
+		_, alive := c.workers[key]
+		c.workersMu.Unlock()
+
+		if !alive {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+}
+
+// TestStopDrainBudgetIsGracefulTimeout — мягкая фаза Stop укладывается в
+// GracefulTimeout, а не в бюджет ребаланса.
+//
+// GracefulTimeout — это то, что оркестратор знает как
+// terminationGracePeriodSeconds: превысив его, процесс получает SIGKILL, и
+// финального коммита не будет вовсе — то есть graceful shutdown обернётся ровно
+// той повторной обработкой, ради предотвращения которой он и написан.
+//
+// Дренаж через onPartitionsRevoked ограничен RebalanceTimeout и про
+// GracefulTimeout не знает. Умолчания пакета (3m против 1m) разницу прячут, но
+// её получает всякий, кто уменьшил бюджет завершения и не тронул таймаут
+// ребаланса, — а это ровно то, что делают, подгоняя завершение под
+// terminationGracePeriod. Поэтому фазу дренажа держит Stop: только у неё бюджет
+// тот, который обещан.
+//
+// Ассерт на верхнюю границу, а не на равенство: он ложно краснеет лишь на
+// машине, которая на порядок медленнее, зато вырезанная фаза даёт восемь секунд
+// против полутысячи миллисекунд и мимо него не проходит.
+func TestStopDrainBudgetIsGracefulTimeout(t *testing.T) {
+	t.Parallel()
+
+	brokers := newFakeCluster(t, 1, testTopic)
+	cfg := testConfig(t, brokers...)
+	cfg.GracefulTimeout = 500 * time.Millisecond
+	cfg.Consumer.RebalanceTimeout = 8 * time.Second
+	cfg.Consumer.CommitInterval = time.Hour
+
+	prod := consNewProducer(t, brokers)
+	prod.send(t, testTopic, 0, "stuck")
+
+	entered := make(chan struct{})
+
+	c := mustConsumer(t, cfg)
+	// Обработчик отпускает партицию только по отмене — то есть ровно по
+	// жёсткой добивке, которой мягкая фаза заканчивается, исчерпав бюджет.
+	mustAddHandler(t, c, testTopic, ConsumerHandlerFunc(func(ctx context.Context, _ IncomingMessage) error {
+		close(entered)
+		<-ctx.Done()
+
+		return nil
+	}))
+	consStart(t, c)
+
+	select {
+	case <-entered:
+	case <-time.After(consWait):
+		t.Fatal("обработчик не получил сообщение")
+	}
+
+	start := time.Now()
+
+	if err := c.Stop(); err != nil {
+		t.Fatalf("Stop = %v, want nil", err)
+	}
+
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("Stop занял %s при GracefulTimeout=%s и RebalanceTimeout=%s: "+
+			"дренаж ушёл в бюджет ребаланса, а не в бюджет завершения",
+			elapsed, cfg.GracefulTimeout, cfg.Consumer.RebalanceTimeout)
+	}
+}
