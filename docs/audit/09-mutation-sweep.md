@@ -501,3 +501,50 @@ func cfgLabel(goPath string) string {
 Позиции 1-3 стоят вместе: они закрываются одним тестовым файлом
 (`kfake` + `EnableSASL` + `TLS`) и снимают самый неприятный отказ пакета —
 «библиотека молча пошла к брокеру без аутентификации».
+
+---
+
+## Позиции 4, 5, 8, 11, 13, 14: что сделано и что осталось
+
+Закрыто (каждый тест проверен на своей мутации — снятие защиты, красный набор,
+восстановление источника):
+
+- **Д3 / позиция 4** (`C30`, `C28`, `C29`, `C47`). `config_logging_test.go`:
+  запись прогоняется в буфер сквозь всю цепочку. `TestKafkaLoggerDelivers-`
+  `RecordsThatPassTheThreshold` — таблица «порог × уровень записи», включая
+  ветку `error` и порог по умолчанию для значения, доехавшего в обход
+  `Validate`. `TestKafkaLoggerKeepsThresholdAcrossWithAttrsAndGroup` — порог и
+  атрибуты переживают `.With(attr)` и `.WithGroup(...)`. Мутации: `Handle`
+  возвращает `nil` без вызова `inner`; `WithAttrs`/`WithGroup` теряют `min`;
+  `WithAttrs`/`WithGroup` теряют сами атрибуты; `error` даёт `LevelInfo`;
+  умолчание при неопознанном значении становится `levelNone`.
+- **Д2 / позиция 5** (`C48`). `config.go`: `LogValue` отдаёт `kafka_log_level`.
+  `config_logvalue_test.go`: обход `Config` рефлексией, ключ обязателен на
+  каждое поле, кроме помеченных `yaml:"-"` — те разобраны поимённо, поэтому
+  новое непрозрачное поле тоже требует явного решения. Мутации: убрать из
+  `LogValue` `kafka_log_level`; убрать `graceful_timeout`.
+- **Позиция 8** (`C35`, находка С3).
+  `TestValidationErrorNamesEnvVariableLiterally` в `config_test.go`: подстрока
+  `"Producer.MessageTimeout (env KAFKAX_PRODUCER_MESSAGE_TIMEOUT)"` и
+  `"ClientID (env KAFKAX_CLIENT_ID)"` — литералом. Мутация: `cfgField.String()`
+  возвращает голый Go-путь; из всего набора краснеет только этот тест.
+- **Позиция 11** (`C39`). Строка «нулевой message_queue_size» в
+  `consumerFieldCases`; комментарий у проверки в `config.go` исправлен — он
+  объяснял только панику от отрицательного значения. Мутация: `<= 0` → `< 0`.
+- **Позиция 13** (`E5`). Подтест в `TestFlushErrorCarriesRemaining`. Мутация:
+  `Error()` всегда возвращает `"flush budget exhausted"`.
+- **Позиция 14** (`C45`, `C46`, `C47`, `C2`). Отрицательный `Linger` и нулевой
+  `MessageQueueSize` — строками в таблицы; `TestConfigValidateSessionTimeout-`
+  `ReportsOnce` — нулевая сессия не тянет претензию к исправному heartbeat;
+  `TestConfigLoggerFallsBackToSlogDefault` — `Logger == nil` берёт
+  `slog.Default()`. Мутации: убрать проверку отрицательного `Linger`; убрать
+  guard `SessionTimeout > 0`; убрать fallback (падает паникой по nil-логгеру).
+  Покрытие `config.go` — 100% операторов, непокрытых строк не осталось.
+
+Не тронуто (за другими): позиции 1-3, 6, 7, 9, 10, 12, 15, 16 — `opts.go`,
+`otel.go`, `panics.go` и интеграционный набор.
+
+Осталось по существу: решение «одного якоря на `cfgLabel` достаточно» опирается
+на то, что `cfgField` — единственная функция, собирающая координаты поля.
+Появится вторая — якорь перестанет её сторожить, и это придётся заметить
+глазами.
