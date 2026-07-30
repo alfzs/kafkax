@@ -3,6 +3,7 @@ package kafkax
 import (
 	"context"
 	"log/slog"
+	"runtime/debug"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -46,9 +47,11 @@ const (
 	// PanicSiteMessageSkipped — паника внутри Config.OnMessageSkipped.
 	// Трактуется как «хук не забрал сообщение».
 	PanicSiteMessageSkipped PanicSite = "on_message_skipped"
-	// PanicSitePanicHook — паника внутри самого Config.OnPanic. Хук с этим
-	// значением повторно не вызывается: рекурсия в обработчике паник кончилась
-	// бы переполнением стека.
+	// PanicSitePanicHook — паника внутри самого Config.OnPanic. Единственное
+	// значение, с которым хук не вызывается: рекурсия в обработчике паник
+	// кончилась бы переполнением стека. В лог и в метрику при этом попадает
+	// наравне с остальными — компонент, сигнализирующий об авариях, не имеет
+	// права отказывать молча.
 	PanicSitePanicHook PanicSite = "on_panic"
 )
 
@@ -114,14 +117,24 @@ func (r panicReporter) callHook(ctx context.Context, site PanicSite, recovered a
 	}
 
 	defer func() {
-		if hookPanic := recover(); hookPanic != nil {
-			// Намеренно без рекурсии в report: паника внутри обработчика паник
-			// не должна ни инкрементировать метрику чужого site, ни повторно
-			// звать тот же хук.
-			r.logger.Error("Recovered panic",
-				slog.String("site", string(PanicSitePanicHook)),
-				slog.String("panic_site", string(site)),
-				slog.Any("panic", hookPanic))
+		hookPanic := recover()
+		if hookPanic == nil {
+			return
+		}
+
+		// Намеренно без рекурсии в report: паника внутри обработчика паник не
+		// должна повторно звать тот же хук. Но лог, метрика и стек — всё, что
+		// report делает помимо хука, — здесь обязаны быть: компонент, который
+		// должен сигнализировать об авариях, не имеет права отказывать молча.
+		r.logger.Error("Recovered panic",
+			slog.String("site", string(PanicSitePanicHook)),
+			slog.String("panic_site", string(site)),
+			slog.Any("panic", hookPanic),
+			slog.String("stack", string(debug.Stack())))
+
+		if r.panics != nil {
+			r.panics.Add(ctx, 1,
+				metric.WithAttributes(attribute.String("site", string(PanicSitePanicHook))))
 		}
 	}()
 

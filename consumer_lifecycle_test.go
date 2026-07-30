@@ -408,6 +408,12 @@ func TestHandlerPanicRecovered(t *testing.T) {
 // собственная паника прошла бы мимо и уронила процесс — ровно та авария, о
 // которой хук должен был предупредить.
 //
+// Пережить её мало: подавление обязано оставлять машиночитаемый след. Рекурсии
+// в report здесь нет намеренно (повторный вызов того же хука кончился бы
+// переполнением стека), поэтому счётчик инкрементится отдельной строкой в
+// callHook — и без ассерта ниже эта строка тихо исчезла бы при первом же
+// рефакторинге, вернув отказ мониторинга паник в исходное молчаливое состояние.
+//
 //nolint:paralleltest // подменяет глобальный MeterProvider
 func TestOnPanicHookPanicDoesNotCrashConsumer(t *testing.T) {
 	const topic = "kafkax-panic-hook-topic"
@@ -447,4 +453,17 @@ func TestOnPanicHookPanicDoesNotCrashConsumer(t *testing.T) {
 	waitFor(t, consWait, "здоровая партиция продолжает работать", func() bool {
 		return consHasValue(h.messages(), "ok-after")
 	})
+
+	// Паника хука посчитана под своим site. Ровно одна: рапорт о панике
+	// обработчика пишется только на первой попытке, значит и хук зван один раз.
+	if got := rec.sum(consMetricPanics, attribute.String("site", string(PanicSitePanicHook))); got != 1 {
+		t.Fatalf("panics(site=%s) = %d, want 1: отказ обработчика паник не виден в метриках",
+			PanicSitePanicHook, got)
+	}
+
+	// Site чужой паники подменяться не должен: по нему строится алерт на
+	// «упал обработчик», и смешать его с «упал хук» значило бы потерять оба.
+	if got := rec.sum(consMetricPanics, attribute.String("site", string(PanicSiteHandler))); got != 1 {
+		t.Fatalf("panics(site=%s) = %d, want 1", PanicSiteHandler, got)
+	}
 }

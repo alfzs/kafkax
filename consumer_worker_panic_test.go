@@ -129,20 +129,27 @@ func TestPartitionWorkerPanicIsReportedAndPartitionGoesSilent(t *testing.T) {
 // собой все остальные партиции. Ни ошибки, ни падения при этом нет — только
 // растущий лаг.
 //
+// Но не повиснуть мало. Раньше эта ветка выбрасывала батч молча, и запись
+// воркера из карты снимал только ребаланс или Stop: до тех пор dispatch на
+// каждом опросе снова находил мёртвого воркера и снова выбрасывал записи —
+// партиция вычитывалась по кругу без единого следа. Теперь она выводится из
+// выборки, и тест проверяет именно это: гейдж partitions.paused поднят, записи
+// учтены как dropped, и ни одна из них не потеряна.
+//
 // Отсюда конструкция: очередь ёмкостью в один батч и две записи, доставленные
-// РАЗНЫМИ опросами. Первая занимает очередь навсегда, на второй dispatch обязан
-// выбрать <-worker.done. Момент, когда вторая запись вынута из буфера клиента,
-// тест ловит хуком franz-go — он срабатывает внутри PollRecords, до dispatch,
-// поэтому дальше работает доказательство от противного: сообщение живого топика
-// доедет до обработчика только в том случае, если цикл опроса пережил отправку
-// в мёртвого воркера.
+// РАЗНЫМИ опросами. Какую из двух отправок выберет dispatch, предсказать нельзя
+// (select с двумя готовыми ветками выбирает случайно), поэтому ассерт стоит не
+// на счётчике опросов, а на паузе: до неё дело дойдёт при любом раскладе — либо
+// на первой отправке, либо на второй, когда единственная ячейка уже занята.
+//
+//nolint:paralleltest // captureMetrics подменяет глобальный MeterProvider: параллельный сосед смешал бы записи
 func TestDeadPartitionWorkerDoesNotStallPollLoop(t *testing.T) {
-	t.Parallel()
-
 	const (
 		wedgeTopic = "kafkax-wedge-topic"
 		liveTopic  = "kafkax-live-topic"
 	)
+
+	rec := captureMetrics(t)
 
 	brokers := newFakeCluster(t, 1, wedgeTopic, liveTopic)
 	watch := &pollWatch{}
@@ -177,18 +184,27 @@ func TestDeadPartitionWorkerDoesNotStallPollLoop(t *testing.T) {
 
 	prod.send(t, wedgeTopic, 0, "first")
 
-	waitFor(t, consWait, "первая запись заняла очередь мёртвого воркера", func() bool {
+	waitFor(t, consWait, "первая запись вынута из буфера клиента", func() bool {
 		return watch.polled(wedgeTopic) >= 1
 	})
 
 	// Вторая запись обязана приехать отдельным опросом: в одном батче с первой
 	// она заняла бы ту же ячейку очереди, и второй отправки — той самой, что
-	// упирается в мёртвого воркера, — не случилось бы.
+	// гарантированно упирается в мёртвого воркера, — не случилось бы.
 	prod.send(t, wedgeTopic, 0, "second")
 
-	waitFor(t, consWait, "вторая запись вынута из буфера клиента", func() bool {
-		return watch.polled(wedgeTopic) >= 2
+	waitFor(t, consWait, "партиция мёртвого воркера выведена из выборки", func() bool {
+		return rec.sum(consMetricPaused) == 1
 	})
+
+	// Выброшенные записи учтены. Молчаливая потеря — ровно то, чем эта ветка
+	// была до правки, поэтому счётчик здесь важнее самой паузы.
+	if got := rec.sum(consMetricProcessed,
+		attribute.String("topic", wedgeTopic),
+		attribute.String("status", consumerStatusDropped)); got < 1 {
+		t.Fatalf("processed(status=%s) = %d, want >= 1: батч мёртвого воркера выброшен молча",
+			consumerStatusDropped, got)
+	}
 
 	prod.send(t, liveTopic, 0, "alive")
 
@@ -198,6 +214,29 @@ func TestDeadPartitionWorkerDoesNotStallPollLoop(t *testing.T) {
 
 	if got := wedge.callCount(); got != 0 {
 		t.Fatalf("обработчик мёртвой партиции вызван %d раз, want 0", got)
+	}
+
+	if err := c.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// Пауза не должна пережить экземпляр: воркеров снимает closeAndAwait, и
+	// вместе с ними снимается пауза, иначе гейдж остался бы поднятым за
+	// партицию, которой у процесса уже нет.
+	if got := rec.sum(consMetricPaused); got != 0 {
+		t.Fatalf("partitions.paused = %d после Stop, want 0", got)
+	}
+
+	// Ни одна запись не потеряна: оффсет не отмечен ни за одну из них.
+	// Свежему консьюмеру логгер-убийца не нужен — иначе он положил бы и его
+	// воркера, а тест проверял бы собственную оснастку.
+	clean := cfg
+	clean.Logger = testLogger(t)
+
+	got := consDrainFresh(t, clean, prod, wedgeTopic, 0)
+	if len(got) != 3 || got[0] != "first" || got[1] != "second" || got[2] != consMarkerValue {
+		t.Fatalf("свежий консьюмер получил %v, want [first second %s]: записи потеряны вместе с воркером",
+			got, consMarkerValue)
 	}
 }
 
@@ -291,6 +330,13 @@ func TestShutdownUnblocksDispatchStuckOnFullQueue(t *testing.T) {
 // упавшее до next, попадёт в PanicSiteProcessMessage), и ошибиться здесь легко —
 // внешне «код обвязки» и «код цепочки» выглядят одинаково чужими.
 //
+// Второй закрепляемый здесь контракт — счёт. Попыток две, рапорт один: полный
+// рапорт о панике (стек, инкремент panics, вызов OnPanic) пишется только на
+// первой попытке. Иначе при HandlerMaxRetries=-1 счётчик рос бы линейно во
+// времени и «одно сообщение крутится сутки» стало бы неотличимо от «упало N
+// разных сообщений». Что повтор всё-таки был, видно по метрике handler.retries
+// и по записи Warn — они и проверяются ниже вместе со счётчиком паник.
+//
 //nolint:paralleltest // captureMetrics подменяет глобальный MeterProvider: параллельный сосед смешал бы записи
 func TestMiddlewarePanicIsReportedAsHandlerPanic(t *testing.T) {
 	const topic = "kafkax-middleware-panic-topic"
@@ -317,8 +363,15 @@ func TestMiddlewarePanicIsReportedAsHandlerPanic(t *testing.T) {
 
 	consWaitTerminal(t, rec, topic, consumerStatusError, 1)
 
-	if got := rec.sum(consMetricPanics, attribute.String("site", string(PanicSiteHandler))); got != 2 {
-		t.Fatalf("panics(site=%s) = %d, want 2 (первый вызов и повтор)", PanicSiteHandler, got)
+	if got := rec.sum(consMetricPanics, attribute.String("site", string(PanicSiteHandler))); got != 1 {
+		t.Fatalf("panics(site=%s) = %d, want 1: рапорт о панике пишется только на первой попытке",
+			PanicSiteHandler, got)
+	}
+
+	// Повтор был — иначе предыдущий ассерт проходил бы и в мире, где повторов
+	// нет вовсе, а это уже другой контракт.
+	if got := rec.sum(consMetricRetries, attribute.String("topic", topic)); got != 1 {
+		t.Fatalf("handler.retries = %d, want 1: паника обязана пройти политику повторов", got)
 	}
 
 	if got := rec.sum(consMetricPanics, attribute.String("site", string(PanicSiteProcessMessage))); got != 0 {
