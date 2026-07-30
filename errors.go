@@ -29,10 +29,13 @@ var (
 	// смысл повтор (DeliveryError.Retriable).
 	ErrDeliveryFailed = errors.New("kafkax: delivery failed")
 
-	// ErrHandlerPanic — ConsumerHandler.ProcessMessage запаниковал. Паника
-	// перехватывается и превращается в обычную ошибку обработки, чтобы
-	// сообщение прошло штатный путь ретраев и коммита, а воркер партиции
-	// остался жив.
+	// ErrHandlerPanic — запаниковал чужой код на пути сообщения:
+	// ConsumerHandler.ProcessMessage либо хук Config.OnMessageSkipped. Паника
+	// перехватывается и превращается в обычную ошибку, чтобы сообщение прошло
+	// штатный путь ретраев и коммита, а воркер партиции остался жив; паника
+	// хука при этом означает отказ забрать сообщение, то есть отравление
+	// партиции. Значение recover() развёрнуто в тексте ошибки, у хука — за
+	// префиксом «on message skipped».
 	ErrHandlerPanic = errors.New("kafkax: handler panic")
 
 	// ErrConsumerClosed — консьюмер остановлен навсегда: Stop вызван или идёт
