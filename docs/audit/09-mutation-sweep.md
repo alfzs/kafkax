@@ -501,3 +501,46 @@ func cfgLabel(goPath string) string {
 Позиции 1-3 стоят вместе: они закрываются одним тестовым файлом
 (`kfake` + `EnableSASL` + `TLS`) и снимают самый неприятный отказ пакета —
 «библиотека молча пошла к брокеру без аутентификации».
+
+---
+
+## Позиции 1, 2, 3, 6: что сделано и что осталось
+
+**Д1 — недостижимый ассерт.** `OptValue(kgo.SASL)` боксирует
+`[]sasl.Mechanism`, поэтому `== nil` не могло стать истинным. В
+`TestCommonOptsAttachSASL` теперь разбирается сам слайс: `len(...) == 1` плюс
+сверка `Name()` с литералом `"SCRAM-SHA-512"`. Доказано мутацией «выбросить
+`kgo.SASL(mech)`» — до правки набор оставался зелёным, после ассерт падает на
+`[]sasl.Mechanism(nil)`.
+
+**Позиции 1-3 — судья брокер, файл `opts_sasl_tls_test.go`.** `kfake` с
+`EnableSASL()`/`Superuser(...)`/`TLS(*tls.Config)`, всё в памяти процесса, без
+Docker; весь файл идёт ~5 с, полный корневой набор — ~38 с.
+
+- `TestSASLRoundTripAgainstBroker`: круг «отправил — получил» для PLAIN,
+  SCRAM-SHA-256 и SCRAM-SHA-512. Оба SCRAM выполняют рукопожатие впервые.
+- `TestSASLRejectedByBroker`: без опции SASL, с неверным паролем, с чужим
+  пользователем, с чужим механизмом — отказ; следом круг верными данными по
+  тому же кластеру, иначе отказ доказывал бы только молчание брокера.
+- `TestTLSVerificationAgainstBroker`, `TestMTLSAgainstBroker`,
+  `TestSASLOverTLSRoundTripAgainstBroker`: `RootCAs` из `ca_cert_path`,
+  недоверенный корень, `InsecureSkipVerify`, совпадение и несовпадение
+  `ServerName`, клиентская пара против брокера с
+  `RequireAndVerifyClientCert`, SCRAM поверх проверенного TLS.
+
+Убиты мутации: снятие `kgo.SASL(mech)`; `Pass: ""` и `User: "nobody"` в
+`saslMechanism`; `AsSha512Mechanism` → `AsSha256Mechanism`; снятие
+`kgo.DialTLSConfig`; снятие `cfg.RootCAs`; `ServerName` → `""`;
+`InsecureSkipVerify` → `false`; снятие `cfg.Certificates`.
+
+**Позиция 6 — `O12`/`O23`.** `TestCommonOptsWarnsOnInsecureTLS` в
+`opts_test.go`: WARN через секцию `TLS` и через готовый `Config.TLSConfig`,
+плюс две ветки «проверка включена — WARN не выдаётся». Каждая ветка красная на
+снятии своего вызова `warnInsecureTLS`, и на `if true` вместо проверки поля.
+
+**Что осталось.** `MinVersion` (`O7`) поведенческого теста не получает и не
+может получить: у клиента `crypto/tls` нижняя граница по умолчанию и так
+TLS 1.2 — против слушателя с `MaxVersion=TLS1.1` рукопожатие отвергается
+одинаково с явным `MinVersion` и без него (измерено на go1.26). Строка
+остаётся под структурным ассертом `TestTLSConfigFromSection` как страховка на
+случай смены умолчания Go. Позиции 4-5 и 7-16 перечня не трогались.
