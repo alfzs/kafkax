@@ -130,9 +130,24 @@ func brokerUnavailable(t *testing.T, err error) {
 func newTopic(t *testing.T, partitions int32) string {
 	t.Helper()
 
-	topic := "it-" + sanitize(t.Name())
+	topic := topicName(t)
+	createTopic(t, newAdmin(t), topic, partitions)
 
-	admin := newAdmin(t)
+	return topic
+}
+
+// topicName отдаёт имя темы, уникальное для теста. Отдельно от newTopic ради
+// сценариев со своим брокером: имя им нужно раньше, чем появляется админ, через
+// которого тему можно создать.
+func topicName(t *testing.T) string {
+	t.Helper()
+
+	return "it-" + sanitize(t.Name())
+}
+
+// createTopic создаёт тему у того брокера, к которому подключён admin.
+func createTopic(t *testing.T, admin *kadm.Client, topic string, partitions int32) {
+	t.Helper()
 
 	resp, err := admin.CreateTopics(t.Context(), partitions, 1, nil, topic)
 	if err != nil {
@@ -144,8 +159,6 @@ func newTopic(t *testing.T, partitions int32) string {
 			t.Fatalf("создание темы %s: %v", topic, created.Err)
 		}
 	}
-
-	return topic
 }
 
 // newGroup отдаёт имя группы, уникальное для теста: общая группа связала бы
@@ -161,14 +174,96 @@ func newGroup(t *testing.T) string {
 func newAdmin(t *testing.T) *kadm.Client {
 	t.Helper()
 
-	client, err := kgo.NewClient(kgo.SeedBrokers(brokers(t)...))
+	return newAdminAt(t, brokers(t))
+}
+
+// newAdminAt — то же, но к указанному брокеру. Нужен сценариям, поднимающим
+// собственный контейнер: общий брокер набора им не адресат.
+func newAdminAt(t *testing.T, seeds []string) *kadm.Client {
+	t.Helper()
+
+	return kadm.NewClient(rawClient(t, seeds))
+}
+
+// rawClient — клиент franz-go в обход публичного API пакета. Нужен там, где
+// проверка требует того, чего kafkax намеренно не даёт: явного выбора партиции
+// при записи и чтения темы мимо групп.
+func rawClient(t *testing.T, seeds []string, opts ...kgo.Opt) *kgo.Client {
+	t.Helper()
+
+	client, err := kgo.NewClient(append([]kgo.Opt{kgo.SeedBrokers(seeds...)}, opts...)...)
 	if err != nil {
-		t.Fatalf("административный клиент: %v", err)
+		t.Fatalf("клиент franz-go: %v", err)
 	}
 
 	t.Cleanup(client.Close)
 
-	return kadm.NewClient(client)
+	return client
+}
+
+// openProducer создаёт продюсера по конфигурации теста и закрывает его по его
+// окончании.
+func openProducer(t *testing.T, cfg kafkax.Config) *kafkax.Producer {
+	t.Helper()
+
+	producer, err := kafkax.NewProducer(cfg)
+	if err != nil {
+		t.Fatalf("NewProducer: %v", err)
+	}
+
+	t.Cleanup(func() { _ = producer.Close() })
+
+	return producer
+}
+
+// publishValues отправляет по сообщению на каждое значение, делая ключом само
+// значение.
+//
+// Ключ не декоративен: именно он определяет партицию, а многопартиционные
+// сценарии держатся на том, что поток растащен по всей теме, а не сложен подряд
+// в одну партицию. SendMessage синхронен, поэтому порядок записей внутри
+// партиции совпадает с порядком аргументов — на этом стоят проверки, читающие
+// снимок обработчика как последовательность.
+func publishValues(t *testing.T, producer *kafkax.Producer, topic string, values ...string) {
+	t.Helper()
+
+	for _, value := range values {
+		if err := producer.SendMessage(t.Context(), kafkax.PublishRequest{
+			Topic: topic,
+			Key:   []byte(value),
+			Value: []byte(value),
+		}); err != nil {
+			t.Fatalf("SendMessage(%s): %v", value, err)
+		}
+	}
+}
+
+// committedOffset читает закоммиченный группой оффсет партиции; -1 означает
+// «коммита ещё нет».
+//
+// Утверждение о состоянии в брокере, а не о его последствиях: доставка отвечает
+// на вопрос «что приедет дальше», оффсет — на вопрос «что группа считает
+// сделанным», и отличить коммит не туда от коммита вовремя можно только вторым.
+//
+// Отсутствие оффсета — значение, а не отказ теста. Метод вызывается из await в
+// цикле, и на раннем витке группы может не быть вовсе: координатор назначается
+// лениво, при первом join. Отличить «ещё нет» от «уже никогда» можно только по
+// тому, дождался ли вызывающий нужного числа до конца своего бюджета, а этот
+// счёт ведёт он.
+func committedOffset(t *testing.T, admin *kadm.Client, group, topic string, partition int32) int64 {
+	t.Helper()
+
+	offsets, err := admin.FetchOffsets(t.Context(), group)
+	if err != nil {
+		return -1
+	}
+
+	response, ok := offsets.Lookup(topic, partition)
+	if !ok || response.Err != nil {
+		return -1
+	}
+
+	return response.At
 }
 
 // sanitize приводит имя теста к допустимому в имени темы Kafka виду.
