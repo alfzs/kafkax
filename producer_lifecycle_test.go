@@ -3,9 +3,11 @@ package kafkax
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,13 +47,22 @@ var _ kgo.HookProduceRecordBuffered = (*prodBufferedHook)(nil)
 // возвращается вместе с Close, унося наблюдаемость того, что Close оставил
 // после себя.
 type prodBlockHook struct {
+	// hold — значение записи, на которой хук останавливается; nil
+	// останавливает любую. Отбор по значению нужен там, где до удержанной
+	// отправки в том же тесте проходят обычные.
+	hold []byte
+
 	enteredOnce sync.Once
 	releaseOnce sync.Once
 	entered     chan struct{}
 	release     chan struct{}
 }
 
-func (h *prodBlockHook) OnProduceRecordBuffered(*kgo.Record) {
+func (h *prodBlockHook) OnProduceRecordBuffered(rec *kgo.Record) {
+	if h.hold != nil && !bytes.Equal(rec.Value, h.hold) {
+		return
+	}
+
 	h.enteredOnce.Do(func() { close(h.entered) })
 
 	<-h.release
@@ -102,6 +113,60 @@ func (b *syncBuffer) String() string {
 	defer b.mu.Unlock()
 
 	return b.buf.String()
+}
+
+// messages разбирает журнал и возвращает msg всех записей по порядку.
+func (b *syncBuffer) messages(t *testing.T) []string {
+	t.Helper()
+
+	var out []string
+
+	for line := range strings.SplitSeq(strings.TrimSpace(b.String()), "\n") {
+		if line == "" {
+			continue
+		}
+
+		var rec struct {
+			Msg string `json:"msg"`
+		}
+
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("строка журнала не разбирается как JSON (%v): %s", err, line)
+		}
+
+		out = append(out, rec.Msg)
+	}
+
+	return out
+}
+
+// captureLog уводит журнал пакета в буфер и глушит журнал franz-go.
+//
+// JSON, а не текст: проверяется список сообщений целиком, и разбирать его
+// регулярками по тексту значило бы проверять форматирование slog. Журнал
+// клиента выключен потому, что проверка утверждает отсутствие строк, а чужая
+// строка сделала бы её бессмысленной.
+func captureLog(cfg *Config) *syncBuffer {
+	logs := &syncBuffer{}
+
+	cfg.Logger = slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	cfg.KafkaLogLevel = KafkaLogNone
+
+	return logs
+}
+
+// assertLogMessages сверяет журнал целиком, а не ищет в нём подстроку.
+//
+// Закрытый список — единственный способ проверить инвариант flush «отказ едет
+// ошибкой и только ошибкой»: лишняя строка валит проверку независимо от того,
+// как она сформулирована. Поиск подстроки ловил бы ровно ту формулировку,
+// которую уже убрали, и пропускал бы любую новую.
+func assertLogMessages(t *testing.T, logs *syncBuffer, want ...string) {
+	t.Helper()
+
+	if got := logs.messages(t); !slices.Equal(got, want) {
+		t.Errorf("журнал закрытия = %q, want %q", got, want)
+	}
 }
 
 // Close идемпотентен: второй вызов не паникует и возвращает nil.
@@ -175,10 +240,11 @@ func TestProducerSendMessageAfterClose(t *testing.T) {
 
 // Гонка Close и SendMessage: принятая отправка не должна оборваться.
 //
-// Это смысл связки RWMutex+WaitGroup в продюсере. Без неё между проверкой
-// closing и inflight.Add успевает вклиниться Close, его Wait возвращается
-// раньше уже принятой отправки, и клиент закрывается у неё под руками —
-// вызывающий получает ErrProducerClosed на сообщении, которое продюсер принял.
+// Это смысл связки RWMutex со счётчиком отправок в продюсере. Без неё между
+// проверкой closing и инкрементом счётчика успевает вклиниться Close, его
+// ожидание кончается раньше уже принятой отправки, и клиент закрывается у неё
+// под руками — вызывающий получает ErrProducerClosed на сообщении, которое
+// продюсер принял.
 //
 // Синхронизация на факте, а не на времени: Close вызывается только после того,
 // как все N записей попали в буфер клиента, то есть заведомо прошли acquire.
@@ -254,6 +320,88 @@ func TestProducerCloseWaitsForAcceptedSends(t *testing.T) {
 	// не принимает ничего.
 	if err := p.SendMessage(t.Context(), PublishRequest{Topic: testTopic, Value: []byte("late")}); !errors.Is(err, ErrProducerClosed) {
 		t.Fatalf("SendMessage после Close = %v, want ErrProducerClosed", err)
+	}
+}
+
+// Close ждёт отправку, которая принята продюсером, но до клиента ещё не
+// дошла.
+//
+// Соседний тест выше ждёт, пока все записи окажутся в буфере клиента, и потому
+// проверяет только вторую половину окна: буферизованное дошлёт flush, даже
+// если ожидания отправок нет вовсе. Здесь окно первое — между acquire и
+// kgo.Produce, — и его не закрывает никто, кроме awaitInflight: клиент про эту
+// запись ещё не знает, флашить нечего, и Close, не дождавшись отправки,
+// закрывает клиент у неё под руками. Вызывающий получает ErrProducerClosed на
+// сообщении, которое продюсер у него принял.
+//
+// Отправка перед удержанной не декорация: ею проверяется, что сигнал
+// «отправок больше нет» относится к текущему закрытию, а не остался от любого
+// прошлого обнуления счётчика. Оставленный впрок сигнал отпустил бы Close
+// мгновенно — тест бы это увидел, а сценарий без первой отправки нет.
+func TestProducerCloseWaitsForSendNotYetInClient(t *testing.T) {
+	t.Parallel()
+
+	const (
+		deliveredValue = "before-close"
+		heldValue      = "held-before-client"
+	)
+
+	brokers := newFakeCluster(t, 1, testTopic)
+
+	hook := newProdBlockHook(t)
+	hook.hold = []byte(heldValue)
+
+	cfg := testConfig(t, brokers...)
+	// Бюджет заведомо больше сценария: Close обязан дождаться отправки, а не
+	// уйти по таймеру — иначе тест не отличит ожидание от терпеливого отказа.
+	cfg.GracefulTimeout = 10 * time.Second
+	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
+
+	p := mustProducer(t, cfg)
+
+	if err := p.SendMessage(t.Context(), PublishRequest{Topic: testTopic, Value: []byte(deliveredValue)}); err != nil {
+		t.Fatalf("SendMessage до закрытия: %v", err)
+	}
+
+	heldDone := make(chan error, 1)
+
+	go func() {
+		heldDone <- p.SendMessage(context.Background(), PublishRequest{Topic: testTopic, Value: []byte(heldValue)})
+	}()
+
+	// Отправка прошла acquire и стоит внутри ProduceSync: клиент про запись
+	// ещё не знает, буфер пуст.
+	<-hook.entered
+
+	closeDone := make(chan error, 1)
+
+	go func() { closeDone <- p.Close() }()
+
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close вернулся, не дождавшись принятой отправки: %v", err)
+	case <-time.After(200 * time.Millisecond):
+		// Ложным этот отказ быть не может: возврат Close, пока отправка
+		// удерживается, и есть проверяемый дефект, а не медленная машина.
+	}
+
+	hook.unblock()
+
+	if err := <-heldDone; err != nil {
+		t.Fatalf("принятая до Close отправка оборвалась: %v", err)
+	}
+
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Успех обязан быть подкреплён записью: nil, за которым в топике ничего
+	// нет, был бы той же потерей с другой стороны.
+	recs := prodFetchRecords(t, brokers, testTopic, 2)
+
+	got := []string{string(recs[0].Value), string(recs[1].Value)}
+	if got[0] != deliveredValue || got[1] != heldValue {
+		t.Fatalf("записи топика = %q, want [%q %q]", got, deliveredValue, heldValue)
 	}
 }
 
@@ -382,13 +530,8 @@ func TestProducerCloseRaceWithSends(t *testing.T) {
 func TestProducerCloseFlushBudgetExhausted(t *testing.T) {
 	t.Parallel()
 
-	logs := &syncBuffer{}
-
 	cfg := testConfig(t)
-	cfg.Logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	// Логи franz-go выключены: в журнале должны остаться только строки самого
-	// пакета, иначе проверка «flush молчит» ловила бы чужие.
-	cfg.KafkaLogLevel = KafkaLogNone
+	logs := captureLog(&cfg)
 	cfg.Producer.MessageTimeout = 30 * time.Second
 	cfg.GracefulTimeout = 200 * time.Millisecond
 	// Потолок flush заведомо больше остатка бюджета: min() обязан выбрать
@@ -434,11 +577,15 @@ func TestProducerCloseFlushBudgetExhausted(t *testing.T) {
 		t.Errorf("FlushError.Err = %v, ожидался nil: flush не начинался", flushErr.Err)
 	}
 
-	// Ни числа записей, ни причины отказа в журнале быть не должно: событие
-	// едет одним каналом.
-	if got := logs.String(); strings.Contains(got, "budget") || strings.Contains(got, "buffered") {
-		t.Errorf("flush записал свой отказ в журнал, хотя обязан только вернуть ошибку:\n%s", got)
-	}
+	// Журнал закрытия сверяется целиком: flush обязан не добавить к нему ни
+	// строки — ни числа записей, ни причины отказа. Событие едет одним каналом,
+	// и вызывающий, который логирует ошибку Close сам, не должен получать его
+	// дважды.
+	assertLogMessages(t, logs,
+		"Starting kafka producer shutdown",
+		"Timed out waiting for in-flight sends, proceeding to flush",
+		"Kafka producer shutdown completed",
+	)
 
 	select {
 	case err := <-sendDone:
@@ -747,7 +894,11 @@ func TestProducerCloseBoundedByGracefulTimeout(t *testing.T) {
 	// вернуться по своему бюджету, а не дождаться отправки.
 	cfg.Producer.MessageTimeout = 30 * time.Second
 	cfg.GracefulTimeout = 300 * time.Millisecond
-	cfg.Producer.FlushTimeout = 300 * time.Millisecond
+	// FlushTimeout на два порядка больше бюджета закрытия: GracefulTimeout —
+	// общий бюджет обеих фаз, а не бюджет первой из них. Если flush начнёт
+	// отсчитывать своё время заново, Close займёт 30s вместо 300ms и упрётся в
+	// потолок ниже; при равных значениях разница пряталась в шуме планировщика.
+	cfg.Producer.FlushTimeout = 30 * time.Second
 
 	hook := &prodBufferedHook{}
 	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
@@ -771,8 +922,8 @@ func TestProducerCloseBoundedByGracefulTimeout(t *testing.T) {
 	// awaitInflight Close ждал бы все 30 секунд MessageTimeout.
 	closeStart := time.Now()
 
-	// Брокер недоступен, flush не успевает за свой бюджет — запись потеряна.
-	// Именно это и обязан сообщить Close: без сентинела «не отправили» ничем
+	// Брокер недоступен, бюджет закрытия ушёл на ожидание отправки — запись
+	// потеряна. Именно это и обязан сообщить Close: без сентинела «не отправили» ничем
 	// не отличается от «не смогли красиво попрощаться», и вызывающий, у
 	// которого стоит defer producer.Close(), не отличит потерю данных от шума
 	// на завершении.
@@ -781,10 +932,12 @@ func TestProducerCloseBoundedByGracefulTimeout(t *testing.T) {
 		t.Fatalf("Close = %v, ожидался ErrFlushIncomplete", closeErr)
 	}
 
-	// Предохранитель, а не доказательство: доказывает ограниченность закрытия
-	// сентинел выше, а часы ловят только вырожденный случай «Close ушёл ждать
-	// чужой MessageTimeout» — 30s против потолка 5s. Запас в шестнадцать раз
-	// от бюджета делает границу нечувствительной к планировщику.
+	// Здесь часы уже доказательство, а не предохранитель, потому что оба
+	// вырожденных исхода лежат на порядки выше потолка: «Close ушёл ждать чужой
+	// MessageTimeout» — это 30s, «flush отсчитал свой бюджет заново поверх
+	// общего» — 30.3s, а штатное закрытие укладывается в 300ms. Потолок в 5s
+	// отстоит в шестнадцать раз от бюджета и в шесть раз от ближайшего отказа,
+	// так что к планировщику граница нечувствительна.
 	if elapsed := time.Since(closeStart); elapsed > 5*time.Second {
 		t.Fatalf("Close занял %s при GracefulTimeout=%s", elapsed, cfg.GracefulTimeout)
 	}
@@ -836,9 +989,16 @@ func TestProducerCloseBoundedByGracefulTimeout(t *testing.T) {
 func TestProducerCloseFlushTimesOut(t *testing.T) {
 	t.Parallel()
 
+	// Записей несколько, и число проверяется точным равенством: Remaining —
+	// величина, по которой принимают решение (потеря пяти сообщений и потеря
+	// пятидесяти тысяч требуют разной реакции), а на одной записи от неё
+	// неотличима любая константа.
+	const stuck = 5
+
 	// Без брокеров: testConfig подставит адрес, на котором никто не слушает,
-	// поэтому запись остаётся в буфере клиента, пока её оттуда не выбросят.
+	// поэтому записи остаются в буфере клиента, пока их оттуда не выбросят.
 	cfg := testConfig(t)
+	logs := captureLog(&cfg)
 	// Заведомо больше FlushTimeout: бюджет обязан достаться flush, а не
 	// кончиться раньше, иначе тест попадёт в соседнюю ветку.
 	cfg.GracefulTimeout = 10 * time.Second
@@ -846,12 +1006,18 @@ func TestProducerCloseFlushTimesOut(t *testing.T) {
 
 	p := mustProducer(t, cfg)
 
-	// Асинхронно и мимо SendMessage: счётчик inflight не трогается, поэтому
-	// awaitInflight пройдёт мгновенно и бюджет достанется flush целиком.
-	p.client.Produce(t.Context(), &kgo.Record{Topic: testTopic, Value: []byte("stuck")}, nil)
+	// Асинхронно и мимо SendMessage: счётчик отправок в полёте не трогается,
+	// поэтому awaitInflight пройдёт мгновенно и бюджет достанется flush
+	// целиком.
+	for i := range stuck {
+		p.client.Produce(t.Context(), &kgo.Record{
+			Topic: testTopic,
+			Value: fmt.Appendf(nil, "stuck-%d", i),
+		}, nil)
+	}
 
-	waitFor(t, consWait, "запись легла в буфер клиента", func() bool {
-		return p.client.BufferedProduceRecords() > 0
+	waitFor(t, consWait, "записи легли в буфер клиента", func() bool {
+		return p.client.BufferedProduceRecords() == stuck
 	})
 
 	closeErr := p.Close()
@@ -869,7 +1035,15 @@ func TestProducerCloseFlushTimesOut(t *testing.T) {
 		t.Fatal("FlushError.Err пуст — тест попал в ветку «бюджета не осталось», а не в «Flush не успел»")
 	}
 
-	if flushErr.Remaining < 1 {
-		t.Fatalf("FlushError.Remaining = %d, want >= 1: потерянные записи не сосчитаны", flushErr.Remaining)
+	if flushErr.Remaining != stuck {
+		t.Fatalf("FlushError.Remaining = %d, want %d: число потерянных записей неверно", flushErr.Remaining, stuck)
 	}
+
+	// Вторая ветка отказа flush молчит так же, как первая: ожидания отправок
+	// здесь нет вовсе, поэтому в журнале обязаны остаться только две строки
+	// самого Close.
+	assertLogMessages(t, logs,
+		"Starting kafka producer shutdown",
+		"Kafka producer shutdown completed",
+	)
 }
