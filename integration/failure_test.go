@@ -23,14 +23,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alfzs/kafkax/v2"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	"github.com/testcontainers/testcontainers-go"
 	tckafka "github.com/testcontainers/testcontainers-go/modules/kafka"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
-
-	"github.com/alfzs/kafkax/v2"
 )
 
 // errPoison — отказ обработчика, воспроизводимый на каждой попытке. Именно
@@ -204,7 +203,9 @@ func TestSkipHookAdvancesOffset(t *testing.T) {
 	})
 
 	skipMu.Lock()
+
 	gotSkips := append([]string(nil), skips...)
+
 	skipMu.Unlock()
 
 	if len(gotSkips) != 1 || gotSkips[0] != poison {
@@ -388,6 +389,8 @@ func TestStopDrainsInFlightMessage(t *testing.T) {
 // голодание по CPU здесь выглядит ровно как невосстановившийся консьюмер.
 // Последовательная фаза `go test` — единственный момент, когда параллельные
 // тесты стоят на паузе, и этот тест намеренно занимает её целиком.
+//
+//nolint:paralleltest // намеренно последовательный, причина — в комментарии выше
 func TestBrokerRestartUnderLoad(t *testing.T) {
 	broker, seeds := dedicatedBroker(t)
 
@@ -526,7 +529,9 @@ func dedicatedBroker(t *testing.T) (*tckafka.KafkaContainer, []string) {
 func freeHostPort(t *testing.T) int {
 	t.Helper()
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+
+	listener, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("выбор свободного порта: %v", err)
 	}

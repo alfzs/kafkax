@@ -19,16 +19,16 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/alfzs/kafkax/v2"
 	tckafka "github.com/testcontainers/testcontainers-go/modules/kafka"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
-
-	"github.com/alfzs/kafkax/v2"
 )
 
 // kafkaImage — образ брокера. Версия закреплена: «latest» превратил бы отказ
@@ -67,16 +67,25 @@ var shared struct {
 func TestMain(m *testing.M) {
 	code := m.Run()
 
-	if shared.container != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cancel()
-
-		if err := shared.container.Terminate(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "не удалось погасить контейнер: %v\n", err)
-		}
-	}
+	terminateShared()
 
 	os.Exit(code)
+}
+
+// terminateShared вынесен из TestMain отдельной функцией ради defer cancel():
+// в самом TestMain он стоял бы над os.Exit и не выполнился бы никогда, оставив
+// контекст течь до конца процесса.
+func terminateShared() {
+	if shared.container == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	if err := shared.container.Terminate(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "не удалось погасить контейнер: %v\n", err)
+	}
 }
 
 // brokers отдаёт адреса поднятого брокера, поднимая его при первом обращении.
@@ -211,9 +220,42 @@ func openProducer(t *testing.T, cfg kafkax.Config) *kafkax.Producer {
 		t.Fatalf("NewProducer: %v", err)
 	}
 
-	t.Cleanup(func() { _ = producer.Close() })
+	closeProducer(t, producer)
 
 	return producer
+}
+
+// closeProducer гасит продюсера по окончании теста и НЕ проглатывает ошибку.
+//
+// Close возвращает FlushError с числом записей, которые остались недоставленными
+// к концу бюджета. Выброшенная в `_`, такая ошибка превращает «продюсер не смог
+// дослать хвост» в зелёный прогон: сценарии здесь сверяются с содержимым темы,
+// и недосланное выглядит для них ровно как правильно не отправленное.
+//
+// t.Errorf, а не t.Fatalf: Cleanup идёт после тела теста, и обрывать на нём
+// нечего — а Fatal из Cleanup ещё и не даёт отработать остальным.
+func closeProducer(t *testing.T, producer *kafkax.Producer) {
+	t.Helper()
+
+	t.Cleanup(func() {
+		if err := producer.Close(); err != nil {
+			t.Errorf("закрытие продюсера: %v", err)
+		}
+	})
+}
+
+// stopConsumer останавливает консьюмера по окончании теста, не проглатывая
+// ошибку. Идемпотентен на стороне пакета: Stop выполняет остановку один раз и
+// затем отдаёт тот же результат, так что явный Stop внутри теста этому не
+// мешает и второй раз ошибку не выдумывает.
+func stopConsumer(t *testing.T, consumer *kafkax.Consumer) {
+	t.Helper()
+
+	t.Cleanup(func() {
+		if err := consumer.Stop(); err != nil {
+			t.Errorf("остановка консьюмера: %v", err)
+		}
+	})
 }
 
 // publishValues отправляет по сообщению на каждое значение, делая ключом само
@@ -384,13 +426,7 @@ func (c *collector) has(value string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for _, got := range c.values {
-		if got == value {
-			return true
-		}
-	}
-
-	return false
+	return slices.Contains(c.values, value)
 }
 
 // logSpy — slog.Handler, запоминающий записи, которые в cfg.Logger пишут и сам

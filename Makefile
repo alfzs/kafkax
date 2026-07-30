@@ -38,24 +38,35 @@ test-integration:
 	KAFKAX_INTEGRATION=required $(GO) test -C integration -race -count=1 ./...
 
 ## lint: Run golangci-lint
+#
+# Модули перечислены поимённо: golangci-lint работает в границах одного модуля,
+# и `run ./...` из корня молча пропускал бы integration/ и tools/ — вместе с
+# ними без присмотра оставался весь интеграционный набор.
 lint: $(TOOLS_DIR)/golangci-lint
 	$(TOOLS_DIR)/golangci-lint run ./...
+	cd integration && $(PWD)/$(TOOLS_DIR)/golangci-lint run -c $(PWD)/.golangci.yml ./...
 
 ## lint-fix: Run golangci-lint and auto-fix issues
 lint-fix: $(TOOLS_DIR)/golangci-lint
 	$(TOOLS_DIR)/golangci-lint run --fix ./...
+	cd integration && $(PWD)/$(TOOLS_DIR)/golangci-lint run --fix -c $(PWD)/.golangci.yml ./...
 
 ## fmt: Check gofmt formatting (read-only; `make lint-fix` rewrites files)
 # gofmt -l, а не `go fmt`: последний переписывает файлы на месте, так что цель,
 # заявленная как проверка, молча меняла рабочее дерево — и в CI «проваливалась»
 # уже после того, как исправила причину провала.
+#
+# Список файлов берётся из git, а не обходом каталога: `gofmt -l .` спускается и
+# в .claude/worktrees, где лежат рабочие деревья агентов. В CI их нет, и цель
+# там зелёная, а локально она краснела на чужом незакоммиченном коде.
 fmt:
-	@out="$$($$($(GO) env GOROOT)/bin/gofmt -l .)"; \
+	@out="$$(git ls-files '*.go' | xargs $$($(GO) env GOROOT)/bin/gofmt -l)"; \
 	test -z "$$out" || (echo "gofmt found issues:"; echo "$$out"; exit 1)
 
 ## vet: Run go vet
 vet:
 	$(GO) vet ./...
+	$(GO) vet -C integration ./...
 
 ## audit: Check dependencies for known vulnerabilities
 audit: $(TOOLS_DIR)/govulncheck

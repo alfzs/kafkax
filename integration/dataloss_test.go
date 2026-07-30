@@ -5,9 +5,8 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/twmb/franz-go/pkg/kadm"
-
 	"github.com/alfzs/kafkax/v2"
+	"github.com/twmb/franz-go/pkg/kadm"
 )
 
 // Записи, из которых складывается усечённая тема.
@@ -146,7 +145,7 @@ func TestTruncationBelowCommittedOffset(t *testing.T) {
 			t.Fatalf("NewProducer: %v", err)
 		}
 
-		t.Cleanup(func() { _ = producer.Close() })
+		closeProducer(t, producer)
 
 		resumed := &collector{}
 		startConsumer(t, cfg, topic, resumed)
@@ -205,7 +204,7 @@ func primeTruncatedTopic(t *testing.T, cfg kafkax.Config) string {
 		t.Fatalf("NewProducer: %v", err)
 	}
 
-	t.Cleanup(func() { _ = producer.Close() })
+	closeProducer(t, producer)
 
 	send := func(values []string) {
 		t.Helper()

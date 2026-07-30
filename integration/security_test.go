@@ -29,13 +29,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alfzs/kafkax/v2"
 	"github.com/testcontainers/testcontainers-go"
 	tckafka "github.com/testcontainers/testcontainers-go/modules/kafka"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
-
-	"github.com/alfzs/kafkax/v2"
 )
 
 const (
@@ -218,7 +217,7 @@ func requireRoundTrip(t *testing.T, cfg kafkax.Config, topic, value string) {
 		t.Fatalf("NewProducer: %v", err)
 	}
 
-	t.Cleanup(func() { _ = producer.Close() })
+	closeProducer(t, producer)
 
 	if err := producer.SendMessage(t.Context(), kafkax.PublishRequest{
 		Topic: topic,
@@ -262,7 +261,10 @@ func requireRejected(t *testing.T, cfg kafkax.Config, topic, wantReason string) 
 		t.Fatalf("NewProducer: %v", err)
 	}
 
-	t.Cleanup(func() { _ = producer.Close() })
+	// Ошибка Close здесь выбрасывается намеренно, в отличие от closeProducer:
+	// продюсер этого сценария по построению не смог доставить запись, и его
+	// FlushError — не отказ, а ровно то, что сценарий и проверяет.
+	t.Cleanup(func() { _ = producer.Close() }) //nolint:errcheck // см. выше
 
 	started := time.Now()
 
@@ -382,9 +384,20 @@ func logBrokerOutput(t *testing.T, ctx context.Context, container *tckafka.Kafka
 
 	head := make([]byte, 16<<10)
 
-	n, _ := logs.Read(head)
+	// Читается одна порция, а не весь поток: лог нужен для разбора отказа
+	// вручную, и первых килобайт хватает. Ошибка чтения тут не событие — с
+	// пустой головой печатать всё равно нечего, а io.EOF на коротком логе
+	// штатен, — но выбросить её в `_` значило бы потерять причину, по которой
+	// лога нет.
+	n, err := logs.Read(head)
 	if n > 0 {
 		t.Logf("лог брокера:\n%s", head[:n])
+
+		return
+	}
+
+	if err != nil {
+		t.Logf("лог брокера не прочитался: %v", err)
 	}
 }
 

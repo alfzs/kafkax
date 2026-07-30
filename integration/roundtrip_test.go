@@ -30,7 +30,7 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatalf("NewProducer: %v", err)
 	}
 
-	t.Cleanup(func() { _ = producer.Close() })
+	closeProducer(t, producer)
 
 	for _, value := range []string{"first", "second", "third"} {
 		if err := producer.SendMessage(t.Context(), kafkax.PublishRequest{
@@ -96,7 +96,7 @@ func startConsumer(
 	}
 
 	// Идемпотентен: явный Stop внутри теста этому не мешает.
-	t.Cleanup(func() { _ = consumer.Stop() })
+	stopConsumer(t, consumer)
 
 	return consumer
 }
