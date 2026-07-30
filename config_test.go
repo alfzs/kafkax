@@ -3,6 +3,7 @@ package kafkax
 import (
 	"crypto/tls"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,19 @@ func cfgUnwrapJoined(t *testing.T, err error) []error {
 	}
 
 	return joined.Unwrap()
+}
+
+// cfgLabel — то, как поле называется в тексте ошибки валидации: Go-путь плюс
+// имя переменной окружения.
+//
+// Собирается тем же кодом, что и сообщение, намеренно. Здесь проверяется
+// связка «поле — претензия»: что о неположительном MaxBytes ругаются именно на
+// Consumer.MaxBytes, а не на соседа. Правильность самого имени переменной —
+// отдельный вопрос, и его сторожит TestEnvNamesMatchStructTags, сверяя вывод с
+// тегами структуры; дублировать её здесь значило бы переписывать сорок строк
+// на каждое переименование поля.
+func cfgLabel(goPath string) string {
+	return cfgField(goPath).String()
 }
 
 // cfgWantErr требует ненулевую ошибку, текст которой содержит все want.
@@ -82,34 +96,34 @@ func TestConfigValidateCommonFields(t *testing.T) {
 		want   string
 	}{
 		{
-			name:   "nil brokers",
+			name:   "nil Brokers",
 			mutate: func(c *Config) { c.Brokers = nil },
-			want:   "brokers must not be empty",
+			want:   cfgLabel("Brokers") + " must not be empty",
 		},
 		{
-			name:   "пустой список brokers",
+			name:   "пустой список Brokers",
 			mutate: func(c *Config) { c.Brokers = []string{} },
-			want:   "brokers must not be empty",
+			want:   cfgLabel("Brokers") + " must not be empty",
 		},
 		{
-			name:   "пустой client_id",
+			name:   "пустой ClientID",
 			mutate: func(c *Config) { c.ClientID = "" },
-			want:   "client_id must not be empty",
+			want:   cfgLabel("ClientID") + " must not be empty",
 		},
 		{
-			name:   "нулевой graceful_timeout",
+			name:   "нулевой GracefulTimeout",
 			mutate: func(c *Config) { c.GracefulTimeout = 0 },
-			want:   "graceful_timeout must be positive",
+			want:   cfgLabel("GracefulTimeout") + " must be positive",
 		},
 		{
-			name:   "отрицательный graceful_timeout",
+			name:   "отрицательный GracefulTimeout",
 			mutate: func(c *Config) { c.GracefulTimeout = -time.Second },
-			want:   "graceful_timeout must be positive",
+			want:   cfgLabel("GracefulTimeout") + " must be positive",
 		},
 		{
-			name:   "нулевой dial_timeout",
+			name:   "нулевой DialTimeout",
 			mutate: func(c *Config) { c.DialTimeout = 0 },
-			want:   "dial_timeout must be positive",
+			want:   cfgLabel("DialTimeout") + " must be positive",
 		},
 	}
 
@@ -147,10 +161,10 @@ func TestConfigValidateCollectsAllErrors(t *testing.T) {
 	}
 
 	cfgWantErr(t, cfg.validateProducer(),
-		"brokers must not be empty",
-		"client_id must not be empty",
-		"graceful_timeout must be positive",
-		"dial_timeout must be positive")
+		cfgLabel("Brokers")+" must not be empty",
+		cfgLabel("ClientID")+" must not be empty",
+		cfgLabel("GracefulTimeout")+" must be positive",
+		cfgLabel("DialTimeout")+" must be positive")
 }
 
 func TestConfigValidateZeroConfigReportsBothSections(t *testing.T) {
@@ -161,9 +175,9 @@ func TestConfigValidateZeroConfigReportsBothSections(t *testing.T) {
 	// Пустая структура — это приложение, забывшее заполнить конфиг вообще.
 	// Оно должно получить полный список претензий сразу, включая обе секции.
 	cfgWantErr(t, cfg.Validate(),
-		"brokers must not be empty",
-		"producer.message_timeout must be positive",
-		"consumer.group must not be empty")
+		cfgLabel("Brokers")+" must not be empty",
+		cfgLabel("Producer.MessageTimeout")+" must be positive",
+		cfgLabel("Consumer.Group")+" must not be empty")
 
 	if got := len(cfgUnwrapJoined(t, cfg.Validate())); got < 10 {
 		t.Errorf("пустой Config дал всего %d ошибок — валидация явно поредела", got)
@@ -186,8 +200,8 @@ func TestConfigValidateSectionsAreIndependent(t *testing.T) {
 		cfg.Consumer.InitialOffset = "sideways"
 
 		cfgWantNoErr(t, cfg.validateProducer())
-		cfgWantErr(t, cfg.validateConsumer(), "consumer.group must not be empty")
-		cfgWantErr(t, cfg.Validate(), "consumer.group must not be empty")
+		cfgWantErr(t, cfg.validateConsumer(), cfgLabel("Consumer.Group")+" must not be empty")
+		cfgWantErr(t, cfg.Validate(), cfgLabel("Consumer.Group")+" must not be empty")
 	})
 
 	t.Run("дефект producer не мешает консьюмеру", func(t *testing.T) {
@@ -199,8 +213,8 @@ func TestConfigValidateSectionsAreIndependent(t *testing.T) {
 		cfg.Producer.MaxInflight = 0
 
 		cfgWantNoErr(t, cfg.validateConsumer())
-		cfgWantErr(t, cfg.validateProducer(), "producer.message_timeout must be positive")
-		cfgWantErr(t, cfg.Validate(), "producer.message_timeout must be positive")
+		cfgWantErr(t, cfg.validateProducer(), cfgLabel("Producer.MessageTimeout")+" must be positive")
+		cfgWantErr(t, cfg.Validate(), cfgLabel("Producer.MessageTimeout")+" must be positive")
 	})
 }
 
@@ -246,21 +260,21 @@ func TestConfigValidateSASL(t *testing.T) {
 			name:     "неизвестный механизм",
 			sasl:     SASL{Mechanism: "GSSAPI", Username: "u", Password: "p"},
 			wantErrs: 1,
-			want:     []string{"sasl.mechanism must be one of", `got "GSSAPI"`},
+			want:     []string{cfgLabel("SASL.Mechanism") + " must be one of", `got "GSSAPI"`},
 		},
 		{
 			name:     "пустой username",
 			sasl:     SASL{Mechanism: SASLMechanismPlain, Password: "p"},
 			tls:      TLS{Enabled: true},
 			wantErrs: 1,
-			want:     []string{"sasl.username required for"},
+			want:     []string{cfgLabel("SASL.Username") + " must be set when SASL.Mechanism is"},
 		},
 		{
 			name:     "пустой password",
 			sasl:     SASL{Mechanism: SASLMechanismPlain, Username: "u"},
 			tls:      TLS{Enabled: true},
 			wantErrs: 1,
-			want:     []string{"sasl.password required for"},
+			want:     []string{cfgLabel("SASL.Password") + " must be set when SASL.Mechanism is"},
 		},
 		{
 			// Три независимых дефекта в одной секции — три ошибки: сообщение
@@ -268,7 +282,7 @@ func TestConfigValidateSASL(t *testing.T) {
 			name:     "неизвестный механизм без учётных данных",
 			sasl:     SASL{Mechanism: "kerberos"},
 			wantErrs: 3,
-			want:     []string{"sasl.mechanism", "sasl.username", "sasl.password"},
+			want:     []string{"SASL.Mechanism", "SASL.Username", "SASL.Password"},
 		},
 	}
 
@@ -373,7 +387,7 @@ func TestConfigValidateSASLPlaintext(t *testing.T) {
 			// Проверка общая, а не продюсерская: пароль уходит в сеть с любой
 			// стороны, и консьюмер обязан отвергать ту же конфигурацию.
 			err := cfg.validateProducer()
-			cfgWantErr(t, err, plaintextErr, "sasl.allow_plaintext=true")
+			cfgWantErr(t, err, plaintextErr, "SASL.AllowPlaintext=true")
 			cfgWantErr(t, cfg.validateConsumer(), plaintextErr)
 
 			if strings.Contains(err.Error(), redactionCanary) {
@@ -419,12 +433,12 @@ func TestConfigValidateTLS(t *testing.T) {
 			// к брокеру без клиентского сертификата.
 			name: "сертификат без ключа",
 			tls:  TLS{Enabled: true, ClientCertPath: "/c.pem"},
-			want: "tls.client_cert_path and tls.client_key_path must be set together",
+			want: cfgLabel("TLS.ClientCertPath") + " and " + cfgLabel("TLS.ClientKeyPath") + " must be set together",
 		},
 		{
 			name: "ключ без сертификата",
 			tls:  TLS{Enabled: true, ClientKeyPath: "/k.pem"},
-			want: "tls.client_cert_path and tls.client_key_path must be set together",
+			want: cfgLabel("TLS.ClientCertPath") + " and " + cfgLabel("TLS.ClientKeyPath") + " must be set together",
 		},
 		{
 			// Пара проверяется независимо от флага Enabled: полузаполненная
@@ -432,7 +446,7 @@ func TestConfigValidateTLS(t *testing.T) {
 			// значит увести пользователя к незашифрованному соединению.
 			name: "полупара при выключенном TLS",
 			tls:  TLS{ClientCertPath: "/c.pem"},
-			want: "tls.client_cert_path and tls.client_key_path must be set together",
+			want: cfgLabel("TLS.ClientCertPath") + " and " + cfgLabel("TLS.ClientKeyPath") + " must be set together",
 		},
 	}
 
@@ -466,22 +480,22 @@ func TestConfigValidateProducerFields(t *testing.T) {
 		{
 			name:   "нулевой message_timeout",
 			mutate: func(p *Producer) { p.MessageTimeout = 0 },
-			want:   "producer.message_timeout must be positive",
+			want:   cfgLabel("Producer.MessageTimeout") + " must be positive",
 		},
 		{
 			name:   "отрицательный flush_timeout",
 			mutate: func(p *Producer) { p.FlushTimeout = -time.Second },
-			want:   "producer.flush_timeout must be positive",
+			want:   cfgLabel("Producer.FlushTimeout") + " must be positive",
 		},
 		{
 			name:   "нулевой ack_timeout",
 			mutate: func(p *Producer) { p.AckTimeout = 0 },
-			want:   "producer.ack_timeout must be positive",
+			want:   cfgLabel("Producer.AckTimeout") + " must be positive",
 		},
 		{
 			name:   "нулевой max_buffered_records",
 			mutate: func(p *Producer) { p.MaxBufferedRecords = 0 },
-			want:   "producer.max_buffered_records must be positive",
+			want:   cfgLabel("Producer.MaxBufferedRecords") + " must be positive",
 		},
 		{
 			// Ноль здесь отвергается конструктором клиента franz-go при
@@ -489,22 +503,22 @@ func TestConfigValidateProducerFields(t *testing.T) {
 			// на поле конфигурации.
 			name:   "нулевой max_inflight",
 			mutate: func(p *Producer) { p.MaxInflight = 0 },
-			want:   "producer.max_inflight must be positive",
+			want:   cfgLabel("Producer.MaxInflight") + " must be positive",
 		},
 		{
 			name:   "отрицательный max_retries",
 			mutate: func(p *Producer) { p.MaxRetries = -1 },
-			want:   "producer.max_retries must not be negative",
+			want:   cfgLabel("Producer.MaxRetries") + " must not be negative",
 		},
 		{
 			name:   "нулевой batch_bytes",
 			mutate: func(p *Producer) { p.BatchBytes = 0 },
-			want:   "producer.batch_bytes must be positive",
+			want:   cfgLabel("Producer.BatchBytes") + " must be positive",
 		},
 		{
 			name:   "неизвестный compression_type",
 			mutate: func(p *Producer) { p.CompressionType = "brotli" },
-			want:   "producer.compression_type must be one of",
+			want:   cfgLabel("Producer.CompressionType") + " must be one of",
 		},
 		{
 			// Пустая строка — не «сжатие по умолчанию»: значение приходит из
@@ -512,7 +526,7 @@ func TestConfigValidateProducerFields(t *testing.T) {
 			// превращаться в none.
 			name:   "пустой compression_type",
 			mutate: func(p *Producer) { p.CompressionType = "" },
-			want:   "producer.compression_type must be one of",
+			want:   cfgLabel("Producer.CompressionType") + " must be one of",
 		},
 		{
 			name:   "нулевой max_retries допустим",
@@ -524,7 +538,7 @@ func TestConfigValidateProducerFields(t *testing.T) {
 			// способом, каким это написано в godoc поля.
 			name:   "отрицательный max_buffered_bytes",
 			mutate: func(p *Producer) { p.MaxBufferedBytes = -1 },
-			want:   "producer.max_buffered_bytes must not be negative",
+			want:   cfgLabel("Producer.MaxBufferedBytes") + " must not be negative",
 		},
 		{
 			name:   "нулевой max_buffered_bytes допустим — это «без лимита»",
@@ -574,25 +588,25 @@ func TestConfigValidateAcksAndIdempotence(t *testing.T) {
 			name:        "acks=1 с идемпотентностью",
 			acks:        1,
 			idempotence: true,
-			want:        "producer.required_acks=1 requires producer.enable_idempotence=false",
+			want:        cfgLabel("Producer.RequiredAcks") + " must be -1 unless Producer.EnableIdempotence is false",
 		},
 		{
 			name:        "acks=0 с идемпотентностью",
 			acks:        0,
 			idempotence: true,
-			want:        "producer.required_acks=0 requires producer.enable_idempotence=false",
+			want:        cfgLabel("Producer.RequiredAcks") + " must be -1 unless Producer.EnableIdempotence is false",
 		},
 		{
 			name:        "acks=2 вне диапазона",
 			acks:        2,
 			idempotence: false,
-			want:        "producer.required_acks must be -1, 0 or 1",
+			want:        cfgLabel("Producer.RequiredAcks") + " must be -1, 0 or 1",
 		},
 		{
 			name:        "acks=-2 вне диапазона",
 			acks:        -2,
 			idempotence: true,
-			want:        "producer.required_acks must be -1, 0 or 1",
+			want:        cfgLabel("Producer.RequiredAcks") + " must be -1, 0 or 1",
 		},
 	}
 
@@ -640,32 +654,32 @@ func consumerTimingFieldCases() []consumerFieldCase {
 		{
 			name:   "пустая группа",
 			mutate: func(c *Consumer) { c.Group = "" },
-			want:   "consumer.group must not be empty",
+			want:   cfgLabel("Consumer.Group") + " must not be empty",
 		},
 		{
 			name:   "нулевой session_timeout",
 			mutate: func(c *Consumer) { c.SessionTimeout = 0 },
-			want:   "consumer.session_timeout must be positive",
+			want:   cfgLabel("Consumer.SessionTimeout") + " must be positive",
 		},
 		{
 			name:   "нулевой heartbeat_interval",
 			mutate: func(c *Consumer) { c.HeartbeatInterval = 0 },
-			want:   "consumer.heartbeat_interval must be positive",
+			want:   cfgLabel("Consumer.HeartbeatInterval") + " must be positive",
 		},
 		{
 			name:   "нулевой rebalance_timeout",
 			mutate: func(c *Consumer) { c.RebalanceTimeout = 0 },
-			want:   "consumer.rebalance_timeout must be positive",
+			want:   cfgLabel("Consumer.RebalanceTimeout") + " must be positive",
 		},
 		{
 			name:   "нулевой commit_interval",
 			mutate: func(c *Consumer) { c.CommitInterval = 0 },
-			want:   "consumer.commit_interval must be positive",
+			want:   cfgLabel("Consumer.CommitInterval") + " must be positive",
 		},
 		{
 			name:   "нулевой max_wait",
 			mutate: func(c *Consumer) { c.MaxWait = 0 },
-			want:   "consumer.max_wait must be positive",
+			want:   cfgLabel("Consumer.MaxWait") + " must be positive",
 		},
 		{
 			// Heartbeat не короче сессии означает, что группа развалится по
@@ -674,14 +688,14 @@ func consumerTimingFieldCases() []consumerFieldCase {
 			mutate: func(c *Consumer) {
 				c.HeartbeatInterval = c.SessionTimeout
 			},
-			want: "must not exceed a third of consumer.session_timeout",
+			want: "must not exceed a third of Consumer.SessionTimeout",
 		},
 		{
 			name: "heartbeat_interval больше session_timeout",
 			mutate: func(c *Consumer) {
 				c.HeartbeatInterval = c.SessionTimeout + time.Second
 			},
-			want: "must not exceed a third of consumer.session_timeout",
+			want: "must not exceed a third of Consumer.SessionTimeout",
 		},
 		{
 			// Граница проверки — треть, а не сам таймаут: при интервале в
@@ -692,39 +706,39 @@ func consumerTimingFieldCases() []consumerFieldCase {
 			mutate: func(c *Consumer) {
 				c.HeartbeatInterval = c.SessionTimeout/3 + time.Millisecond
 			},
-			want: "must not exceed a third of consumer.session_timeout",
+			want: "must not exceed a third of Consumer.SessionTimeout",
 		},
 		{
 			// Отрицательное значение уронило бы make(chan, n) паникой уже
 			// после того, как конструктор вернул nil-ошибку.
 			name:   "отрицательный message_queue_size",
 			mutate: func(c *Consumer) { c.MessageQueueSize = -1 },
-			want:   "consumer.message_queue_size must be positive",
+			want:   cfgLabel("Consumer.MessageQueueSize") + " must be positive",
 		},
 		{
 			name:   "нулевой max_poll_records",
 			mutate: func(c *Consumer) { c.MaxPollRecords = 0 },
-			want:   "consumer.max_poll_records must be positive",
+			want:   cfgLabel("Consumer.MaxPollRecords") + " must be positive",
 		},
 		{
 			name:   "неизвестный initial_offset",
 			mutate: func(c *Consumer) { c.InitialOffset = "beginning" },
-			want:   "consumer.initial_offset must be",
+			want:   cfgLabel("Consumer.InitialOffset") + " must be",
 		},
 		{
 			name:   "пустой initial_offset",
 			mutate: func(c *Consumer) { c.InitialOffset = "" },
-			want:   "consumer.initial_offset must be",
+			want:   cfgLabel("Consumer.InitialOffset") + " must be",
 		},
 		{
 			name:   "неизвестный isolation_level",
 			mutate: func(c *Consumer) { c.IsolationLevel = "read_dirty" },
-			want:   "consumer.isolation_level must be",
+			want:   cfgLabel("Consumer.IsolationLevel") + " must be",
 		},
 		{
 			name:   "handler_max_retries меньше -1",
 			mutate: func(c *Consumer) { c.HandlerMaxRetries = -2 },
-			want:   "consumer.handler_max_retries must be -1",
+			want:   cfgLabel("Consumer.HandlerMaxRetries") + " must be -1",
 		},
 		{
 			// Ретраи включены, а паузы между ними нет: партиция закрутилась бы
@@ -734,7 +748,7 @@ func consumerTimingFieldCases() []consumerFieldCase {
 				c.HandlerMaxRetries = 3
 				c.HandlerRetryDelay = 0
 			},
-			want: "consumer.handler_retry_delay must be positive",
+			want: cfgLabel("Consumer.HandlerRetryDelay") + " must be positive",
 		},
 		{
 			// При выключенных ретраях задержка не используется, и требовать
@@ -776,22 +790,22 @@ func consumerFetchSizeCases() []consumerFieldCase {
 		{
 			name:   "нулевой min_bytes",
 			mutate: func(c *Consumer) { c.MinBytes = 0 },
-			want:   "consumer.min_bytes must be positive",
+			want:   cfgLabel("Consumer.MinBytes") + " must be positive",
 		},
 		{
 			name:   "отрицательный min_bytes",
 			mutate: func(c *Consumer) { c.MinBytes = -1 },
-			want:   "consumer.min_bytes must be positive",
+			want:   cfgLabel("Consumer.MinBytes") + " must be positive",
 		},
 		{
 			name:   "нулевой max_bytes",
 			mutate: func(c *Consumer) { c.MaxBytes = 0 },
-			want:   "consumer.max_bytes must be positive",
+			want:   cfgLabel("Consumer.MaxBytes") + " must be positive",
 		},
 		{
 			name:   "нулевой max_partition_bytes",
 			mutate: func(c *Consumer) { c.MaxPartitionBytes = 0 },
-			want:   "consumer.max_partition_bytes must be positive",
+			want:   cfgLabel("Consumer.MaxPartitionBytes") + " must be positive",
 		},
 		{
 			// franz-go эту пару принимает и молча прижимает первое ко второму
@@ -799,7 +813,7 @@ func consumerFetchSizeCases() []consumerFieldCase {
 			// узнать об этом можно только по трафику.
 			name:   "max_partition_bytes больше max_bytes",
 			mutate: func(c *Consumer) { c.MaxPartitionBytes = c.MaxBytes + 1 },
-			want:   "consumer.max_partition_bytes (1048577) must not exceed consumer.max_bytes (1048576)",
+			want:   "must not exceed Consumer.MaxBytes=1048576, got 1048577",
 		},
 		{
 			// Равенство — законная граница: одна партиция вправе занять ответ
@@ -828,7 +842,7 @@ func TestConfigValidateFetchSizesReportSeparately(t *testing.T) {
 		t.Fatalf("получено %d ошибок, ожидалась одна: %v", len(errs), errs)
 	}
 
-	cfgWantErr(t, errs[0], "consumer.max_bytes must be positive")
+	cfgWantErr(t, errs[0], cfgLabel("Consumer.MaxBytes")+" must be positive")
 }
 
 func TestConfigValidateConsumerFields(t *testing.T) {
@@ -872,19 +886,19 @@ func TestConfigValidateDurationLimitsMatchFranzGo(t *testing.T) {
 		{
 			name:    "message_timeout ниже секунды",
 			mutate:  func(c *Config) { c.Producer.MessageTimeout = 900 * time.Millisecond },
-			want:    "producer.message_timeout must be at least 1s",
+			want:    cfgLabel("Producer.MessageTimeout") + " must be at least 1s",
 			kgoWant: "record timeout",
 		},
 		{
 			name:    "ack_timeout ниже 100ms",
 			mutate:  func(c *Config) { c.Producer.AckTimeout = 50 * time.Millisecond },
-			want:    "producer.ack_timeout must be at least 100ms",
+			want:    cfgLabel("Producer.AckTimeout") + " must be at least 100ms",
 			kgoWant: "produce timeout",
 		},
 		{
 			name:    "linger больше минуты",
 			mutate:  func(c *Config) { c.Producer.Linger = 2 * time.Minute },
-			want:    "producer.linger must not exceed 1m",
+			want:    cfgLabel("Producer.Linger") + " must not exceed 1m",
 			kgoWant: "linger",
 		},
 		{
@@ -895,28 +909,28 @@ func TestConfigValidateDurationLimitsMatchFranzGo(t *testing.T) {
 				c.Consumer.SessionTimeout = 50 * time.Millisecond
 				c.Consumer.HeartbeatInterval = 20 * time.Millisecond
 			},
-			want:     "consumer.session_timeout must be at least 100ms",
+			want:     cfgLabel("Consumer.SessionTimeout") + " must be at least 100ms",
 			kgoWant:  "session timeout",
 			consumer: true,
 		},
 		{
 			name:     "rebalance_timeout ниже 100ms",
 			mutate:   func(c *Config) { c.Consumer.RebalanceTimeout = 50 * time.Millisecond },
-			want:     "consumer.rebalance_timeout must be at least 100ms",
+			want:     cfgLabel("Consumer.RebalanceTimeout") + " must be at least 100ms",
 			kgoWant:  "rebalance timeout",
 			consumer: true,
 		},
 		{
 			name:     "commit_interval ниже 100ms",
 			mutate:   func(c *Config) { c.Consumer.CommitInterval = 50 * time.Millisecond },
-			want:     "consumer.commit_interval must be at least 100ms",
+			want:     cfgLabel("Consumer.CommitInterval") + " must be at least 100ms",
 			kgoWant:  "autocommit interval",
 			consumer: true,
 		},
 		{
 			name:     "max_wait ниже 10ms",
 			mutate:   func(c *Config) { c.Consumer.MaxWait = 5 * time.Millisecond },
-			want:     "consumer.max_wait must be at least 10ms",
+			want:     cfgLabel("Consumer.MaxWait") + " must be at least 10ms",
 			kgoWant:  "max fetch wait",
 			consumer: true,
 		},
@@ -990,6 +1004,45 @@ func TestConfigValidateReturnsJoinedErrors(t *testing.T) {
 	for _, e := range errs {
 		if !errors.Is(err, e) {
 			t.Errorf("errors.Is не находит вложенную ошибку %v в %v", e, err)
+		}
+	}
+}
+
+// Имя переменной окружения в тексте ошибки выводится из Go-пути поля, а не
+// берётся из тега. Тест сверяет вывод с тегами всей структуры Config.
+//
+// Без него envName был бы обещанием: первое же поле, названное не по правилу
+// (или переименованная переменная), заставило бы ошибку валидации советовать
+// несуществующий KAFKAX_*, причём молча — компилятор о расхождении строки с
+// тегом не знает. Дефект такого рода стоит дороже обычной опечатки: его читают
+// в момент, когда сервис не поднялся, и советом из ошибки пользуются не глядя.
+func TestEnvNamesMatchStructTags(t *testing.T) {
+	t.Parallel()
+
+	walkConfigFields(t, reflect.TypeFor[Config](), "")
+}
+
+func walkConfigFields(t *testing.T, typ reflect.Type, prefix string) {
+	t.Helper()
+
+	for f := range typ.Fields() {
+		path := prefix + f.Name
+
+		// Вложенные секции (SASL, TLS, Producer, Consumer) собственного тега
+		// env не имеют — имя переменной складывается из пути целиком.
+		if f.Type.Kind() == reflect.Struct && f.Tag.Get("env") == "" {
+			walkConfigFields(t, f.Type, path+".")
+
+			continue
+		}
+
+		want, ok := f.Tag.Lookup("env")
+		if !ok {
+			continue
+		}
+
+		if got := envName(path); got != want {
+			t.Errorf("envName(%q) = %q, а тег env поля — %q", path, got, want)
 		}
 	}
 }

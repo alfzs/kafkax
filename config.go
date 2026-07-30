@@ -10,6 +10,7 @@ import (
 	"math"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 )
@@ -611,20 +612,21 @@ func (c Config) commonErrors() []error {
 	var errs []error
 
 	if len(c.Brokers) == 0 {
-		errs = append(errs, errors.New("brokers must not be empty"))
+		errs = append(errs, fmt.Errorf("%s must not be empty", cfgField("Brokers")))
 	}
 
 	if c.ClientID == "" {
-		errs = append(errs, errors.New("client_id must not be empty"))
+		errs = append(errs, fmt.Errorf("%s must not be empty", cfgField("ClientID")))
 	}
 
 	errs = appendNonPositive(errs,
-		positiveDuration{"graceful_timeout", c.GracefulTimeout},
-		positiveDuration{"dial_timeout", c.DialTimeout})
+		positiveDuration{"GracefulTimeout", c.GracefulTimeout},
+		positiveDuration{"DialTimeout", c.DialTimeout})
 
 	if _, ok := kafkaLogLevel(c.KafkaLogLevel); !ok {
 		errs = append(errs, fmt.Errorf(
-			"kafka_log_level must be one of %s, %s, %s, %s, %s (or empty); got %q",
+			"%s must be one of %s, %s, %s, %s, %s (or empty); got %q",
+			cfgField("KafkaLogLevel"),
 			KafkaLogDebug, KafkaLogInfo, KafkaLogWarn, KafkaLogError, KafkaLogNone,
 			c.KafkaLogLevel))
 	}
@@ -648,16 +650,19 @@ func (c Config) saslErrors() []error {
 	case SASLMechanismScramSHA256, SASLMechanismScramSHA512:
 	default:
 		errs = append(errs, fmt.Errorf(
-			"sasl.mechanism must be one of %s, %s, %s; got %q",
+			"%s must be one of %s, %s, %s; got %q",
+			cfgField("SASL.Mechanism"),
 			SASLMechanismPlain, SASLMechanismScramSHA256, SASLMechanismScramSHA512, c.SASL.Mechanism))
 	}
 
 	if c.SASL.Username == "" {
-		errs = append(errs, fmt.Errorf("sasl.username required for sasl.mechanism=%q", c.SASL.Mechanism))
+		errs = append(errs, fmt.Errorf("%s must be set when SASL.Mechanism is %q",
+			cfgField("SASL.Username"), c.SASL.Mechanism))
 	}
 
 	if c.SASL.Password == "" {
-		errs = append(errs, fmt.Errorf("sasl.password required for sasl.mechanism=%q", c.SASL.Mechanism))
+		errs = append(errs, fmt.Errorf("%s must be set when SASL.Mechanism is %q",
+			cfgField("SASL.Password"), c.SASL.Mechanism))
 	}
 
 	return errs
@@ -688,10 +693,12 @@ func (c Config) plaintextPasswordErrors() []error {
 	}
 
 	return []error{fmt.Errorf(
-		"sasl.mechanism=%s without TLS sends the password to the broker in cleartext;"+
-			" enable tls.enabled (or set Config.TLSConfig), or switch to %s/%s,"+
-			" or set sasl.allow_plaintext=true to state that the plaintext connection is intended",
-		SASLMechanismPlain, SASLMechanismScramSHA256, SASLMechanismScramSHA512)}
+		"SASL.Mechanism=%s without TLS sends the password to the broker in cleartext;"+
+			" set TLS.Enabled=true (or Config.TLSConfig), or switch to %s/%s,"+
+			" or set SASL.AllowPlaintext=true (env %s) to state that the plaintext"+
+			" connection is intended",
+		SASLMechanismPlain, SASLMechanismScramSHA256, SASLMechanismScramSHA512,
+		envName("SASL.AllowPlaintext"))}
 }
 
 func (c Config) tlsErrors() []error {
@@ -701,7 +708,8 @@ func (c Config) tlsErrors() []error {
 	// конфигурация, при которой tls.LoadX509KeyPair не вызовется вовсе и
 	// клиент молча пойдёт без клиентского сертификата.
 	if (c.TLS.ClientCertPath == "") != (c.TLS.ClientKeyPath == "") {
-		errs = append(errs, errors.New("tls.client_cert_path and tls.client_key_path must be set together"))
+		errs = append(errs, fmt.Errorf("%s and %s must be set together",
+			cfgField("TLS.ClientCertPath"), cfgField("TLS.ClientKeyPath")))
 	}
 
 	return errs
@@ -709,39 +717,44 @@ func (c Config) tlsErrors() []error {
 
 func (c Config) producerErrors() []error {
 	errs := appendNonPositive(nil,
-		positiveDuration{"producer.message_timeout", c.Producer.MessageTimeout},
-		positiveDuration{"producer.flush_timeout", c.Producer.FlushTimeout},
-		positiveDuration{"producer.ack_timeout", c.Producer.AckTimeout})
+		positiveDuration{"Producer.MessageTimeout", c.Producer.MessageTimeout},
+		positiveDuration{"Producer.FlushTimeout", c.Producer.FlushTimeout},
+		positiveDuration{"Producer.AckTimeout", c.Producer.AckTimeout})
 
 	errs = appendBelowMinimum(errs,
-		boundedDuration{"producer.message_timeout", c.Producer.MessageTimeout, time.Second},
-		boundedDuration{"producer.ack_timeout", c.Producer.AckTimeout, 100 * time.Millisecond})
+		boundedDuration{"Producer.MessageTimeout", c.Producer.MessageTimeout, time.Second},
+		boundedDuration{"Producer.AckTimeout", c.Producer.AckTimeout, 100 * time.Millisecond})
 
 	// Верхняя граница linger — тоже проверка kgo.NewClient. Ноль законен и
 	// означает «отправлять батч сразу», поэтому нижней границы у поля нет.
 	if c.Producer.Linger > time.Minute {
-		errs = append(errs, fmt.Errorf("producer.linger must not exceed 1m, got %v", c.Producer.Linger))
+		errs = append(errs, fmt.Errorf("%s must not exceed 1m, got %v",
+			cfgField("Producer.Linger"), c.Producer.Linger))
 	}
 
 	if c.Producer.Linger < 0 {
-		errs = append(errs, fmt.Errorf("producer.linger must not be negative, got %v", c.Producer.Linger))
+		errs = append(errs, fmt.Errorf("%s must not be negative, got %v",
+			cfgField("Producer.Linger"), c.Producer.Linger))
 	}
 
 	if c.Producer.MaxBufferedRecords <= 0 {
-		errs = append(errs, fmt.Errorf(
-			"producer.max_buffered_records must be positive, got %d", c.Producer.MaxBufferedRecords))
+		errs = append(errs, fmt.Errorf("%s must be positive, got %d",
+			cfgField("Producer.MaxBufferedRecords"), c.Producer.MaxBufferedRecords))
 	}
 
 	if c.Producer.MaxInflight <= 0 {
-		errs = append(errs, fmt.Errorf("producer.max_inflight must be positive, got %d", c.Producer.MaxInflight))
+		errs = append(errs, fmt.Errorf("%s must be positive, got %d",
+			cfgField("Producer.MaxInflight"), c.Producer.MaxInflight))
 	}
 
 	if c.Producer.MaxRetries < 0 {
-		errs = append(errs, fmt.Errorf("producer.max_retries must not be negative, got %d", c.Producer.MaxRetries))
+		errs = append(errs, fmt.Errorf("%s must not be negative, got %d",
+			cfgField("Producer.MaxRetries"), c.Producer.MaxRetries))
 	}
 
 	if c.Producer.BatchBytes <= 0 {
-		errs = append(errs, fmt.Errorf("producer.batch_bytes must be positive, got %d", c.Producer.BatchBytes))
+		errs = append(errs, fmt.Errorf("%s must be positive, got %d",
+			cfgField("Producer.BatchBytes"), c.Producer.BatchBytes))
 	}
 
 	// Ноль — законное «без лимита», а вот отрицательное значение godoc не
@@ -750,8 +763,8 @@ func (c Config) producerErrors() []error {
 	// написано в конфигурации.
 	if c.Producer.MaxBufferedBytes < 0 {
 		errs = append(errs, fmt.Errorf(
-			"producer.max_buffered_bytes must not be negative (0 means unlimited), got %d",
-			c.Producer.MaxBufferedBytes))
+			"%s must not be negative (0 means unlimited), got %d",
+			cfgField("Producer.MaxBufferedBytes"), c.Producer.MaxBufferedBytes))
 	}
 
 	errs = append(errs, c.acksErrors()...)
@@ -773,14 +786,15 @@ func (c Config) acksErrors() []error {
 	case 0, 1:
 		if c.Producer.EnableIdempotence {
 			return []error{fmt.Errorf(
-				"producer.required_acks=%d requires producer.enable_idempotence=false"+
-					" (idempotent writes are only defined for acks=-1)",
-				c.Producer.RequiredAcks)}
+				"%s must be -1 unless Producer.EnableIdempotence is false"+
+					" (idempotent writes are only defined for acks=-1); got %d",
+				cfgField("Producer.RequiredAcks"), c.Producer.RequiredAcks)}
 		}
 
 		return nil
 	default:
-		return []error{fmt.Errorf("producer.required_acks must be -1, 0 or 1; got %d", c.Producer.RequiredAcks)}
+		return []error{fmt.Errorf("%s must be -1, 0 or 1; got %d",
+			cfgField("Producer.RequiredAcks"), c.Producer.RequiredAcks)}
 	}
 }
 
@@ -788,21 +802,21 @@ func (c Config) consumerErrors() []error {
 	var errs []error
 
 	if c.Consumer.Group == "" {
-		errs = append(errs, errors.New("consumer.group must not be empty"))
+		errs = append(errs, fmt.Errorf("%s must not be empty", cfgField("Consumer.Group")))
 	}
 
 	errs = appendNonPositive(errs,
-		positiveDuration{"consumer.session_timeout", c.Consumer.SessionTimeout},
-		positiveDuration{"consumer.heartbeat_interval", c.Consumer.HeartbeatInterval},
-		positiveDuration{"consumer.rebalance_timeout", c.Consumer.RebalanceTimeout},
-		positiveDuration{"consumer.commit_interval", c.Consumer.CommitInterval},
-		positiveDuration{"consumer.max_wait", c.Consumer.MaxWait})
+		positiveDuration{"Consumer.SessionTimeout", c.Consumer.SessionTimeout},
+		positiveDuration{"Consumer.HeartbeatInterval", c.Consumer.HeartbeatInterval},
+		positiveDuration{"Consumer.RebalanceTimeout", c.Consumer.RebalanceTimeout},
+		positiveDuration{"Consumer.CommitInterval", c.Consumer.CommitInterval},
+		positiveDuration{"Consumer.MaxWait", c.Consumer.MaxWait})
 
 	errs = appendBelowMinimum(errs,
-		boundedDuration{"consumer.session_timeout", c.Consumer.SessionTimeout, 100 * time.Millisecond},
-		boundedDuration{"consumer.rebalance_timeout", c.Consumer.RebalanceTimeout, 100 * time.Millisecond},
-		boundedDuration{"consumer.commit_interval", c.Consumer.CommitInterval, 100 * time.Millisecond},
-		boundedDuration{"consumer.max_wait", c.Consumer.MaxWait, 10 * time.Millisecond})
+		boundedDuration{"Consumer.SessionTimeout", c.Consumer.SessionTimeout, 100 * time.Millisecond},
+		boundedDuration{"Consumer.RebalanceTimeout", c.Consumer.RebalanceTimeout, 100 * time.Millisecond},
+		boundedDuration{"Consumer.CommitInterval", c.Consumer.CommitInterval, 100 * time.Millisecond},
+		boundedDuration{"Consumer.MaxWait", c.Consumer.MaxWait, 10 * time.Millisecond})
 
 	// Не «меньше session_timeout», а «не больше его трети» — ровно то, что
 	// обещает godoc HeartbeatInterval. Требование не косметическое: при
@@ -812,27 +826,29 @@ func (c Config) consumerErrors() []error {
 	maxHeartbeat := c.Consumer.SessionTimeout / 3
 	if c.Consumer.SessionTimeout > 0 && c.Consumer.HeartbeatInterval > maxHeartbeat {
 		errs = append(errs, fmt.Errorf(
-			"consumer.heartbeat_interval (%v) must not exceed a third of consumer.session_timeout (%v), i.e. %v",
-			c.Consumer.HeartbeatInterval, c.Consumer.SessionTimeout, maxHeartbeat))
+			"%s must not exceed a third of Consumer.SessionTimeout=%v, i.e. %v; got %v",
+			cfgField("Consumer.HeartbeatInterval"),
+			c.Consumer.SessionTimeout, maxHeartbeat, c.Consumer.HeartbeatInterval))
 	}
 
 	// Отрицательное значение роняет makechan паникой уже после того, как
 	// конструктор вернул nil-ошибку.
 	if c.Consumer.MessageQueueSize <= 0 {
-		errs = append(errs, fmt.Errorf(
-			"consumer.message_queue_size must be positive, got %d", c.Consumer.MessageQueueSize))
+		errs = append(errs, fmt.Errorf("%s must be positive, got %d",
+			cfgField("Consumer.MessageQueueSize"), c.Consumer.MessageQueueSize))
 	}
 
 	if c.Consumer.MaxPollRecords <= 0 {
-		errs = append(errs, fmt.Errorf(
-			"consumer.max_poll_records must be positive, got %d", c.Consumer.MaxPollRecords))
+		errs = append(errs, fmt.Errorf("%s must be positive, got %d",
+			cfgField("Consumer.MaxPollRecords"), c.Consumer.MaxPollRecords))
 	}
 
 	switch strings.ToLower(c.Consumer.InitialOffset) {
 	case OffsetEarliest, OffsetLatest:
 	default:
 		errs = append(errs, fmt.Errorf(
-			"consumer.initial_offset must be %q or %q; got %q",
+			"%s must be %q or %q; got %q",
+			cfgField("Consumer.InitialOffset"),
 			OffsetEarliest, OffsetLatest, c.Consumer.InitialOffset))
 	}
 
@@ -840,7 +856,8 @@ func (c Config) consumerErrors() []error {
 	case IsolationReadCommitted, IsolationReadUncommitted:
 	default:
 		errs = append(errs, fmt.Errorf(
-			"consumer.isolation_level must be %q or %q; got %q",
+			"%s must be %q or %q; got %q",
+			cfgField("Consumer.IsolationLevel"),
 			IsolationReadCommitted, IsolationReadUncommitted, c.Consumer.IsolationLevel))
 	}
 
@@ -857,32 +874,35 @@ func (c Config) consumerErrors() []error {
 //
 // franz-go эти поля не проверяет вовсе. Ноль проходит и Validate, и конструктор
 // клиента, и отказ выглядит не как ошибка конфигурации, а как «консьюмер
-// подключился и ничего не читает». Пару max_partition_bytes > max_bytes
+// подключился и ничего не читает». Пару MaxPartitionBytes > MaxBytes
 // franz-go молча прижимает (kgo/config.go), то есть настройка перестаёт значить
 // написанное — и об этом тоже узнают не из лога, а из наблюдения за трафиком.
 func (c Config) fetchSizeErrors() []error {
 	var errs []error
 
 	if c.Consumer.MinBytes <= 0 {
-		errs = append(errs, fmt.Errorf("consumer.min_bytes must be positive, got %d", c.Consumer.MinBytes))
+		errs = append(errs, fmt.Errorf("%s must be positive, got %d",
+			cfgField("Consumer.MinBytes"), c.Consumer.MinBytes))
 	}
 
 	if c.Consumer.MaxBytes <= 0 {
-		errs = append(errs, fmt.Errorf("consumer.max_bytes must be positive, got %d", c.Consumer.MaxBytes))
+		errs = append(errs, fmt.Errorf("%s must be positive, got %d",
+			cfgField("Consumer.MaxBytes"), c.Consumer.MaxBytes))
 	}
 
 	if c.Consumer.MaxPartitionBytes <= 0 {
-		errs = append(errs, fmt.Errorf(
-			"consumer.max_partition_bytes must be positive, got %d", c.Consumer.MaxPartitionBytes))
+		errs = append(errs, fmt.Errorf("%s must be positive, got %d",
+			cfgField("Consumer.MaxPartitionBytes"), c.Consumer.MaxPartitionBytes))
 	}
 
 	// Сравнение имеет смысл только при положительной верхней границе: при
-	// max_bytes=0 ошибка о ней уже добавлена, и вторая претензия к той же
+	// MaxBytes=0 ошибка о ней уже добавлена, и вторая претензия к той же
 	// опечатке только удлинила бы список.
 	if c.Consumer.MaxBytes > 0 && c.Consumer.MaxPartitionBytes > c.Consumer.MaxBytes {
 		errs = append(errs, fmt.Errorf(
-			"consumer.max_partition_bytes (%d) must not exceed consumer.max_bytes (%d)",
-			c.Consumer.MaxPartitionBytes, c.Consumer.MaxBytes))
+			"%s must not exceed Consumer.MaxBytes=%d, got %d",
+			cfgField("Consumer.MaxPartitionBytes"),
+			c.Consumer.MaxBytes, c.Consumer.MaxPartitionBytes))
 	}
 
 	return errs
@@ -895,26 +915,107 @@ func (c Config) handlerRetryErrors() []error {
 
 	if c.Consumer.HandlerMaxRetries < -1 {
 		errs = append(errs, fmt.Errorf(
-			"consumer.handler_max_retries must be -1 (infinite), 0 (no retries) or positive; got %d",
-			c.Consumer.HandlerMaxRetries))
+			"%s must be -1 (infinite), 0 (no retries) or positive; got %d",
+			cfgField("Consumer.HandlerMaxRetries"), c.Consumer.HandlerMaxRetries))
 	}
 
+	// «got %v» здесь не для симметрии с соседями: ноль и отрицательная
+	// длительность — разные опечатки (забыли поле против «-1s» из шаблона), а
+	// без значения они выглядят одинаково.
 	if c.Consumer.HandlerMaxRetries != 0 && c.Consumer.HandlerRetryDelay <= 0 {
-		errs = append(errs, errors.New("consumer.handler_retry_delay must be positive when retries are enabled"))
+		errs = append(errs, fmt.Errorf("%s must be positive when retries are enabled, got %v",
+			cfgField("Consumer.HandlerRetryDelay"), c.Consumer.HandlerRetryDelay))
 	}
 
 	return errs
 }
 
-// positiveDuration — пара «имя поля в yaml, значение» для appendNonPositive.
+// cfgField — координаты поля конфигурации в тексте ошибки валидации: Go-путь
+// плюс имя переменной окружения, например
+// «Consumer.MaxBytes (env KAFKAX_CONSUMER_MAX_BYTES)».
+//
+// Go-путь основной, потому что Config собирают двумя способами, а прежний
+// yaml-путь («consumer.max_bytes») обслуживал только один из них: по нему
+// нельзя найти поле в структуре, и тот, кто собрал Config литералом в Go,
+// оставался с претензией к полю, которого в его коде не существует. Обратное
+// не симметрично — Go-путь ведёт ко всем трём формам записи: yaml-ключ есть
+// его же snake_case, а имя переменной окружения выводится из него механически
+// (см. envName) и сверяется с тегами структуры тестом.
+//
+// Цена названа: каждое сообщение длиннее примерно на тридцать символов, а
+// пустой Config печатает два десятка таких строк подряд. Скобки всё равно
+// стоят, потому что вторая половина читателей приходит из Kubernetes, где
+// кроме имени переменной у них ничего и нет: Go-путь без него отвечает на
+// вопрос «какое поле», но не на вопрос «что менять в манифесте».
+type cfgField string
+
+func (f cfgField) String() string {
+	return string(f) + " (env " + envName(string(f)) + ")"
+}
+
+// envName выводит имя переменной окружения из Go-пути поля: точка становится
+// подчёркиванием, границы слов — тоже, всё в верхнем регистре.
+//
+// Вывод, а не таблица соответствий: таблица на 40 полей разошлась бы с тегами
+// при первом же добавлении поля, причём молча — ошибка валидации назвала бы
+// несуществующую переменную. Соответствие тегам сторожит
+// TestEnvNamesMatchStructTags: он обходит Config рефлексией и падает, если
+// хоть одно поле названо не по правилу.
+//
+// Пробег по строке на каждую ошибку валидации допустим: путь холодный, конфиг
+// проверяется один раз за старт процесса.
+func envName(goPath string) string {
+	var b strings.Builder
+
+	b.Grow(len(envPrefix) + len(goPath) + 8)
+	b.WriteString(envPrefix)
+
+	for i, r := range goPath {
+		switch {
+		case r == '.':
+			b.WriteByte('_')
+		case isASCIIUpper(r) && i > 0 && needsSeparator(goPath, i):
+			b.WriteByte('_')
+			b.WriteRune(r)
+		default:
+			b.WriteRune(unicode.ToUpper(r))
+		}
+	}
+
+	return b.String()
+}
+
+// envPrefix — общий префикс переменных окружения пакета, тот же, что в тегах env.
+const envPrefix = "KAFKAX_"
+
+func isASCIIUpper(r rune) bool { return r >= 'A' && r <= 'Z' }
+
+// needsSeparator отвечает, начинается ли на позиции i новое слово. Заглавная
+// после строчной — начинается всегда (MaxBytes); заглавная после заглавной —
+// только если следом идёт строчная, иначе распалась бы аббревиатура:
+// ClientID даёт CLIENT_ID, а не CLIENT_I_D, CACertPath — CA_CERT_PATH.
+func needsSeparator(s string, i int) bool {
+	prev := rune(s[i-1])
+	if prev == '_' || prev == '.' {
+		return false
+	}
+
+	if !isASCIIUpper(prev) {
+		return true
+	}
+
+	next := i + 1
+
+	return next < len(s) && rune(s[next]) >= 'a' && rune(s[next]) <= 'z'
+}
+
+// positiveDuration — пара «поле, значение» для appendNonPositive.
 type positiveDuration struct {
-	name  string
+	name  cfgField
 	value time.Duration
 }
 
 // appendNonPositive добавляет по ошибке на каждую неположительную длительность.
-// Имена совпадают с путями в yaml, чтобы из текста ошибки было видно, что
-// править, без чтения исходников.
 func appendNonPositive(errs []error, ds ...positiveDuration) []error {
 	for _, d := range ds {
 		if d.value <= 0 {
@@ -927,7 +1028,7 @@ func appendNonPositive(errs []error, ds ...positiveDuration) []error {
 
 // boundedDuration — длительность и нижняя граница, которую задаёт franz-go.
 type boundedDuration struct {
-	name  string
+	name  cfgField
 	value time.Duration
 	min   time.Duration
 }

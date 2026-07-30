@@ -319,12 +319,12 @@ func TestProducerCloseRaceWithSends(t *testing.T) {
 // пакет писал их в лог и одновременно возвращал ошибку; вызывающий, который
 // свою ошибку тоже логирует, получал одно событие дважды, а число потерянных
 // записей оставалось в строке лога, не связанной с ErrFlushIncomplete. Тест
-// закрепляет исправленное распределение ролей: число — в тексте ошибки, лог
-// пакета молчит.
+// закрепляет исправленное распределение ролей: число — в FlushError.Remaining,
+// лог пакета молчит.
 //
 // Ветку «бюджет кончился до начала flush» от соседней («Flush не уложился в
-// срок») отличает только текст: сентинел у них общий. Поэтому текст и
-// проверяется — без него тест был бы зелёным, попав не в ту ветку.
+// срок») отличает FlushError.Err: у первой причины нет, flush не начинался.
+// Различие проверяется — без него тест был бы зелёным, попав не в ту ветку.
 //
 // Как ветка достигается: отправка на недоступный брокер не может вернуться за
 // GracefulTimeout, awaitInflight израсходует весь бюджет закрытия до последней
@@ -361,8 +361,7 @@ func TestProducerCloseFlushBudgetExhausted(t *testing.T) {
 	}()
 
 	// Close вызывается только после того, как запись попала в буфер клиента:
-	// иначе awaitInflight мог бы вернуться сразу, а число в тексте ошибки
-	// оказаться нулём.
+	// иначе awaitInflight мог бы вернуться сразу, а Remaining оказаться нулём.
 	waitFor(t, consWait, "отправка попала в буфер клиента", func() bool {
 		return hook.n.Load() == 1
 	})
@@ -372,10 +371,18 @@ func TestProducerCloseFlushBudgetExhausted(t *testing.T) {
 		t.Fatalf("Close = %v, ожидался ErrFlushIncomplete", closeErr)
 	}
 
-	for _, want := range []string{"flush budget exhausted", "1 records buffered"} {
-		if !strings.Contains(closeErr.Error(), want) {
-			t.Errorf("Close = %q, ожидалось упоминание %q", closeErr, want)
-		}
+	var flushErr *FlushError
+	if !errors.As(closeErr, &flushErr) {
+		t.Fatalf("errors.As не достал *FlushError из %v", closeErr)
+	}
+
+	if flushErr.Remaining != 1 {
+		t.Errorf("FlushError.Remaining = %d, ожидалась 1 потерянная запись", flushErr.Remaining)
+	}
+
+	// Причины нет — это и есть признак ветки «бюджет кончился до flush».
+	if flushErr.Err != nil {
+		t.Errorf("FlushError.Err = %v, ожидался nil: flush не начинался", flushErr.Err)
 	}
 
 	// Ни числа записей, ни причины отказа в журнале быть не должно: событие

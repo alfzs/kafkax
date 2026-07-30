@@ -147,7 +147,7 @@ func TestDefaultConfigIsUsableAfterFillingRequiredFields(t *testing.T) {
 func TestDefaultConfigWithoutRequiredFieldsFailsValidation(t *testing.T) {
 	t.Parallel()
 
-	cfgWantErr(t, DefaultConfig().Validate(), "brokers", "client_id", "consumer.group")
+	cfgWantErr(t, DefaultConfig().Validate(), "Brokers", "ClientID", "Consumer.Group")
 }
 
 // TestValidationErrorsCarryInvalidConfigSentinel — ошибку валидации можно

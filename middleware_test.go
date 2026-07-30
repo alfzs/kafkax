@@ -215,8 +215,8 @@ func TestMatchKeyMiddleware(t *testing.T) {
 
 				// Длины в тексте — то, ради чего ошибка оборачивается: без них
 				// «invalid composite key» не отличить от опечатки в parts.
-				if !strings.Contains(err.Error(), "match key middleware") {
-					t.Errorf("текст %q не называет middleware", err)
+				if !strings.Contains(err.Error(), "matching message key") {
+					t.Errorf("текст %q не называет операцию", err)
 				}
 			} else if err != nil {
 				t.Fatalf("ProcessMessage = %v, want nil", err)

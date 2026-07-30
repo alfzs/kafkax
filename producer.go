@@ -198,7 +198,7 @@ func (p *KafkaProducer) initMetrics(meter metric.Meter) error {
 // отменил отправку сам вызывающий, а не Kafka.
 func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) (err error) {
 	if !p.acquire() {
-		return fmt.Errorf("send message: %w", ErrProducerClosed)
+		return fmt.Errorf("sending message: %w", ErrProducerClosed)
 	}
 	defer p.inflight.Done()
 
@@ -210,13 +210,13 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) (er
 	if req.Topic == "" {
 		p.reject(ctx, rejectEmptyTopic)
 
-		return fmt.Errorf("send message: %w", ErrEmptyTopic)
+		return fmt.Errorf("sending message: %w", ErrEmptyTopic)
 	}
 
 	if err := validateHeaders(req.Headers); err != nil {
 		p.reject(ctx, rejectInvalidHeaders)
 
-		return fmt.Errorf("send message: %w", err)
+		return fmt.Errorf("sending message: %w", err)
 	}
 
 	start := time.Now()
@@ -358,26 +358,26 @@ func (p *KafkaProducer) acquire() bool {
 func (p *KafkaProducer) produceError(topic string, err error) error {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, kgo.ErrRecordTimeout):
-		return fmt.Errorf("send message: %w: %w", ErrDeliveryTimeout, err)
+		return fmt.Errorf("sending message: %w: %w", ErrDeliveryTimeout, err)
 
 	case errors.Is(err, kgo.ErrClientClosed), errors.Is(err, kgo.ErrAborting):
 		// Close успел закрыть клиент между acquire и ProduceSync либо клиент
 		// сбрасывает буфер: с точки зрения вызывающего это тот же
 		// «продюсер закрыт», что и проваленная проверка в acquire.
-		return fmt.Errorf("send message: %w: %w", ErrProducerClosed, err)
+		return fmt.Errorf("sending message: %w: %w", ErrProducerClosed, err)
 
 	case errors.Is(err, context.Canceled):
 		// Единственная ветка без сентинела: отмена — решение вызывающего, а не
 		// отказ Kafka. Префикс называет операцию, а не причину: ctx.Done()
 		// срабатывает и на отмене, и на дедлайне, и «context canceled: context
 		// deadline exceeded» противоречило бы само себе.
-		return fmt.Errorf("send message: %w", err)
+		return fmt.Errorf("sending message: %w", err)
 
 	default:
 		// Двойной %w: errors.Is находит sentinel, errors.As достаёт
 		// *DeliveryError с кодом брокера, по которому и видно, имеет ли смысл
 		// повтор.
-		return fmt.Errorf("send message: %w: %w", ErrDeliveryFailed, newDeliveryError(topic, err))
+		return fmt.Errorf("sending message: %w: %w", ErrDeliveryFailed, newDeliveryError(topic, err))
 	}
 }
 
@@ -440,14 +440,15 @@ func (p *KafkaProducer) awaitInflight(deadline time.Time) {
 //
 // Оба отказа только возвращаются, без записи в лог: ошибку получает вызывающий
 // Close, и он её залогирует — пакет, залогировав сам, удваивал бы событие в
-// журнале. Число недосланных записей уходит в текст ошибки, а не в атрибут
-// лога, ровно поэтому: иначе оно оставалось бы в строке, которую никто не
-// связал бы с возвращённым ErrFlushIncomplete.
+// журнале. Число недосланных записей едет тем же каналом, но полем
+// FlushError.Remaining, а не текстом: иначе оно либо оставалось бы в строке
+// лога, не связанной с ErrFlushIncomplete, либо плодило по шаблону сообщения
+// на каждое своё значение.
 func (p *KafkaProducer) flush(deadline time.Time) error {
 	budget := min(time.Until(deadline), p.flushTimeout)
 	if budget <= 0 {
-		return fmt.Errorf("closing producer: %w: flush budget exhausted, %d records buffered",
-			ErrFlushIncomplete, p.client.BufferedProduceRecords())
+		return fmt.Errorf("closing producer: %w: %w",
+			ErrFlushIncomplete, &FlushError{Remaining: p.client.BufferedProduceRecords()})
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
@@ -457,8 +458,8 @@ func (p *KafkaProducer) flush(deadline time.Time) error {
 	// спрашивается отдельно — оно и есть то, что потеряется при закрытии
 	// клиента.
 	if err := p.client.Flush(ctx); err != nil {
-		return fmt.Errorf("closing producer: %w: %d records remaining: %w",
-			ErrFlushIncomplete, p.client.BufferedProduceRecords(), err)
+		return fmt.Errorf("closing producer: %w: %w",
+			ErrFlushIncomplete, &FlushError{Remaining: p.client.BufferedProduceRecords(), Err: err})
 	}
 
 	p.logger.Info("All buffered messages flushed")

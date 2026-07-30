@@ -214,7 +214,7 @@ func TestProduceErrorPropagatesCancellation(t *testing.T) {
 	// Префикс называет операцию, а не причину: ctx.Done() срабатывает и на
 	// отмене, и на дедлайне, и «context canceled: context deadline exceeded»
 	// противоречило бы само себе.
-	if !strings.Contains(got.Error(), "send message") {
+	if !strings.Contains(got.Error(), "sending message") {
 		t.Errorf("текст %q не называет операцию", got)
 	}
 }
@@ -353,5 +353,75 @@ func TestDeliveryErrorIsSentinelWithoutWrapping(t *testing.T) {
 
 	if got := err.Error(); !strings.Contains(got, "boom") {
 		t.Errorf("текст %q не доносит причину", got)
+	}
+}
+
+// TestFlushErrorCarriesRemaining — число потерянных записей достаётся типом, а
+// не разбором текста.
+//
+// Ради этого поле и заведено: величина потери — то, по чему принимают решение
+// (алерт, счётчик потерь), а текст ошибки контрактом не объявлен, и код,
+// вычитывающий из него число, ломается от любой правки формулировки.
+func TestFlushErrorCarriesRemaining(t *testing.T) {
+	t.Parallel()
+
+	cause := context.DeadlineExceeded
+	err := fmt.Errorf("closing producer: %w: %w",
+		ErrFlushIncomplete, &FlushError{Remaining: 42, Err: cause})
+
+	if !errors.Is(err, ErrFlushIncomplete) {
+		t.Fatalf("errors.Is(%v, ErrFlushIncomplete) == false", err)
+	}
+
+	var flushErr *FlushError
+	if !errors.As(err, &flushErr) {
+		t.Fatalf("errors.As не достал *FlushError из %v", err)
+	}
+
+	if flushErr.Remaining != 42 {
+		t.Errorf("FlushError.Remaining = %d, ожидалось 42", flushErr.Remaining)
+	}
+
+	// Причина обязана оставаться в цепочке: «flush не уложился в срок» и
+	// «клиент отказал» требуют разной реакции, а сентинел у них общий.
+	if !errors.Is(err, cause) {
+		t.Errorf("причина %v потеряна в %v", cause, err)
+	}
+}
+
+// TestFlushErrorIsSentinelWithoutWrapping — errors.Is опознаёт *FlushError и
+// без обёртки, а исчерпанный бюджет даёт текст без причины: цепочка на нём
+// кончается, потому что flush не начинался.
+func TestFlushErrorIsSentinelWithoutWrapping(t *testing.T) {
+	t.Parallel()
+
+	err := error(&FlushError{Remaining: 1})
+
+	if !errors.Is(err, ErrFlushIncomplete) {
+		t.Fatalf("errors.Is(%v, ErrFlushIncomplete) == false", err)
+	}
+
+	if errors.Is(err, ErrProducerClosed) {
+		t.Fatalf("*FlushError опознана как ErrProducerClosed: %v", err)
+	}
+
+	if got := err.Error(); got != "flush budget exhausted" {
+		t.Errorf("текст = %q, ожидался стабильный «flush budget exhausted» без числа", got)
+	}
+}
+
+// TestFlushErrorTextIsCountFree — текст ошибки не зависит от числа записей.
+//
+// Смысл проверки в группировке: пока число стояло в тексте, каждая авария
+// давала свой шаблон сообщения, и APM показывал сотни «разных» ошибок вместо
+// одной. Тест падает, если число вернут в строку.
+func TestFlushErrorTextIsCountFree(t *testing.T) {
+	t.Parallel()
+
+	few := (&FlushError{Remaining: 1, Err: context.DeadlineExceeded}).Error()
+	many := (&FlushError{Remaining: 100000, Err: context.DeadlineExceeded}).Error()
+
+	if few != many {
+		t.Errorf("текст зависит от числа записей: %q против %q", few, many)
 	}
 }
