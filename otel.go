@@ -43,9 +43,20 @@ const instrumentationModule = "github.com/alfzs/kafkax/v2"
 // docs/audit/03-observability.md). Схемо-осведомлённый backend, поверив
 // объявлению, начал бы переименовывать атрибуты по правилам чужой схемы.
 func meterOptions() []metric.MeterOption {
+	return meterOptionsFor(moduleVersion(debug.ReadBuildInfo()))
+}
+
+// meterOptionsFor — тело meterOptions при уже известной версии.
+//
+// Чтение build info вынесено в вызывающего не ради красоты: build info
+// тестового бинаря принадлежит модулю пакета и всегда непустое, так что обе
+// ветки — «версия есть» и «версии нет» — из теста недостижимы, пока
+// debug.ReadBuildInfo зашит внутрь. Проверить на них нечего, и потеря ветки с
+// пустой строкой прошла бы молча: scope метрик уехал бы в экспорт с
+// instrumentation.version="".
+func meterOptionsFor(version string) []metric.MeterOption {
 	opts := []metric.MeterOption{}
 
-	version := moduleVersion()
 	if version == "" {
 		return opts
 	}
@@ -54,8 +65,13 @@ func meterOptions() []metric.MeterOption {
 }
 
 // moduleVersion достаёт версию модуля пакета из build info.
-func moduleVersion() string {
-	info, ok := debug.ReadBuildInfo()
+//
+// info и ok — ровно то, что вернул debug.ReadBuildInfo; параметрами, а не
+// вызовом внутри, по той же причине, что и у meterOptionsFor. Пакет бывает и
+// главным модулем (его собственные тесты и примеры), и зависимостью
+// (единственный способ, которым его видит приложение), поэтому ищется в обоих
+// местах.
+func moduleVersion(info *debug.BuildInfo, ok bool) string {
 	if !ok {
 		return ""
 	}
