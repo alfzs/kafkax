@@ -28,6 +28,15 @@ test-cover:
 	$(GO) test -race -count=1 -coverprofile=coverage.out ./...
 	$(GO) tool cover -html=coverage.out -o coverage.html
 
+## test-integration: Run integration tests against a real broker (requires Docker)
+#
+# Отдельный модуль, поэтому и отдельная цель: `go test ./...` в корне его не
+# видит и Docker не требует. KAFKAX_INTEGRATION=required превращает
+# недоступность Docker из пропуска в отказ — на машине разработчика пропуск
+# уместен, в конвейере он означал бы зелёный прогон, ничего не проверивший.
+test-integration:
+	KAFKAX_INTEGRATION=required $(GO) test -C integration -race -count=1 ./...
+
 ## lint: Run golangci-lint
 lint: $(TOOLS_DIR)/golangci-lint
 	$(TOOLS_DIR)/golangci-lint run ./...

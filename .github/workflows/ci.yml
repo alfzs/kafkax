@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, v2-only]
   pull_request:
 
 permissions:
@@ -36,3 +36,21 @@ jobs:
 
       - name: Vulnerability check
         run: make audit
+
+  # Отдельная задача, а не шаг предыдущей: интеграционный набор требует Docker и
+  # идёт на порядок дольше модульного. Слитые в одну, они лишили бы быструю
+  # обратную связь смысла — отказ в юнит-тестах ждал бы конца прогона Kafka.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # KAFKAX_INTEGRATION=required внутри цели: без него отсутствие Docker
+      # дало бы пропуск, то есть зелёную задачу, не проверившую ничего.
+      - name: Integration tests
+        run: make test-integration
