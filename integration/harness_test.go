@@ -97,14 +97,28 @@ func brokers(t *testing.T) []string {
 	})
 
 	if shared.err != nil {
-		if os.Getenv("KAFKAX_INTEGRATION") == "required" {
-			t.Fatalf("брокер не поднялся, а KAFKAX_INTEGRATION=required: %v", shared.err)
-		}
-
-		t.Skipf("Docker недоступен, интеграционный набор пропущен: %v", shared.err)
+		brokerUnavailable(t, shared.err)
 	}
 
 	return shared.brokers
+}
+
+// brokerUnavailable решает, чем считать не поднявшийся контейнер: отказом или
+// причиной пропустить сценарий.
+//
+// Одна политика на весь набор, включая тесты со своим брокером (см.
+// secureBrokers): разработчик без Docker обязан хотя бы собрать пакет, а в CI
+// молчаливый пропуск равнозначен непроверенному коду — там выставляется
+// KAFKAX_INTEGRATION=required, и любая причина, включая кривую конфигурацию
+// брокера, становится красным тестом.
+func brokerUnavailable(t *testing.T, err error) {
+	t.Helper()
+
+	if os.Getenv("KAFKAX_INTEGRATION") == "required" {
+		t.Fatalf("брокер не поднялся, а KAFKAX_INTEGRATION=required: %v", err)
+	}
+
+	t.Skipf("Docker недоступен, сценарий пропущен: %v", err)
 }
 
 // newTopic создаёт тему с заданным числом партиций и уникальным именем.
@@ -177,8 +191,17 @@ func sanitize(name string) string {
 func testConfig(t *testing.T) kafkax.Config {
 	t.Helper()
 
+	return configFor(t, brokers(t))
+}
+
+// configFor — та же конфигурация, но для произвольного адреса: тесты со своими
+// настройками брокера поднимают отдельный контейнер и общий harness им не
+// подходит.
+func configFor(t *testing.T, addrs []string) kafkax.Config {
+	t.Helper()
+
 	cfg := kafkax.DefaultConfig()
-	cfg.Brokers = brokers(t)
+	cfg.Brokers = addrs
 	cfg.ClientID = "kafkax-integration"
 	cfg.Logger = testLogger(t)
 	cfg.GracefulTimeout = 20 * time.Second
@@ -268,6 +291,96 @@ func (c *collector) has(value string) bool {
 
 	for _, got := range c.values {
 		if got == value {
+			return true
+		}
+	}
+
+	return false
+}
+
+// logSpy — slog.Handler, запоминающий записи, которые в cfg.Logger пишут и сам
+// пакет, и franz-go через kslog.
+//
+// Логгер, а не подменённый otel.SetMeterProvider: причина эпизода уезжает в оба
+// канала одним и тем же значением, но провайдер метрик глобален на процесс, а
+// тесты набора идут параллельно — подмена глобали связала бы независимые
+// сценарии и сделала бы отказ невоспроизводимым поодиночке. cfg.Logger же
+// принадлежит одному клиенту.
+type logSpy struct {
+	store *logSpyStore
+	inner slog.Handler
+}
+
+// logSpyStore разделяется всеми производными хендлерами: пакет навешивает на
+// логгер component и group через With, а WithAttrs обязан вернуть новый
+// хендлер — без общего хранилища записи уехали бы в копию.
+type logSpyStore struct {
+	mu      sync.Mutex
+	entries []logSpyEntry
+}
+
+type logSpyEntry struct {
+	level   slog.Level
+	message string
+	attrs   map[string]string
+}
+
+func newLogSpy(t *testing.T) *logSpy {
+	t.Helper()
+
+	return &logSpy{store: &logSpyStore{}, inner: testLogger(t).Handler()}
+}
+
+// Enabled пропускает всё. Порог для записей franz-go пакет применяет своей
+// обёрткой НАД этим хендлером (Config.KafkaLogLevel), поэтому фильтр здесь
+// означал бы, что тест видит меньше, чем видит логгер потребителя.
+func (h *logSpy) Enabled(_ context.Context, _ slog.Level) bool { return true }
+
+func (h *logSpy) Handle(ctx context.Context, record slog.Record) error {
+	entry := logSpyEntry{
+		level:   record.Level,
+		message: record.Message,
+		attrs:   make(map[string]string, record.NumAttrs()),
+	}
+
+	record.Attrs(func(attr slog.Attr) bool {
+		entry.attrs[attr.Key] = attr.Value.String()
+
+		return true
+	})
+
+	h.store.mu.Lock()
+	h.store.entries = append(h.store.entries, entry)
+	h.store.mu.Unlock()
+
+	// Записи всё равно уходят в лог теста: отказ разбирать по одним ассертам
+	// нечем, а поток клиента — единственное, что о нём известно.
+	if h.inner.Enabled(ctx, record.Level) {
+		return h.inner.Handle(ctx, record)
+	}
+
+	return nil
+}
+
+func (h *logSpy) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &logSpy{store: h.store, inner: h.inner.WithAttrs(attrs)}
+}
+
+func (h *logSpy) WithGroup(name string) slog.Handler {
+	return &logSpy{store: h.store, inner: h.inner.WithGroup(name)}
+}
+
+func (h *logSpy) snapshot() []logSpyEntry {
+	h.store.mu.Lock()
+	defer h.store.mu.Unlock()
+
+	return append([]logSpyEntry(nil), h.store.entries...)
+}
+
+// contains сообщает, встречалась ли запись с подстрокой в тексте.
+func (h *logSpy) contains(substring string) bool {
+	for _, entry := range h.snapshot() {
+		if strings.Contains(entry.message, substring) {
 			return true
 		}
 	}
