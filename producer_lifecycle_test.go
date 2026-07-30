@@ -15,6 +15,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"go.opentelemetry.io/otel/attribute"
+	"go.uber.org/goleak"
 )
 
 // prodBufferedHook считает записи, попавшие в буфер клиента.
@@ -31,6 +32,54 @@ func (h *prodBufferedHook) OnProduceRecordBuffered(*kgo.Record) {
 }
 
 var _ kgo.HookProduceRecordBuffered = (*prodBufferedHook)(nil)
+
+// prodBlockHook останавливает SendMessage внутри ProduceSync и держит её там,
+// пока тест не отпустит release.
+//
+// Точка остановки выбрана не за удобство: OnProduceRecordBuffered вызывается в
+// начале kgo.Produce, до того как клиент возьмёт хоть один свой замок и до
+// того, как запись попадёт в буфер. Отправка поэтому остаётся принятой
+// продюсером (acquire уже прошёл), но невидимой для клиента — и переживает
+// закрытие клиента, вместо того чтобы оборваться на нём. Удержание у брокера
+// такого не даёт: client.Close() обрывает запрос в полёте, и отправка
+// возвращается вместе с Close, унося наблюдаемость того, что Close оставил
+// после себя.
+type prodBlockHook struct {
+	enteredOnce sync.Once
+	releaseOnce sync.Once
+	entered     chan struct{}
+	release     chan struct{}
+}
+
+func (h *prodBlockHook) OnProduceRecordBuffered(*kgo.Record) {
+	h.enteredOnce.Do(func() { close(h.entered) })
+
+	<-h.release
+}
+
+var _ kgo.HookProduceRecordBuffered = (*prodBlockHook)(nil)
+
+// newProdBlockHook собирает хук и гарантирует, что удержание снимется даже при
+// раннем t.Fatal: отправка, оставленная в хуке, пережила бы тест и всплыла бы
+// падением goleak в TestMain — «тест прошёл, прогон упал».
+func newProdBlockHook(t *testing.T) *prodBlockHook {
+	t.Helper()
+
+	h := &prodBlockHook{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+
+	t.Cleanup(h.unblock)
+
+	return h
+}
+
+// unblock отпускает удержание; повторный вызов безопасен, поэтому тест может
+// снять удержание посреди сценария, не отменяя страховку в Cleanup.
+func (h *prodBlockHook) unblock() {
+	h.releaseOnce.Do(func() { close(h.release) })
+}
 
 // syncBuffer — потокобезопасный приёмник журнала.
 //
@@ -401,6 +450,85 @@ func TestProducerCloseFlushBudgetExhausted(t *testing.T) {
 		}
 	case <-time.After(consWait):
 		t.Fatal("SendMessage не вернулся после Close")
+	}
+}
+
+// Close, ушедший по бюджету, не оставляет за собой ни одной горутины.
+//
+// Класс дефекта — расхождение двух моментов, которые вызывающий считает одним:
+// «продюсер закрыт» и «продюсер отпустил ресурсы». Ожидание отправок держалось
+// на sync.WaitGroup, Wait() которой нечем прервать, поэтому бюджет закрытия
+// реализовывался гонкой с горутиной: Close уходил по таймеру, а горутина
+// оставалась висеть на Wait до конца самой долгой отправки — до MessageTimeout
+// после возврата из Close. Наружу это не видно ничем: Close возвращает ошибку,
+// а не число недогасших горутин, и сервис, у которого продюсер закрывается по
+// graceful shutdown, спокойно уходит в exit поверх живого хвоста.
+//
+// Общий goleak в TestMain такую утечку не ловит по построению: он снимает
+// показания в конце прогона, а к тому времени удерживающая отправка давно
+// вернулась и хвост догорел. Проверять нужно ровно в момент возврата из Close,
+// пока отправка ещё в полёте, — отсюда снимок IgnoreCurrent перед Close: он не
+// исключает ни одной функции по имени (это запрещено, см. leaks_test.go), а
+// лишь сужает окно наблюдения до горутин, рождённых самим закрытием.
+//
+// Тест не параллельный: goleak смотрит на весь процесс, и горутины соседнего
+// теста он посчитал бы своими.
+//
+//nolint:paralleltest // goleak наблюдает весь процесс: параллельный сосед даёт чужие горутины
+func TestProducerCloseLeavesNoGoroutines(t *testing.T) {
+	// Брокера нет: до сети отправка всё равно не доходит, её держит хук.
+	cfg := testConfig(t)
+	// Бюджет закрытия заведомо меньше бюджета отправки: Close обязан уйти по
+	// своему таймеру, оставив отправку в полёте, — иначе проверять нечего.
+	cfg.Producer.MessageTimeout = 30 * time.Second
+	cfg.GracefulTimeout = 200 * time.Millisecond
+	cfg.Producer.FlushTimeout = 200 * time.Millisecond
+
+	hook := newProdBlockHook(t)
+	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
+
+	p, err := NewProducer(cfg)
+	if err != nil {
+		t.Fatalf("NewProducer: %v", err)
+	}
+
+	sendDone := make(chan error, 1)
+
+	go func() {
+		sendDone <- p.SendMessage(context.Background(), PublishRequest{Topic: testTopic, Value: []byte("v")})
+	}()
+
+	// Отправка внутри ProduceSync и никуда оттуда не денется: acquire пройден,
+	// счётчик отправок в полёте ненулевой, и Close упрётся именно в него.
+	<-hook.entered
+
+	// Снимок берётся после того, как отправка встала в хук: её собственная
+	// горутина к делу не относится и в окно наблюдения попасть не должна.
+	sinceClose := goleak.IgnoreCurrent()
+
+	closeErr := p.Close()
+
+	// Проверка стоит до снятия удержания: отпущенная отправка вернулась бы, и
+	// пережившая Close горутина догасла бы вместе с ней, не оставив следа.
+	goleak.VerifyNone(t, sinceClose)
+
+	// Закрытие всё-таки состоялось и о потере сообщило: без этого тест был бы
+	// зелёным и на Close, который просто ничего не делает.
+	if !errors.Is(closeErr, ErrFlushIncomplete) {
+		t.Errorf("Close = %v, ожидался ErrFlushIncomplete", closeErr)
+	}
+
+	hook.unblock()
+
+	select {
+	case err := <-sendDone:
+		// Клиент закрыт под отправкой — ей полагается ошибка закрытия, а не
+		// успех: продюсер не мог доставить то, чего даже не буферизовал.
+		if !errors.Is(err, ErrProducerClosed) {
+			t.Errorf("отправка, пережившая Close = %v, want ErrProducerClosed", err)
+		}
+	case <-time.After(consWait):
+		t.Fatal("SendMessage не вернулся после снятия удержания")
 	}
 }
 

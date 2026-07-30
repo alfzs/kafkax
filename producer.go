@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -73,12 +74,31 @@ type Producer struct {
 	gracefulTimeout time.Duration
 
 	// mu защищает closing и приём новых отправок в inflight. RWMutex, а не
-	// atomic.Bool: между проверкой флага и inflight.Add должно быть
-	// невозможно вклиниться Close'у, иначе Wait вернётся раньше отправки,
-	// которая уже прошла проверку, и клиент закроется у неё под руками.
-	mu       sync.RWMutex
-	closing  bool
-	inflight sync.WaitGroup
+	// atomic.Bool: между проверкой флага и инкрементом inflight должно быть
+	// невозможно вклиниться Close'у, иначе ожидание кончится раньше отправки,
+	// которая уже прошла проверку, и клиент закроется у неё под руками. При
+	// этом отправки не сериализуются друг с другом — на горячем пути замок
+	// берётся только на чтение.
+	mu      sync.RWMutex
+	closing bool
+
+	// inflight — число принятых и ещё не вернувшихся SendMessage; drained —
+	// сигнал «вернулась последняя из них», который шлёт release, увидев ноль
+	// при уже выставленном closing.
+	//
+	// Счётчик с каналом, а не sync.WaitGroup: Wait() нечем прервать, поэтому
+	// ожидание с бюджетом приходилось уносить в отдельную горутину, и по
+	// исчерпании бюджета Close возвращался, оставляя её висеть на Wait до
+	// конца самой долгой отправки. Утечка конечная, но невидимая: «продюсер
+	// закрыт» и «продюсер отпустил ресурсы» расходились на MessageTimeout, а
+	// сервис, гасящийся по graceful shutdown, наблюдает только первое.
+	inflight atomic.Int64
+	// Буфер на один сигнал и неблокирующая посылка, потому что получателя
+	// может уже не быть: Close, ушедший по бюджету, никого не слушает, а
+	// отправка обязана вернуться, а не встать на канале. Канал не
+	// закрывается: право сигналить есть у любой отправки, увидевшей ноль, а
+	// повторный close паникует.
+	drained chan struct{}
 
 	sent     metric.Int64Counter
 	failed   metric.Int64Counter
@@ -120,6 +140,7 @@ func NewProducer(config Config) (*Producer, error) {
 		messageTimeout:  config.Producer.MessageTimeout,
 		flushTimeout:    config.Producer.FlushTimeout,
 		gracefulTimeout: config.GracefulTimeout,
+		drained:         make(chan struct{}, 1),
 	}
 
 	if err := p.initMetrics(otel.GetMeterProvider().Meter(instrumentationName, meterOptions()...)); err != nil {
@@ -200,7 +221,7 @@ func (p *Producer) SendMessage(ctx context.Context, req PublishRequest) (err err
 	if !p.acquire() {
 		return fmt.Errorf("sending message: %w", ErrProducerClosed)
 	}
-	defer p.inflight.Done()
+	defer p.release()
 
 	// Валидация идёт до регистрации метрик исхода, а не после: атрибут topic
 	// берётся из запроса и ничем не ограничен, так что писать его для
@@ -342,6 +363,31 @@ func (p *Producer) acquire() bool {
 	return true
 }
 
+// release отмечает возврат из SendMessage и будит Close, если ждать больше
+// некого.
+//
+// Ноль перепроверяется под замком, а не берётся из результата Add: между
+// декрементом и захватом замка продюсер мог принять новую отправку, и сигнал
+// «ждать больше некого» отпустил бы Close у неё под руками — ровно тот отказ,
+// ради которого acquire и Close делят mu.
+func (p *Producer) release() {
+	if p.inflight.Add(-1) > 0 {
+		return
+	}
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if !p.closing || p.inflight.Load() != 0 {
+		return
+	}
+
+	select {
+	case p.drained <- struct{}{}:
+	default:
+	}
+}
+
 // produceError переводит ошибку franz-go в sentinel пакета, сохраняя причину.
 //
 // Разделение существует ради одного решения вызывающего кода: можно ли
@@ -421,17 +467,27 @@ func (p *Producer) Close() error {
 // Каждый такой вызов ограничен собственным MessageTimeout, так что ожидание
 // конечно и без бюджета; бюджет здесь — защита от вызывающего, который
 // передал в SendMessage контекст, живущий дольше, чем весь shutdown.
+//
+// Ожидание отменяемо целиком: уход по бюджету не оставляет за собой ни
+// горутины, ни взведённого таймера, поэтому возврат из Close означает, что
+// пакет отпустил всё своё, а не только перестал принимать сообщения.
+//
+// Вызывается строго после того, как выставлен closing, и на этом держится
+// отсутствие потерянного сигнала: с этого момента счётчик умеет только
+// убывать, так что увиденный ноль окончателен, а ненулевое значение
+// гарантирует, что отправка, которая опустит счётчик, возьмёт замок уже после
+// нас и closing увидит.
 func (p *Producer) awaitInflight(deadline time.Time) {
-	done := make(chan struct{})
+	if p.inflight.Load() == 0 {
+		return
+	}
 
-	go func() {
-		p.inflight.Wait()
-		close(done)
-	}()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 
 	select {
-	case <-done:
-	case <-time.After(time.Until(deadline)):
+	case <-p.drained:
+	case <-timer.C:
 		p.logger.Warn("Timed out waiting for in-flight sends, proceeding to flush")
 	}
 }
