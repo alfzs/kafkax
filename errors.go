@@ -1,6 +1,11 @@
 package kafkax
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/twmb/franz-go/pkg/kerr"
+)
 
 // Sentinel-ошибки пакета. Проверяются через errors.Is; текст сообщения частью
 // контракта не является и может меняться, в отличие от самих переменных.
@@ -19,10 +24,9 @@ var (
 	// Producer.EnableIdempotence (включена по умолчанию).
 	ErrDeliveryTimeout = errors.New("kafkax: timeout waiting for delivery ack")
 
-	// ErrDeliveryFailed — брокер отверг сообщение. Оборачивает конкретную
-	// ошибку franz-go: используйте errors.As с *kerr.Error, чтобы прочитать
-	// код и решить, имеет ли смысл повтор (kerr.MessageTooLarge — нет,
-	// kerr.NotEnoughReplicas — да).
+	// ErrDeliveryFailed — брокер отверг сообщение. Оборачивает *DeliveryError:
+	// используйте errors.As, чтобы прочитать код отказа и решить, имеет ли
+	// смысл повтор (DeliveryError.Retriable).
 	ErrDeliveryFailed = errors.New("kafkax: delivery failed")
 
 	// ErrHandlerPanic — ConsumerHandler.ProcessMessage запаниковал. Паника
@@ -31,10 +35,14 @@ var (
 	// остался жив.
 	ErrHandlerPanic = errors.New("kafkax: handler panic")
 
-	// ErrConsumerClosed — Stop уже вызван или идёт shutdown.
+	// ErrConsumerClosed — консьюмер остановлен навсегда: Stop вызван или идёт
+	// shutdown. Состояние терминальное, поэтому ошибку возвращают и Start, и
+	// AddHandler: повторять их бессмысленно, нужен новый консьюмер.
 	ErrConsumerClosed = errors.New("kafkax: consumer is shutting down")
 
-	// ErrConsumerStarted — Start вызван повторно на уже запущенном консьюмере.
+	// ErrConsumerStarted — операция, разрешённая только до старта (Start,
+	// AddHandler), вызвана на уже работающем консьюмере. В отличие от
+	// ErrConsumerClosed говорит, что цикл опроса жив.
 	ErrConsumerStarted = errors.New("kafkax: consumer already started")
 
 	// ErrPollLoopStuck — цикл опроса не вышел даже после жёсткой отмены,
@@ -103,3 +111,79 @@ var (
 	// см. Config.Validate.
 	ErrInvalidConfig = errors.New("kafkax: invalid configuration")
 )
+
+// DeliveryError — отказ доставки, описанный в терминах этого пакета, а не
+// клиента Kafka.
+//
+// Заведён ради одной вещи: разбор ошибки отправки не должен требовать импорта
+// github.com/twmb/franz-go/pkg/kerr. Зависимость от чужого типа ошибки ломается
+// молча — смена клиента (один переход пакет уже пережил) не меняет ни одной
+// сигнатуры, поэтому компилятор промолчит, а errors.As у потребителя просто
+// перестанет находить, и «неповторяемый» отказ уедет в бесконечный ретрай.
+//
+// Всегда лежит под ErrDeliveryFailed:
+//
+//	var derr *kafkax.DeliveryError
+//	if errors.As(err, &derr) && derr.Retriable {
+//		// повтор осмыслен
+//	}
+//
+// Исходная ошибка клиента остаётся достижимой через Unwrap, но частью контракта
+// не является: смотреть на неё при отладке можно, полагаться в коде — нельзя.
+type DeliveryError struct {
+	// Topic — топик, в который шла отправка. В тексте ошибки он есть, но
+	// разбирать текст ради него — ровно то, от чего избавляет типизация.
+	Topic string
+	// Code — код ошибки протокола Kafka. Ноль означает, что кода не было
+	// вовсе: отказ случился до ответа брокера (сеть, TLS, разрешение имени).
+	Code int16
+	// Name — символическое имя кода протокола, например MESSAGE_TOO_LARGE.
+	// Пусто при Code == 0.
+	Name string
+	// Description — расшифровка кода из спецификации протокола.
+	Description string
+	// Retriable — брокер считает отказ временным. При Code == 0 всегда false,
+	// и это означает «клиент не сказал», а не «повторять бессмысленно».
+	Retriable bool
+	// Err — исходная ошибка клиента Kafka. Деталь реализации, см. Unwrap.
+	Err error
+}
+
+func (e *DeliveryError) Error() string {
+	if e.Code == 0 {
+		return fmt.Sprintf("topic %q: %v", e.Topic, e.Err)
+	}
+
+	return fmt.Sprintf("topic %q: %s (code %d): %s", e.Topic, e.Name, e.Code, e.Description)
+}
+
+// Unwrap отдаёт ошибку клиента Kafka. Нужен для отладки и для того, чтобы
+// errors.Is продолжал находить сентинелы самого franz-go в цепочке; строить на
+// нём логику не следует — типы franz-go частью публичного контракта kafkax не
+// объявлены.
+func (e *DeliveryError) Unwrap() error { return e.Err }
+
+// Is связывает тип с сентинелом: errors.Is(err, ErrDeliveryFailed) отвечает
+// true и на *DeliveryError, полученной без обёртки.
+func (e *DeliveryError) Is(target error) bool {
+	return target == ErrDeliveryFailed
+}
+
+// newDeliveryError переводит отказ franz-go в тип пакета.
+//
+// Код и признак повторяемости достаются из *kerr.Error — единственного места,
+// где эта информация вообще существует. Это и есть та точка, к которой
+// сводится зависимость от клиента: при смене клиента правится она, а не код
+// каждого потребителя.
+func newDeliveryError(topic string, err error) *DeliveryError {
+	de := &DeliveryError{Topic: topic, Err: err}
+
+	if kerrErr, ok := errors.AsType[*kerr.Error](err); ok {
+		de.Code = kerrErr.Code
+		de.Name = kerrErr.Message
+		de.Description = kerrErr.Description
+		de.Retriable = kerrErr.Retriable
+	}
+
+	return de
+}

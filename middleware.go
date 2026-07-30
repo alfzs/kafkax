@@ -1,7 +1,6 @@
 package kafkax
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"slices"
@@ -26,7 +25,8 @@ func Chain(handler ConsumerHandler, mws ...ConsumerMiddleware) ConsumerHandler {
 // побайтово равен encoding.EncodeKey(parts...) — например, свой тенант в топике,
 // который читают все:
 //
-//	kafkax.Chain(handler, kafkax.MatchKeyMiddleware(tenantID, externalBotID))
+//	kafkax.Chain(handler, kafkax.MatchKeyMiddleware(
+//		encoding.UUID(tenantID), encoding.Str(externalBotID)))
 //
 // Чужой ключ — не ошибка: обработчик не вызывается, middleware возвращает nil,
 // оффсет отмечается, чтение идёт дальше.
@@ -37,33 +37,37 @@ func Chain(handler ConsumerHandler, mws ...ConsumerMiddleware) ConsumerHandler {
 // «Политика повторов»). Если в топике штатно соседствуют ключи разных схем,
 // такую ошибку нужно гасить своим Config.OnMessageSkipped.
 //
-// parts кодируются один раз, при сборке цепочки, а не на каждом сообщении.
-// Отсюда паника при неподдерживаемом типе части: набор parts статичен в коде
-// вызывающего, поэтому ошибка здесь — ошибка программиста, и обнаружиться она
-// должна на старте процесса, а не на первом сообщении (см. encoding.MatchKey).
-// Вызов без частей — тоже паника: encoding.EncodeKey() вернул бы пустой ключ,
-// и middleware молча отбросил бы весь трафик топика. Это отказ вида «метрики
+// parts кодируются один раз, при сборке цепочки: encoding.NewKey возвращает
+// предкодированный encoding.Key, и на сообщение остаются только его
+// ValidateLength и Match. Само правило «короче ожидаемого — ErrInvalidKey»
+// живёт в encoding.Key.ValidateLength (её же зовёт encoding.ValidateKeyLength)
+// и здесь не повторяется.
+//
+// Отсюда паника при невалидной части: набор parts статичен в коде вызывающего,
+// поэтому ошибка здесь — ошибка программиста, и обнаружиться она должна на
+// старте процесса, а не на первом сообщении (см. encoding.MatchKey). Вызов без
+// частей — тоже паника: encoding.EncodeKey() вернул бы пустой ключ, и
+// middleware молча отбросил бы весь трафик топика. Это отказ вида «метрики
 // зелёные, обработано ноль сообщений» — ровно тот, против которого здесь стоят
 // остальные паники.
-func MatchKeyMiddleware(parts ...any) ConsumerMiddleware {
+func MatchKeyMiddleware(parts ...encoding.KeyPart) ConsumerMiddleware {
 	if len(parts) == 0 {
 		panic("kafkax: MatchKeyMiddleware: no key parts given; " +
 			"an empty key would silently drop every message")
 	}
 
-	want, err := encoding.EncodeKey(parts...)
+	want, err := encoding.NewKey(parts...)
 	if err != nil {
 		panic(fmt.Sprintf("kafkax: MatchKeyMiddleware: %v", err))
 	}
 
 	return func(next ConsumerHandler) ConsumerHandler {
 		return ConsumerHandlerFunc(func(ctx context.Context, msg IncomingMessage) error {
-			if len(msg.Key) < len(want) {
-				return fmt.Errorf("match key middleware: %w: got %d bytes, want at least %d",
-					encoding.ErrInvalidKey, len(msg.Key), len(want))
+			if err := want.ValidateLength(msg.Key); err != nil {
+				return fmt.Errorf("match key middleware: %w", err)
 			}
 
-			if !bytes.Equal(msg.Key, want) {
+			if !want.Match(msg.Key) {
 				return nil
 			}
 

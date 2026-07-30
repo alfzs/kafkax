@@ -70,6 +70,18 @@ linters:
     - nolintlint       # enforces proper //nolint directive usage
 
   disable:
+    # contextcheck требует, чтобы дочерний контекст всегда наследовался от
+    # родительского. У консьюмера это ровно наоборот и намеренно: жизненный цикл
+    # держит собственный lifeCtx, а бюджеты остановки строятся поверх
+    # context.WithoutCancel(lifeCtx) — иначе отмена, ради обработки которой их и
+    # заводят, гасила бы их в момент создания. Проверено на текущем дереве:
+    # линтер даёт 11 срабатываний, все в consumer.go и все на этом рисунке
+    # (pollCtx от lifeCtx вместо ctx из Start; hardCtx в awaitPollLoop и
+    # awaitWorkers; poison/resumePartition/worker, которые ctx не принимают, так
+    # как живут дольше опроса). Цена включения — 11 //nolint в одном файле,
+    # то есть отключение с указанием причины, только россыпью. Смежный риск
+    # (контекст, спрятанный в поле структуры) закрыт включённым containedctx.
+    - contextcheck     # см. комментарий выше — конфликтует с намеренным WithoutCancel
     - lll              # line length — handled by gofmt/gofumpt
     - prealloc         # high false-positive rate; enable only after performance profiling
     - wrapcheck        # forces wrapping all external errors — too noisy as a default

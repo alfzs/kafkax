@@ -145,12 +145,12 @@ func TestMatchKeyMiddleware(t *testing.T) {
 	tenant := uuid.MustParse("11111111-2222-3333-4444-555555555555")
 	other := uuid.MustParse("99999999-8888-7777-6666-555555555555")
 
-	matching, err := encoding.EncodeKey(tenant, int64(7))
+	matching, err := encoding.EncodeKey(encoding.UUID(tenant), encoding.Int64(7))
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
 
-	foreign, err := encoding.EncodeKey(other, int64(7))
+	foreign, err := encoding.EncodeKey(encoding.UUID(other), encoding.Int64(7))
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestMatchKeyMiddleware(t *testing.T) {
 			t.Parallel()
 
 			next := &mockHandler{}
-			handler := MatchKeyMiddleware(tenant, int64(7))(next)
+			handler := MatchKeyMiddleware(encoding.UUID(tenant), encoding.Int64(7))(next)
 
 			err := handler.ProcessMessage(t.Context(), mwMsg(tt.key))
 
@@ -235,13 +235,13 @@ func TestMatchKeyMiddlewarePropagatesHandlerError(t *testing.T) {
 
 	wantErr := errors.New("downstream failed")
 
-	key, err := encoding.EncodeKey("tenant-a")
+	key, err := encoding.EncodeKey(encoding.Str("tenant-a"))
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
 
 	next := &mockHandler{returnErr: wantErr}
-	handler := MatchKeyMiddleware("tenant-a")(next)
+	handler := MatchKeyMiddleware(encoding.Str("tenant-a"))(next)
 
 	// Фильтр не должен глотать отказ обработчика: иначе отравленное сообщение
 	// своего тенанта тихо коммитилось бы.
@@ -253,19 +253,22 @@ func TestMatchKeyMiddlewarePropagatesHandlerError(t *testing.T) {
 func TestMatchKeyMiddlewarePanicsAtBuildTime(t *testing.T) {
 	t.Parallel()
 
-	// parts статичны в коде вызывающего и от данных не зависят, поэтому
-	// неподдерживаемый тип — ошибка программиста. Паника должна случиться при
-	// сборке цепочки, то есть на старте процесса, а не на первом сообщении:
-	// иначе опечатка вроде int вместо int64 доехала бы до прода и проявилась
-	// под нагрузкой.
+	// Прежний набор случаев этого теста (int вместо int64, float64, срез байт,
+	// структура) больше не выражается в коде: части ключа принимаются как
+	// encoding.KeyPart, и MatchKeyMiddleware(uuid.Nil, 42) не компилируется —
+	// проверка переехала из рантайма в систему типов.
+	//
+	// В рантайме остался единственный способ подсунуть невалидную часть —
+	// нулевое значение KeyPart, собранное не конструктором (поле структуры,
+	// make([]KeyPart, n)). Оно обязано ронять процесс при сборке цепочки, то
+	// есть на старте, а не на первом сообщении: иначе фильтр молча разошёлся бы
+	// с продюсерским ключом и отбрасывал бы весь трафик.
 	tests := []struct {
 		name string
-		part any
+		part encoding.KeyPart
 	}{
-		{name: "int вместо int64", part: 42},
-		{name: "float64", part: 1.5},
-		{name: "срез байт", part: []byte("raw")},
-		{name: "структура", part: struct{ A int }{}},
+		{name: "нулевое значение KeyPart", part: encoding.KeyPart{}},
+		{name: "нулевое значение из среза", part: make([]encoding.KeyPart, 1)[0]},
 	}
 
 	for _, tt := range tests {
@@ -275,18 +278,24 @@ func TestMatchKeyMiddlewarePanicsAtBuildTime(t *testing.T) {
 			defer func() {
 				recovered := recover()
 				if recovered == nil {
-					t.Fatal("MatchKeyMiddleware не запаниковал на неподдерживаемом типе")
+					t.Fatal("MatchKeyMiddleware не запаниковал на невалидной части")
 				}
 
 				msg, ok := recovered.(string)
 				if !ok || !strings.Contains(msg, "MatchKeyMiddleware") {
 					t.Fatalf("паника = %v, ожидалось упоминание MatchKeyMiddleware", recovered)
 				}
+
+				// Позиция части — то, ради чего паника форматируется: без неё
+				// в цепочке из пяти частей ищут глазами.
+				if !strings.Contains(msg, "position 1") {
+					t.Errorf("паника %q не называет позицию части", msg)
+				}
 			}()
 
 			// Ни ProcessMessage, ни даже применение к обработчику здесь не
 			// вызываются — паника обязана произойти на этой строке.
-			_ = MatchKeyMiddleware(uuid.Nil, tt.part)
+			_ = MatchKeyMiddleware(encoding.UUID(uuid.Nil), tt.part)
 
 			t.Fatal("недостижимо: сборка middleware завершилась без паники")
 		})
@@ -296,7 +305,7 @@ func TestMatchKeyMiddlewarePanicsAtBuildTime(t *testing.T) {
 func TestMatchKeyMiddlewarePanicsWithoutParts(t *testing.T) {
 	t.Parallel()
 
-	// Отдельный случай от неподдерживаемого типа: EncodeKey() без частей
+	// Отдельный случай от невалидной части: EncodeKey() без частей
 	// ошибки не возвращает — он возвращает пустой ключ. Без явной проверки
 	// цепочка собралась бы, и middleware молча отбросил бы весь трафик топика,
 	// не оставив в метриках ни одной ошибки.
@@ -322,12 +331,12 @@ func TestMatchKeyMiddlewareInsideChain(t *testing.T) {
 
 	tenant := uuid.MustParse("11111111-2222-3333-4444-555555555555")
 
-	matching, err := encoding.EncodeKey(tenant)
+	matching, err := encoding.EncodeKey(encoding.UUID(tenant))
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
 
-	foreign, err := encoding.EncodeKey(uuid.MustParse("99999999-8888-7777-6666-555555555555"))
+	foreign, err := encoding.EncodeKey(encoding.UUID(uuid.MustParse("99999999-8888-7777-6666-555555555555")))
 	if err != nil {
 		t.Fatalf("EncodeKey: %v", err)
 	}
@@ -366,7 +375,7 @@ func TestMatchKeyMiddlewareInsideChain(t *testing.T) {
 				return nil
 			})
 
-			chained := Chain(handler, mwTrace(j, "outer"), MatchKeyMiddleware(tenant))
+			chained := Chain(handler, mwTrace(j, "outer"), MatchKeyMiddleware(encoding.UUID(tenant)))
 
 			if err := chained.ProcessMessage(t.Context(), mwMsg(tt.key)); err != nil {
 				t.Fatalf("ProcessMessage: %v", err)
@@ -376,5 +385,38 @@ func TestMatchKeyMiddlewareInsideChain(t *testing.T) {
 				t.Fatalf("журнал = %v, want %v", got, tt.wantMarks)
 			}
 		})
+	}
+}
+
+// Горячий путь middleware обязан оставаться безаллокационным: части кодируются
+// один раз при сборке цепочки, а на сообщение остаются только длина и
+// сравнение байтов. Регрессия сюда — вызов encoding.ValidateKeyLength или
+// encoding.EncodeKey из ProcessMessage, то есть перекодирование частей на
+// каждое сообщение топика.
+//
+// Тест непараллельный намеренно: testing.AllocsPerRun паникует, если в этот
+// момент выполняется хоть один параллельный тест (testing/allocs.go).
+//
+//nolint:paralleltest // AllocsPerRun несовместим с t.Parallel, см. комментарий выше
+func TestMatchKeyMiddlewareDoesNotAllocatePerMessage(t *testing.T) {
+	tenant := uuid.MustParse("11111111-2222-3333-4444-555555555555")
+
+	key, err := encoding.EncodeKey(encoding.UUID(tenant), encoding.Int64(7))
+	if err != nil {
+		t.Fatalf("EncodeKey: %v", err)
+	}
+
+	handler := MatchKeyMiddleware(encoding.UUID(tenant), encoding.Int64(7))(&mockHandler{})
+	msg := mwMsg(key)
+	ctx := t.Context()
+
+	allocs := testing.AllocsPerRun(100, func() {
+		if err := handler.ProcessMessage(ctx, msg); err != nil {
+			t.Errorf("ProcessMessage: %v", err)
+		}
+	})
+
+	if allocs > 0 {
+		t.Errorf("ProcessMessage = %.0f аллокаций на сообщение, want 0", allocs)
 	}
 }

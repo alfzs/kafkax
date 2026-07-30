@@ -59,14 +59,14 @@ func TestPartitionWorkerPanicIsReportedAndPartitionGoesSilent(t *testing.T) {
 	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(watch)}
 
 	sites := &consTrace{}
-	cfg.OnPanic = func(_ context.Context, site string, _ any, stack []byte) {
+	cfg.OnPanic = func(_ context.Context, site PanicSite, _ any, stack []byte) {
 		if len(stack) == 0 {
 			sites.add("empty-stack")
 
 			return
 		}
 
-		sites.add(site)
+		sites.add(string(site))
 	}
 
 	prod := consNewProducer(t, brokers)
@@ -78,11 +78,11 @@ func TestPartitionWorkerPanicIsReportedAndPartitionGoesSilent(t *testing.T) {
 	consStart(t, c)
 
 	waitFor(t, consWait, "паника воркера доложена в OnPanic", func() bool {
-		return slices.Contains(sites.snapshot(), panicSitePartitionWorker)
+		return slices.Contains(sites.snapshot(), string(PanicSitePartitionWorker))
 	})
 
-	if got := rec.sum(consMetricPanics, attribute.String("site", panicSitePartitionWorker)); got != 1 {
-		t.Fatalf("panics(site=%s) = %d, want 1", panicSitePartitionWorker, got)
+	if got := rec.sum(consMetricPanics, attribute.String("site", string(PanicSitePartitionWorker))); got != 1 {
+		t.Fatalf("panics(site=%s) = %d, want 1", PanicSitePartitionWorker, got)
 	}
 
 	waitFor(t, consWait, "гейдж активных воркеров вернулся к нулю", func() bool {
@@ -156,8 +156,8 @@ func TestDeadPartitionWorkerDoesNotStallPollLoop(t *testing.T) {
 	cfg.Consumer.MessageQueueSize = 1
 
 	sites := &consTrace{}
-	cfg.OnPanic = func(_ context.Context, site string, _ any, _ []byte) {
-		sites.add(site)
+	cfg.OnPanic = func(_ context.Context, site PanicSite, _ any, _ []byte) {
+		sites.add(string(site))
 	}
 
 	prod := consNewProducer(t, brokers)
@@ -172,7 +172,7 @@ func TestDeadPartitionWorkerDoesNotStallPollLoop(t *testing.T) {
 	// Воркеры заводит колбэк назначения, поэтому воркер умирает ещё до первой
 	// записи: к моменту отправки его done уже закрыт.
 	waitFor(t, consWait, "воркер отравленного топика умер", func() bool {
-		return slices.Contains(sites.snapshot(), panicSitePartitionWorker)
+		return slices.Contains(sites.snapshot(), string(PanicSitePartitionWorker))
 	})
 
 	prod.send(t, wedgeTopic, 0, "first")
@@ -288,7 +288,7 @@ func TestShutdownUnblocksDispatchStuckOnFullQueue(t *testing.T) {
 // callHandler, где бы внутри неё паника ни случилась — до вызова next или после.
 //
 // Тест закрепляет это как контракт: аудит предполагал обратное (что middleware,
-// упавшее до next, попадёт в panicSiteProcessMessage), и ошибиться здесь легко —
+// упавшее до next, попадёт в PanicSiteProcessMessage), и ошибиться здесь легко —
 // внешне «код обвязки» и «код цепочки» выглядят одинаково чужими.
 //
 //nolint:paralleltest // captureMetrics подменяет глобальный MeterProvider: параллельный сосед смешал бы записи
@@ -317,13 +317,13 @@ func TestMiddlewarePanicIsReportedAsHandlerPanic(t *testing.T) {
 
 	consWaitTerminal(t, rec, topic, consumerStatusError, 1)
 
-	if got := rec.sum(consMetricPanics, attribute.String("site", panicSiteHandler)); got != 2 {
-		t.Fatalf("panics(site=%s) = %d, want 2 (первый вызов и повтор)", panicSiteHandler, got)
+	if got := rec.sum(consMetricPanics, attribute.String("site", string(PanicSiteHandler))); got != 2 {
+		t.Fatalf("panics(site=%s) = %d, want 2 (первый вызов и повтор)", PanicSiteHandler, got)
 	}
 
-	if got := rec.sum(consMetricPanics, attribute.String("site", panicSiteProcessMessage)); got != 0 {
+	if got := rec.sum(consMetricPanics, attribute.String("site", string(PanicSiteProcessMessage))); got != 0 {
 		t.Fatalf("panics(site=%s) = %d, want 0: цепочка middleware исполняется под recover'ом обработчика",
-			panicSiteProcessMessage, got)
+			PanicSiteProcessMessage, got)
 	}
 
 	if got := h.callCount(); got != 0 {

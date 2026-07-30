@@ -103,12 +103,18 @@ defer consumer.Stop()
 ```
 
 Обработчики регистрируются до `Start`; подписка на топики происходит внутри
-`Start`, отдельного шага для неё нет. Повторный `Start` вернёт
-`ErrConsumerStarted`, консьюмер после `Stop` не перезапускается.
+`Start`, отдельного шага для неё нет. Состояний у консьюмера три: «не запущен»,
+«запущен», «остановлен навсегда». Повторный `Start` вернёт `ErrConsumerStarted`,
+а `Start` или `AddHandler` после `Stop` — `ErrConsumerClosed`: консьюмер не
+перезапускается, нужен новый. Неуспешный `Start` (`ErrNoHandlers`, ошибка
+конфигурации) состояние не меняет — конфигурацию можно исправить и повторить.
 
-> **Буферы записей.** `IncomingMessage.Key`, `.Value` и `.Headers` ссылаются на
-> буферы franz-go и валидны только на время вызова `ProcessMessage`. Если
-> данные нужны дольше — копируйте.
+> **Буферы записей.** `IncomingMessage.Key`, `.Value` и `.Headers` — срезы
+> буферов franz-go, а не копии. Читать их можно и после возврата из
+> `ProcessMessage` (пулинг записей библиотека не включает), а вот **изменять
+> нельзя**: тот же срез получит каждый повтор и затем `OnMessageSkipped`.
+> Нужна модификация — копируйте. Включение `kgo.WithPools` через `ExtraOpts`
+> не поддерживается.
 
 ## Гарантии доставки
 
@@ -229,7 +235,18 @@ cfg.OnMessageSkipped = func(ctx context.Context, msg kafkax.IncomingMessage, cau
 |---|---|---|
 | `ErrProducerClosed` | сообщение точно не ушло | безопасен |
 | `ErrDeliveryTimeout` | могло уйти | создаёт дубликат |
-| `ErrDeliveryFailed` | отказ брокера; через `errors.As` достаётся `*kerr.Error` | зависит от кода |
+| `ErrDeliveryFailed` | отказ брокера; через `errors.As` достаётся `*kafkax.DeliveryError` с полями `Topic`, `Code`, `Name`, `Description`, `Retriable` | смотреть `Retriable` |
+
+Типы franz-go в контракт ошибок не входят. Разбирать отказ брокера следует так:
+
+```go
+var derr *kafkax.DeliveryError
+if errors.As(err, &derr) && derr.Retriable {
+    // повтор безопасен по коду брокера, но может создать дубликат
+}
+```
+
+`*kerr.Error` остаётся достижим через `Unwrap` — только для отладки.
 
 ### Остановка
 
@@ -253,7 +270,7 @@ cfg.OnMessageSkipped = func(ctx context.Context, msg kafkax.IncomingMessage, cau
 | `ErrInvalidConfig` | общий признак любой из ~25 претензий валидации; см. [Валидация](#валидация) |
 | `ErrDuplicateHandler` | `AddHandler` для уже занятого топика — почти всегда опечатка в имени, поэтому отказ, а не тихая замена |
 | `ErrNilHandler`, `ErrEmptyTopic`, `ErrNoHandlers` | обработчик `nil`, пустой топик, `Start` без единого `AddHandler` |
-| `ErrConsumerStarted`, `ErrConsumerClosed` | повторный `Start`; работа после `Stop` |
+| `ErrConsumerStarted`, `ErrConsumerClosed` | операция до старта (`Start`, `AddHandler`) вызвана на работающем консьюмере; она же — на остановленном |
 | `ErrEmptyHeaderKey`, `ErrReservedHeaderKey` | заголовок с пустым именем или с именем, которым управляет OTel-propagator |
 
 ## Middleware консьюмера
@@ -282,20 +299,24 @@ consumer.AddHandler("orders", &orderHandler{}, loggingMiddleware, metricsMiddlew
 
 ```go
 consumer.AddHandler("events", &orderHandler{},
-    kafkax.MatchKeyMiddleware(myTenantID, myExternalBotID))
+    kafkax.MatchKeyMiddleware(encoding.UUID(myTenantID), encoding.Str(myExternalBotID)))
 ```
 
 ## Композитные ключи
 
-`encoding.EncodeKey` собирает бинарный ключ Kafka-сообщения из нескольких
-значений (`uuid.UUID`, `string`, `int64`, `bool`) — без обратного декодирования:
-консьюмер знает свои значения и сравнивает, а не разбирает чужой ключ.
+`encoding.EncodeKey` собирает бинарный ключ Kafka-сообщения из частей — без
+обратного декодирования: консьюмер знает свои значения и сравнивает, а не
+разбирает чужой ключ.
+
+Части создаются только конструкторами `encoding.UUID`, `encoding.Str`,
+`encoding.Int64` и `encoding.Bool`, возвращающими непрозрачный тип `KeyPart`.
+Неподдерживаемое значение не компилируется, а не падает в рантайме.
 
 ```go
 import "github.com/alfzs/kafkax/v2/encoding"
 
 // Продюсер
-key, err := encoding.EncodeKey(tenantID, externalBotID)
+key, err := encoding.EncodeKey(encoding.UUID(tenantID), encoding.Str(externalBotID))
 if err != nil {
     return err
 }
@@ -304,7 +325,7 @@ producer.SendMessage(ctx, kafkax.PublishRequest{Topic: "events", Key: key, Value
 
 // Консьюмер — вручную, без middleware
 func (h *handler) ProcessMessage(ctx context.Context, msg kafkax.IncomingMessage) error {
-    if !encoding.MatchKey(msg.Key, myTenantID, myExternalBotID) {
+    if !encoding.MatchKey(msg.Key, encoding.UUID(myTenantID), encoding.Str(myExternalBotID)) {
         return nil // не наш адресат
     }
     ...
@@ -316,6 +337,35 @@ func (h *handler) ProcessMessage(ctx context.Context, msg kafkax.IncomingMessage
 это не так, — сигнал усечённого или повреждённого сообщения, в отличие от
 валидного по длине ключа другого тенанта (для него `MatchKey` просто вернёт
 `false`). `MatchKeyMiddleware` делает эту проверку сама.
+
+### Предкодированный ключ
+
+`MatchKey` и `ValidateKeyLength` кодируют части заново на каждый вызов. Если
+ключ известен заранее и сравнивается на каждом сообщении, соберите его один раз
+через `encoding.NewKey` и используйте методы `Key`:
+
+```go
+want, err := encoding.NewKey(encoding.UUID(myTenantID), encoding.Str(myExternalBotID))
+if err != nil {
+    return err
+}
+
+// в обработчике: без аллокаций
+if err := want.ValidateLength(msg.Key); err != nil {
+    return err
+}
+
+if !want.Match(msg.Key) {
+    return nil
+}
+```
+
+`Key.Bytes` отдаёт закодированные байты — их же можно передать продюсеру.
+`MatchKeyMiddleware` устроена именно так: собирает `Key` при регистрации
+обработчика, а на сообщение только сравнивает.
+
+Ошибки кодирования: `ErrInvalidKeyPart` — часть создана не конструктором
+(нулевое значение `KeyPart`); `ErrKeyPartTooLong` — строка длиннее `MaxUint32`.
 
 ## Архитектура консьюмера
 
@@ -411,8 +461,8 @@ kotel под своими именами.
 
 | Поле | Env | По умолчанию | Описание |
 |---|---|---|---|
-| `Brokers` | `KAFKAX_BROKERS` | — | Адреса брокеров `host:port` через запятую. Достаточно одного — остальные обнаруживаются автоматически |
-| `ClientID` | `KAFKAX_CLIENT_ID` | — | Идентификатор клиента в логах и метриках брокера |
+| `Brokers` | `KAFKAX_BROKERS` | — | Адреса брокеров `host:port` через запятую. Достаточно одного — остальные обнаруживаются автоматически. **Обязателен**, умолчания нет: поле помечено `env-required`, и без переменной окружения `cleanenv.ReadEnv` завершится ошибкой |
+| `ClientID` | `KAFKAX_CLIENT_ID` | — | Идентификатор клиента в логах и метриках брокера. **Обязателен**, умолчания нет: поле помечено `env-required`, и без переменной окружения `cleanenv.ReadEnv` завершится ошибкой |
 | `GracefulTimeout` | `KAFKAX_GRACEFUL_TIMEOUT` | `3m` | Общий бюджет на остановку в `Close`/`Stop` |
 | `DialTimeout` | `KAFKAX_DIAL_TIMEOUT` | `10s` | Таймаут установки соединения с брокером |
 
@@ -427,8 +477,8 @@ kotel под своими именами.
 | `Logger` | `*slog.Logger` библиотеки. При `nil` — `slog.Default()`. Логи franz-go идут туда же на уровне `Debug` |
 | `TLSConfig` | Готовый `*tls.Config`. Задан — имеет приоритет над всей секцией `TLS`. Нужен для mTLS с ротацией, кастомного `VerifyPeerCertificate`, сертификатов из памяти |
 | `ExtraOpts` | `[]kgo.Opt`, добавляются последними и побеждают всё, что вывела библиотека. Аварийный выход, не замена конфигурации |
-| `OnPanic` | Вызывается после восстановления паники в горутине библиотеки: `site` (`handler`, `process_message`, `partition_worker`, `on_message_skipped`), `recovered`, `stack`. Синхронный — не должен блокироваться |
-| `OnMessageSkipped` | Судьба сообщения, исчерпавшего повторы. См. «Политика повторов» |
+| `OnPanic` | Вызывается после восстановления паники в горутине библиотеки: `site` типа `kafkax.PanicSite` (`PanicSiteHandler`, `PanicSiteProcessMessage`, `PanicSitePartitionWorker`, `PanicSitePollLoop`, `PanicSiteMessageSkipped`, `PanicSitePanicHook`), `recovered`, `stack`. Синхронный — не должен блокироваться |
+| `OnMessageSkipped` | Судьба сообщения, исчерпавшего повторы. Вызывается синхронно в горутине партиционного воркера — партиция стоит, ребаланс ждёт; `ctx` к этому моменту может быть уже отменён, поэтому для записи в DLQ используйте `context.WithoutCancel` с собственным таймаутом. См. «Политика повторов» |
 
 ### SASL
 
@@ -564,6 +614,12 @@ KAFKAX_SASL_USERNAME=my-service-user
 KAFKAX_SASL_PASSWORD=secret
 ```
 
+`KAFKAX_BROKERS` и `KAFKAX_CLIENT_ID` обязательны на уровне тегов
+(`env-required`): без них `ReadEnv` вернёт ошибку и до конструктора дело не
+дойдёт. `KAFKAX_CONSUMER_GROUP` тегом не помечен — он обязателен только для
+консьюмера, и его отсутствие всплывает позже, при валидации конфигурации в
+`NewKafkaConsumer`.
+
 ## Graceful shutdown
 
 **Продюсер.** `Close()` перестаёт принимать новые отправки, дожидается
@@ -589,3 +645,7 @@ type MessageProducer interface {
     Close() error
 }
 ```
+
+## Лицензия
+
+MIT. Полный текст — в файле [LICENSE](LICENSE).

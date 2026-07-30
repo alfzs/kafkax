@@ -441,8 +441,8 @@ func TestSkipHookPanicPausesPartition(t *testing.T) { //nolint:paralleltest // c
 	}
 
 	sites := &consTrace{}
-	cfg.OnPanic = func(_ context.Context, site string, _ any, _ []byte) {
-		sites.add(site)
+	cfg.OnPanic = func(_ context.Context, site PanicSite, _ any, _ []byte) {
+		sites.add(string(site))
 	}
 
 	prod := consNewProducer(t, brokers)
@@ -463,12 +463,12 @@ func TestSkipHookPanicPausesPartition(t *testing.T) { //nolint:paralleltest // c
 
 	consWaitTerminal(t, rec, topic, consumerStatusError, 1)
 
-	if steps := sites.snapshot(); len(steps) != 1 || steps[0] != panicSiteMessageSkipped {
-		t.Fatalf("OnPanic вызван с %v, want [%s]", steps, panicSiteMessageSkipped)
+	if steps := sites.snapshot(); len(steps) != 1 || steps[0] != string(PanicSiteMessageSkipped) {
+		t.Fatalf("OnPanic вызван с %v, want [%s]", steps, PanicSiteMessageSkipped)
 	}
 
-	if got := rec.sum(consMetricPanics, attribute.String("site", panicSiteMessageSkipped)); got != 1 {
-		t.Fatalf("panics(site=%s) = %d, want 1", panicSiteMessageSkipped, got)
+	if got := rec.sum(consMetricPanics, attribute.String("site", string(PanicSiteMessageSkipped))); got != 1 {
+		t.Fatalf("panics(site=%s) = %d, want 1", PanicSiteMessageSkipped, got)
 	}
 
 	// Партиция встала — паника хука не отличается по последствиям от его отказа.

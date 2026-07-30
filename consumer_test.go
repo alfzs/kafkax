@@ -572,6 +572,29 @@ func TestAddHandlerContract(t *testing.T) {
 			t.Fatalf("AddHandler после Start = %v, want ErrConsumerStarted", err)
 		}
 	})
+
+	t.Run("после Stop", func(t *testing.T) {
+		t.Parallel()
+
+		c := mustConsumer(t, cfg)
+
+		if err := c.Stop(); err != nil {
+			t.Fatalf("Stop до Start = %v, want nil", err)
+		}
+
+		// Раньше эта регистрация проходила молча: флаг started остановленным
+		// консьюмером не взводился. Вызывающий получал nil и полагал, что
+		// подписка есть, — а Start после Stop уже невозможен, так что
+		// обработчик не позвали бы никогда.
+		err := c.AddHandler(testTopic, &mockHandler{})
+		if !errors.Is(err, ErrConsumerClosed) {
+			t.Fatalf("AddHandler после Stop = %v, want ErrConsumerClosed", err)
+		}
+
+		if errors.Is(err, ErrConsumerStarted) {
+			t.Fatal("остановленный консьюмер выдал себя за запущенный")
+		}
+	})
 }
 
 // TestStartContract фиксирует фактический контракт Start.
@@ -592,8 +615,8 @@ func TestStartContract(t *testing.T) {
 			t.Fatalf("Start без обработчиков = %v, want ErrNoHandlers", err)
 		}
 
-		// Неуспешный Start обязан откатывать флаг started: иначе исправить
-		// конфигурацию и повторить запуск было бы нельзя.
+		// Неуспешный Start обязан возвращать состояние в consumerIdle: иначе
+		// исправить конфигурацию и повторить запуск было бы нельзя.
 		mustAddHandler(t, c, testTopic, &mockHandler{})
 
 		if err := c.Start(t.Context()); err != nil {
@@ -627,6 +650,31 @@ func TestStartContract(t *testing.T) {
 		// молчаливый отказ вместо ошибки оставил бы приложение без потребителя.
 		if err := c.Start(t.Context()); !errors.Is(err, ErrConsumerClosed) {
 			t.Fatalf("Start после Stop = %v, want ErrConsumerClosed", err)
+		}
+	})
+
+	t.Run("Start после полного цикла Start-Stop", func(t *testing.T) {
+		t.Parallel()
+
+		c := mustConsumer(t, cfg)
+		mustAddHandler(t, c, testTopic, &mockHandler{})
+		consStart(t, c)
+
+		if err := c.Stop(); err != nil {
+			t.Fatalf("Stop = %v, want nil", err)
+		}
+
+		// Ключевой случай RF-API-10. Пока состояние было булевым флагом
+		// started, отработавший консьюмер оставался «запущенным» и на этот
+		// Start отвечал ErrConsumerStarted — то есть предлагал ждать
+		// несуществующий цикл опроса вместо создания нового консьюмера.
+		err := c.Start(t.Context())
+		if !errors.Is(err, ErrConsumerClosed) {
+			t.Fatalf("Start после Start+Stop = %v, want ErrConsumerClosed", err)
+		}
+
+		if errors.Is(err, ErrConsumerStarted) {
+			t.Fatal("остановленный консьюмер выдал себя за запущенный")
 		}
 	})
 }

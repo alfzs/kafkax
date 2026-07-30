@@ -431,14 +431,22 @@ func TestProducerSendMessageDeliveryTimeout(t *testing.T) {
 	if errors.Is(err, ErrProducerClosed) {
 		t.Errorf("таймаут не должен выдаваться за ErrProducerClosed: %v", err)
 	}
+
+	// Сентинела мало: под ним обязана лежать причина. Их две — исчерпанный
+	// бюджет вызова и неспособность клиента дослать запись, — и какая из них
+	// сработает на недоступном брокере, решает гонка двух таймеров. Проверяется
+	// поэтому не конкретная, а сам факт: причина не потеряна.
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, kgo.ErrRecordTimeout) {
+		t.Errorf("ErrDeliveryTimeout пришёл без причины: %v", err)
+	}
 }
 
 // Брокер отверг запись: ошибка обёрнута дважды.
 //
-// errors.Is доводит до sentinel'а пакета, errors.As — до *kerr.Error с кодом
+// errors.Is доводит до sentinel'а пакета, errors.As — до *DeliveryError с кодом
 // брокера. Потеря любой из двух обёрток лишает вызывающего единственного
-// способа решить, безопасен ли повтор: kerr.RecordListTooLarge повторять
-// бессмысленно, kerr.NotEnoughReplicas — наоборот.
+// способа решить, безопасен ли повтор: RECORD_LIST_TOO_LARGE повторять
+// бессмысленно, NOT_ENOUGH_REPLICAS — наоборот.
 func TestProducerSendMessageBrokerError(t *testing.T) {
 	t.Parallel()
 
@@ -462,13 +470,24 @@ func TestProducerSendMessageBrokerError(t *testing.T) {
 		t.Errorf("errors.Is(err, ErrDeliveryFailed) = false; err = %v", err)
 	}
 
-	var kerrErr *kerr.Error
-	if !errors.As(err, &kerrErr) {
-		t.Fatalf("errors.As(err, *kerr.Error) = false; err = %v", err)
+	var delivery *DeliveryError
+	if !errors.As(err, &delivery) {
+		t.Fatalf("errors.As(err, *DeliveryError) = false; err = %v", err)
 	}
 
-	if kerrErr.Code != kerr.RecordListTooLarge.Code {
-		t.Errorf("код брокера = %d (%s), want %d", kerrErr.Code, kerrErr.Message, kerr.RecordListTooLarge.Code)
+	if delivery.Code != kerr.RecordListTooLarge.Code {
+		t.Errorf("код брокера = %d (%s), want %d",
+			delivery.Code, delivery.Name, kerr.RecordListTooLarge.Code)
+	}
+
+	if delivery.Topic != testTopic {
+		t.Errorf("DeliveryError.Topic = %q, want %q", delivery.Topic, testTopic)
+	}
+
+	// Код неповторяемый — именно поэтому он и выбран для теста; если бы пакет
+	// подставлял Retriable наугад, потребитель ушёл бы в бесконечный ретрай.
+	if delivery.Retriable {
+		t.Errorf("Retriable = true для %s", delivery.Name)
 	}
 
 	// Отказ брокера — не таймаут и не закрытие: классы ошибок не должны

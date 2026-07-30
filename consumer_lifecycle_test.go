@@ -344,7 +344,7 @@ func TestHandlerPanicRecovered(t *testing.T) {
 	cfg := testConfig(t, brokers...)
 
 	sites := &consTrace{}
-	cfg.OnPanic = func(_ context.Context, site string, recovered any, stack []byte) {
+	cfg.OnPanic = func(_ context.Context, site PanicSite, recovered any, stack []byte) {
 		if len(stack) == 0 {
 			sites.add("empty-stack")
 
@@ -372,12 +372,12 @@ func TestHandlerPanicRecovered(t *testing.T) {
 
 	consWaitTerminal(t, rec, topic, consumerStatusError, 1)
 
-	if steps := sites.snapshot(); len(steps) != 1 || steps[0] != panicSiteHandler+":handler exploded" {
-		t.Fatalf("OnPanic вызван с %v, want [%s:handler exploded]", steps, panicSiteHandler)
+	if steps := sites.snapshot(); len(steps) != 1 || steps[0] != string(PanicSiteHandler)+":handler exploded" {
+		t.Fatalf("OnPanic вызван с %v, want [%s:handler exploded]", steps, PanicSiteHandler)
 	}
 
-	if got := rec.sum(consMetricPanics, attribute.String("site", panicSiteHandler)); got != 1 {
-		t.Fatalf("panics(site=%s) = %d, want 1", panicSiteHandler, got)
+	if got := rec.sum(consMetricPanics, attribute.String("site", string(PanicSiteHandler))); got != 1 {
+		t.Fatalf("panics(site=%s) = %d, want 1", PanicSiteHandler, got)
 	}
 
 	// Консьюмер жив: соседняя партиция обрабатывается и до, и после паники.
@@ -416,7 +416,7 @@ func TestOnPanicHookPanicDoesNotCrashConsumer(t *testing.T) {
 
 	brokers := newFakeCluster(t, 2, topic)
 	cfg := testConfig(t, brokers...)
-	cfg.OnPanic = func(context.Context, string, any, []byte) {
+	cfg.OnPanic = func(context.Context, PanicSite, any, []byte) {
 		panic("hook exploded too")
 	}
 

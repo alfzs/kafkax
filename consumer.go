@@ -21,9 +21,27 @@ import (
 
 // IncomingMessage — сообщение Kafka, переданное в ConsumerHandler.
 //
-// Key, Value и Headers ссылаются на буферы записи franz-go и живут ровно
-// столько, сколько длится вызов обработчика. Код, сохраняющий их дольше,
-// обязан копировать.
+// # Владение памятью
+//
+// Key и Value — это срезы, разделяемые с записью franz-go, а не копии. Читать
+// их после возврата из обработчика безопасно: пулинг буферов не включён
+// (kgo.WithPools пакет не вызывает), поэтому память живёт ровно столько,
+// сколько на неё ссылаются, как обычный объект под управлением GC.
+//
+// Мутировать их запрещено. Тот же самый срез пакет отдаёт повторно:
+// в каждую попытку повтора (Consumer.HandlerMaxRetries) и затем в
+// Config.OnMessageSkipped — уже после возврата из ProcessMessage. Обработчик,
+// правящий Value на месте, увидит своё же изменение на следующей попытке и
+// отдаст испорченное сообщение в DLQ.
+//
+// Копировать нужно не «чтобы пережить вызов», а чтобы изменить: append к Value
+// с достаточной ёмкостью пишет в тот же массив. Для чтения, разбора и передачи
+// в другой код копия не требуется.
+//
+// Отдельно про Config.ExtraOpts: kgo.WithPools, протащенный туда, включает в
+// franz-go переиспользование буферов, а Record.Recycle пакет не вызывает.
+// Такая конфигурация не поддерживается — пулинг в ней выродится в отсутствие
+// возврата памяти, а не в порчу данных.
 type IncomingMessage struct {
 	Topic     string
 	Partition int32
@@ -253,6 +271,40 @@ func newConsumerMetrics(meter metric.Meter) (consumerMetrics, error) {
 	return m, reg.err()
 }
 
+// consumerState — состояние жизненного цикла консьюмера.
+//
+// Три состояния, а не булев «запущен»: без отдельного терминального состояния
+// Start после Stop неотличим от повторного Start и объясняет отказ неправдой —
+// «уже запущен» вместо «остановлен». Разница существенна для вызывающего:
+// первое лечится тем, что запуск не нужно повторять, второе — тем, что нужен
+// новый консьюмер.
+type consumerState int32
+
+const (
+	// consumerIdle — создан, но не запущен. Единственное состояние, из
+	// которого разрешены AddHandler и Start.
+	consumerIdle consumerState = iota
+	// consumerRunning — цикл опроса работает.
+	consumerRunning
+	// consumerClosed — Stop начат или уже завершён. Терминальное состояние:
+	// клиент franz-go закрыт, консьюмер не перезапускается.
+	consumerClosed
+)
+
+// lifecycleErr описывает отказ операции, разрешённой только до старта.
+// Для consumerIdle возвращает nil: отказывать не в чем.
+func (s consumerState) lifecycleErr() error {
+	if s == consumerClosed {
+		return ErrConsumerClosed
+	}
+
+	if s == consumerRunning {
+		return ErrConsumerStarted
+	}
+
+	return nil
+}
+
 // KafkaConsumer — консьюмер Kafka поверх franz-go.
 //
 // На каждую назначенную топик-партицию заводится горутина: обработка разных
@@ -328,11 +380,10 @@ type KafkaConsumer struct {
 	// прежде чем трогать карту воркеров.
 	loopDone chan struct{}
 
-	started atomic.Bool
-
-	// stopping взводится в начале остановки и читается Start: он обязан узнать
-	// о ней раньше, чем опубликует созданного клиента.
-	stopping atomic.Bool
+	// state — состояние жизненного цикла, см. consumerState. Читается Start и
+	// AddHandler, взводится в consumerClosed в начале остановки: Start обязан
+	// узнать о ней раньше, чем опубликует созданного клиента.
+	state atomic.Int32
 
 	// stopOnce делает Stop одновременно однократным и блокирующим: второй
 	// вызывающий ждёт первого и получает тот же результат, а не nil «уже
@@ -390,6 +441,11 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 // Вызывается до Start: после старта набор топиков уже передан в
 // kgo.ConsumeTopics, и добавление обработчика вернуло бы обработчик без
 // подписки. Повторная регистрация того же топика — ошибка, а не тихая замена.
+//
+// На запущенном консьюмере возвращает ErrConsumerStarted, на остановленном —
+// ErrConsumerClosed. Второе не «то же самое, но позже»: регистрация на
+// остановленном консьюмере бесполезна навсегда, и раньше она молча
+// завершалась успехом, создавая впечатление рабочей подписки.
 func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ...ConsumerMiddleware) error {
 	if topic == "" {
 		return fmt.Errorf("add handler: %w", ErrEmptyTopic)
@@ -402,8 +458,8 @@ func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ..
 		return fmt.Errorf("add handler for topic %q: %w", topic, ErrNilHandler)
 	}
 
-	if c.started.Load() {
-		return fmt.Errorf("add handler for topic %q: %w", topic, ErrConsumerStarted)
+	if err := c.loadState().lifecycleErr(); err != nil {
+		return fmt.Errorf("add handler for topic %q: %w", topic, err)
 	}
 
 	c.handlersMu.Lock()
@@ -425,35 +481,56 @@ func (c *KafkaConsumer) AddHandler(topic string, handler ConsumerHandler, mws ..
 	return nil
 }
 
+// loadState возвращает текущее состояние жизненного цикла.
+func (c *KafkaConsumer) loadState() consumerState {
+	return consumerState(c.state.Load())
+}
+
+// abortStart возвращает консьюмера в consumerIdle после неуспешного Start,
+// чтобы можно было исправить конфигурацию и повторить запуск.
+//
+// CAS, а не Store: параллельный Stop мог уже перевести консьюмера в
+// consumerClosed, и безусловная запись воскресила бы остановленного.
+func (c *KafkaConsumer) abortStart() {
+	c.state.CompareAndSwap(int32(consumerRunning), int32(consumerIdle))
+}
+
 // Start создаёт клиента Kafka и запускает цикл опроса. Не блокирует.
 //
 // Отмена ctx запускает ровно тот же путь, что и Stop, — с дренажем очередей и
 // финальным коммитом. Разница только в том, что ошибку завершения при этом
 // некому вернуть: она уходит в лог. Предпочтительнее явный Stop.
 //
-// Повторный вызов возвращает ErrConsumerStarted; консьюмер, прошедший Stop, не
-// перезапускается.
+// Повторный вызов уже запущенного консьюмера возвращает ErrConsumerStarted.
+// Консьюмер, прошедший Stop, не перезапускается: Start вернёт ErrConsumerClosed,
+// и отличить это от «уже запущен» можно через errors.Is.
 func (c *KafkaConsumer) Start(ctx context.Context) error {
 	const op = "start"
 
-	if !c.started.CompareAndSwap(false, true) {
+	// Гонку двух Start разрешает CAS; проигравший узнаёт причину отказа из
+	// состояния. К моменту чтения оно могло вернуться в consumerIdle — если
+	// победивший откатился по ошибке конфигурации, — и тогда честнее всего
+	// сказать «занято»: запуска не было именно из-за встречного вызова.
+	if !c.state.CompareAndSwap(int32(consumerIdle), int32(consumerRunning)) {
+		if err := c.loadState().lifecycleErr(); err != nil {
+			return err
+		}
+
 		return ErrConsumerStarted
 	}
 
-	// Флаг сбрасывается на каждом неуспешном пути: иначе после отказа Start
-	// исправить конфигурацию и повторить запуск было бы нельзя.
+	// Состояние откатывается на каждом неуспешном пути: иначе после отказа
+	// Start исправить конфигурацию и повторить запуск было бы нельзя.
 	topics := c.topics()
 	if len(topics) == 0 {
-		c.started.Store(false)
+		c.abortStart()
 
 		return ErrNoHandlers
 	}
 
 	// Быстрый путь: Stop уже прошёл, создавать клиента незачем. Гарантию даёт
 	// не эта проверка, а повторная — под c.mu, рядом с публикацией клиента.
-	if c.stopping.Load() {
-		c.started.Store(false)
-
+	if c.loadState() == consumerClosed {
 		return ErrConsumerClosed
 	}
 
@@ -463,7 +540,7 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 		lost:     c.onPartitionsLost,
 	})
 	if err != nil {
-		c.started.Store(false)
+		c.abortStart()
 
 		return fmt.Errorf("%s: %w", op, err)
 	}
@@ -475,26 +552,25 @@ func (c *KafkaConsumer) Start(ctx context.Context) error {
 
 	client, err := kgo.NewClient(opts...)
 	if err != nil {
-		c.started.Store(false)
+		c.abortStart()
 
 		return fmt.Errorf("%s: kafka client init: %w", op, err)
 	}
 
 	pollCtx, pollCancel := context.WithCancel(c.lifeCtx)
 
-	// Проверка stopping и публикация клиента — одна критическая секция, и это
-	// обязательное условие, а не аккуратность. Stop взводит stopping до захвата
-	// c.mu, поэтому разнести их значит открыть окно, в котором Stop видит
-	// c.client == nil, уходит по ранней ветке и оставляет уже созданного
-	// клиента — присоединившегося к группе, с живым heartbeat — без единого
-	// владельца, способного его закрыть. Типовой триггер — SIGTERM во время
-	// старта пода.
+	// Проверка состояния и публикация клиента — одна критическая секция, и это
+	// обязательное условие, а не аккуратность. Stop переводит консьюмера в
+	// consumerClosed до захвата c.mu, поэтому разнести их значит открыть окно, в
+	// котором Stop видит c.client == nil, уходит по ранней ветке и оставляет уже
+	// созданного клиента — присоединившегося к группе, с живым heartbeat — без
+	// единого владельца, способного его закрыть. Типовой триггер — SIGTERM во
+	// время старта пода.
 	c.mu.Lock()
-	if c.stopping.Load() {
+	if c.loadState() == consumerClosed {
 		c.mu.Unlock()
 		pollCancel()
 		client.CloseAllowingRebalance()
-		c.started.Store(false)
 
 		return ErrConsumerClosed
 	}
@@ -564,7 +640,7 @@ func (c *KafkaConsumer) runPollLoop(ctx context.Context, client *kgo.Client) {
 	defer close(c.loopDone)
 	defer func() {
 		if r := recover(); r != nil {
-			c.panics.report(context.WithoutCancel(ctx), panicSitePollLoop, r, debug.Stack())
+			c.panics.report(context.WithoutCancel(ctx), PanicSitePollLoop, r, debug.Stack())
 		}
 	}()
 
@@ -761,7 +837,7 @@ func (c *KafkaConsumer) runPartitionWorker(
 			// Паника здесь — не в обработчике, а в самом воркере: без
 			// перехвата она уронила бы процесс, потому что чужая горутина
 			// вызывающим кодом не ловится.
-			c.panics.report(context.WithoutCancel(ctx), panicSitePartitionWorker, r, debug.Stack(),
+			c.panics.report(context.WithoutCancel(ctx), PanicSitePartitionWorker, r, debug.Stack(),
 				slog.String("topic", key.topic),
 				slog.Int("partition", int(key.partition)))
 		}
@@ -870,7 +946,7 @@ func (c *KafkaConsumer) processRecord(
 
 		// Отдельный перехват вокруг обвязки: паника в трейсинге или в
 		// метриках не должна уносить воркера вместе с очередью.
-		c.panics.report(ctx, panicSiteProcessMessage, r, debug.Stack(), recordAttrs(rec)...)
+		c.panics.report(ctx, PanicSiteProcessMessage, r, debug.Stack(), recordAttrs(rec)...)
 
 		// Отравление здесь обязательно. Штатный возврат из processRecord
 		// оставил бы запись без отметки, но не остановил бы партицию — и
@@ -991,7 +1067,7 @@ func (c *KafkaConsumer) resolveFailure(
 func (c *KafkaConsumer) callSkipHook(ctx context.Context, msg IncomingMessage, cause error) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			c.panics.report(ctx, panicSiteMessageSkipped, r, debug.Stack(),
+			c.panics.report(ctx, PanicSiteMessageSkipped, r, debug.Stack(),
 				slog.String("topic", msg.Topic),
 				slog.Int("partition", int(msg.Partition)),
 				slog.Int64("offset", msg.Offset))
@@ -1148,7 +1224,7 @@ func (c *KafkaConsumer) callHandler(
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%w: %v", ErrHandlerPanic, r)
 			span.RecordError(err)
-			c.panics.report(ctx, panicSiteHandler, r, debug.Stack(),
+			c.panics.report(ctx, PanicSiteHandler, r, debug.Stack(),
 				slog.String("topic", msg.Topic),
 				slog.Int("partition", int(msg.Partition)),
 				slog.Int64("offset", msg.Offset))
@@ -1393,7 +1469,9 @@ func (c *KafkaConsumer) Stop() error {
 
 // shutdown — тело остановки, выполняемое ровно один раз.
 func (c *KafkaConsumer) shutdown() error {
-	c.stopping.Store(true)
+	// Терминальное состояние взводится до захвата c.mu — на этом порядке
+	// держится защита от «осиротевшего» клиента в Start, см. комментарий там.
+	c.state.Store(int32(consumerClosed))
 
 	c.mu.Lock()
 	client, pollCancel := c.client, c.pollCancel

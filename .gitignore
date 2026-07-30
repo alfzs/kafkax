@@ -4,3 +4,7 @@
 /graphify-out/
 .idea/
 .tools/
+
+# Артефакты `make test-cover`; удаляются `make clean`.
+coverage.out
+coverage.html

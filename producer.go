@@ -192,7 +192,7 @@ func (p *KafkaProducer) initMetrics(meter metric.Meter) error {
 // случай равен документированному значению, а не сумме нескольких таймеров.
 func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) (err error) {
 	if !p.acquire() {
-		return ErrProducerClosed
+		return fmt.Errorf("send message: %w", ErrProducerClosed)
 	}
 	defer p.inflight.Done()
 
@@ -247,7 +247,7 @@ func (p *KafkaProducer) SendMessage(ctx context.Context, req PublishRequest) (er
 	// traceparent в заголовки записи и закрывает спан в
 	// OnProduceRecordUnbuffered, проставив partition, offset и статус ошибки.
 	if err := p.client.ProduceSync(sendCtx, rec).FirstErr(); err != nil {
-		return p.produceError(err)
+		return p.produceError(req.Topic, err)
 	}
 
 	return nil
@@ -296,34 +296,42 @@ func (p *KafkaProducer) acquire() bool {
 	return true
 }
 
-// produceError переводит ошибку franz-go в sentinel пакета.
+// produceError переводит ошибку franz-go в sentinel пакета, сохраняя причину.
 //
 // Разделение существует ради одного решения вызывающего кода: можно ли
 // повторить отправку, не рискуя дубликатом. ErrDeliveryTimeout означает
 // «запись уже у клиента и могла доехать», ErrProducerClosed — «не доехала
 // точно».
-func (p *KafkaProducer) produceError(err error) error {
+//
+// Причина разворачивается рядом с сентинелом во всех ветках, а не в двух из
+// четырёх. Сентинел отвечает на вопрос «повторять ли», причина — на вопрос
+// «что именно случилось»: наш context.DeadlineExceeded и kgo.ErrRecordTimeout
+// приводят к одному и тому же ErrDeliveryTimeout, но означают разные проблемы
+// (мал бюджет вызова против неспособности клиента дослать запись), и без
+// причины они неразличимы.
+func (p *KafkaProducer) produceError(topic string, err error) error {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, kgo.ErrRecordTimeout):
-		return ErrDeliveryTimeout
+		return fmt.Errorf("send message: %w: %w", ErrDeliveryTimeout, err)
 
 	case errors.Is(err, kgo.ErrClientClosed), errors.Is(err, kgo.ErrAborting):
 		// Close успел закрыть клиент между acquire и ProduceSync либо клиент
 		// сбрасывает буфер: с точки зрения вызывающего это тот же
 		// «продюсер закрыт», что и проваленная проверка в acquire.
-		return ErrProducerClosed
+		return fmt.Errorf("send message: %w: %w", ErrProducerClosed, err)
 
 	case errors.Is(err, context.Canceled):
-		// Префикс называет операцию, а не причину: ctx.Done() срабатывает и
-		// на отмене, и на дедлайне, и «context canceled: context deadline
-		// exceeded» противоречило бы само себе.
+		// Единственная ветка без сентинела: отмена — решение вызывающего, а не
+		// отказ Kafka. Префикс называет операцию, а не причину: ctx.Done()
+		// срабатывает и на отмене, и на дедлайне, и «context canceled: context
+		// deadline exceeded» противоречило бы само себе.
 		return fmt.Errorf("send message: %w", err)
 
 	default:
 		// Двойной %w: errors.Is находит sentinel, errors.As достаёт
-		// *kerr.Error с кодом брокера, по которому и видно, имеет ли смысл
-		// повтор (kerr.MessageTooLarge — нет, kerr.NotEnoughReplicas — да).
-		return fmt.Errorf("send message: %w: %w", ErrDeliveryFailed, err)
+		// *DeliveryError с кодом брокера, по которому и видно, имеет ли смысл
+		// повтор.
+		return fmt.Errorf("send message: %w: %w", ErrDeliveryFailed, newDeliveryError(topic, err))
 	}
 }
 

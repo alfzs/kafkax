@@ -27,54 +27,54 @@ func TestEncodeKey_SupportedTypes(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		parts []any
+		parts []KeyPart
 		want  []byte
 	}{
 		{
 			name:  "uuid — 16 байт без длины",
-			parts: []any{testID1},
+			parts: []KeyPart{UUID(testID1)},
 			want:  testID1[:],
 		},
 		{
 			name:  "string — length-prefix big-endian + данные",
-			parts: []any{"bot"},
+			parts: []KeyPart{Str("bot")},
 			want:  []byte{0x00, 0x00, 0x00, 0x03, 'b', 'o', 't'},
 		},
 		{
 			name:  "пустая строка — только нулевая длина",
-			parts: []any{""},
+			parts: []KeyPart{Str("")},
 			want:  []byte{0x00, 0x00, 0x00, 0x00},
 		},
 		{
 			name:  "int64 — 8 байт big-endian",
-			parts: []any{int64(42)},
+			parts: []KeyPart{Int64(42)},
 			want:  []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A},
 		},
 		{
 			name:  "int64 ноль",
-			parts: []any{int64(0)},
+			parts: []KeyPart{Int64(0)},
 			want:  []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 		},
 		{
 			// Отрицательные значения кодируются как uint64 через
 			// reinterpretation, а не как знаковый sign-magnitude.
 			name:  "int64 -1 — все биты выставлены",
-			parts: []any{int64(-1)},
+			parts: []KeyPart{Int64(-1)},
 			want:  []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
 		},
 		{
 			name:  "int64 MinInt64",
-			parts: []any{int64(-1 << 63)},
+			parts: []KeyPart{Int64(-1 << 63)},
 			want:  []byte{0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 		},
 		{
 			name:  "bool true — один байт 1",
-			parts: []any{true},
+			parts: []KeyPart{Bool(true)},
 			want:  []byte{0x01},
 		},
 		{
 			name:  "bool false — один байт 0",
-			parts: []any{false},
+			parts: []KeyPart{Bool(false)},
 			want:  []byte{0x00},
 		},
 		{
@@ -86,7 +86,7 @@ func TestEncodeKey_SupportedTypes(t *testing.T) {
 		},
 		{
 			name:  "комбинация всех типов подряд",
-			parts: []any{testID1, "ab", int64(1), true},
+			parts: []KeyPart{UUID(testID1), Str("ab"), Int64(1), Bool(true)},
 			want: bytes.Join([][]byte{
 				testID1[:],
 				{0x00, 0x00, 0x00, 0x02, 'a', 'b'},
@@ -119,7 +119,7 @@ func TestEncodeKey_StringLengthBigEndian(t *testing.T) {
 
 	s := strings.Repeat("x", 258)
 
-	key, err := EncodeKey(s)
+	key, err := EncodeKey(Str(s))
 	if err != nil {
 		t.Fatalf("EncodeKey() вернул ошибку: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestEncodeKey_StringLengthBigEndian(t *testing.T) {
 func TestEncodeKey_Deterministic(t *testing.T) {
 	t.Parallel()
 
-	parts := []any{testID1, "hello", int64(99), true}
+	parts := []KeyPart{UUID(testID1), Str("hello"), Int64(99), Bool(true)}
 
 	first, err := EncodeKey(parts...)
 	if err != nil {
@@ -163,12 +163,12 @@ func TestEncodeKey_Deterministic(t *testing.T) {
 func TestEncodeKey_PartOrderMatters(t *testing.T) {
 	t.Parallel()
 
-	direct, err := EncodeKey(testID1, testID2)
+	direct, err := EncodeKey(UUID(testID1), UUID(testID2))
 	if err != nil {
 		t.Fatalf("EncodeKey() вернул ошибку: %v", err)
 	}
 
-	reversed, err := EncodeKey(testID2, testID1)
+	reversed, err := EncodeKey(UUID(testID2), UUID(testID1))
 	if err != nil {
 		t.Fatalf("EncodeKey() вернул ошибку: %v", err)
 	}
@@ -186,29 +186,29 @@ func TestEncodeKey_DistinctPartsDistinctBytes(t *testing.T) {
 
 	tests := []struct {
 		name string
-		a    []any
-		b    []any
+		a    []KeyPart
+		b    []KeyPart
 	}{
 		{
 			// Без префикса длины обе пары склеились бы в "abc".
 			name: "разное разбиение одной строки",
-			a:    []any{"ab", "c"},
-			b:    []any{"a", "bc"},
+			a:    []KeyPart{Str("ab"), Str("c")},
+			b:    []KeyPart{Str("a"), Str("bc")},
 		},
 		{
 			name: "строка против её же длины в другом порядке",
-			a:    []any{"x", ""},
-			b:    []any{"", "x"},
+			a:    []KeyPart{Str("x"), Str("")},
+			b:    []KeyPart{Str(""), Str("x")},
 		},
 		{
 			name: "true/false в одной позиции",
-			a:    []any{testID1, true},
-			b:    []any{testID1, false},
+			a:    []KeyPart{UUID(testID1), Bool(true)},
+			b:    []KeyPart{UUID(testID1), Bool(false)},
 		},
 		{
 			name: "соседние int64",
-			a:    []any{int64(1)},
-			b:    []any{int64(2)},
+			a:    []KeyPart{Int64(1)},
+			b:    []KeyPart{Int64(2)},
 		},
 	}
 
@@ -233,40 +233,36 @@ func TestEncodeKey_DistinctPartsDistinctBytes(t *testing.T) {
 	}
 }
 
-// Ошибка обязана называть позицию и тип: без них разработчик ищет опечатку
-// глазами по всему списку аргументов вызова.
-func TestEncodeKey_UnsupportedType(t *testing.T) {
+// Неподдерживаемый тип части больше не существует как класс ошибки: части
+// собираются конструкторами, и EncodeKey(42) не компилируется. Остался ровно
+// один способ подсунуть мусор — нулевое значение KeyPart (например, из
+// make([]KeyPart, n)). Он обязан быть отвергнут с позицией и сентинелом, а не
+// закодирован как пустая часть: такой ключ молча разъехался бы с продюсерским.
+func TestEncodeKey_InvalidPart(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name         string
-		parts        []any
+		parts        []KeyPart
 		wantContains []string
 	}{
 		{
-			name:         "int вместо int64 в первой позиции",
-			parts:        []any{42},
-			wantContains: []string{"unsupported key part type int", wantPos0},
+			name:         "нулевое значение KeyPart в первой позиции",
+			parts:        []KeyPart{{}},
+			wantContains: []string{"zero-value KeyPart", wantPos0},
 		},
 		{
-			name:         "float64 в середине",
-			parts:        []any{testID1, 3.14, "tail"},
-			wantContains: []string{"unsupported key part type float64", "position 1"},
+			name:         "нулевое значение в середине",
+			parts:        []KeyPart{UUID(testID1), {}, Str("tail")},
+			wantContains: []string{"zero-value KeyPart", "position 1"},
 		},
 		{
-			name:         "указатель на uuid вместо значения",
-			parts:        []any{&testID1},
-			wantContains: []string{"*uuid.UUID", wantPos0},
-		},
-		{
-			name:         "[]byte не поддерживается",
-			parts:        []any{[]byte{1, 2, 3}},
-			wantContains: []string{"[]uint8", wantPos0},
-		},
-		{
-			name:         "nil-часть",
-			parts:        []any{nil},
-			wantContains: []string{wantPos0},
+			// Неизвестный kind недостижим снаружи пакета, но ветка обязана
+			// отказывать, а не писать байты: добавление нового вида части без
+			// правки appendTo не должно давать молча усечённый ключ.
+			name:         "неизвестный kind",
+			parts:        []KeyPart{{kind: 200}},
+			wantContains: []string{"unknown kind 200", wantPos0},
 		},
 	}
 
@@ -283,6 +279,12 @@ func TestEncodeKey_UnsupportedType(t *testing.T) {
 				t.Errorf("при ошибке ключ = % X, ожидался nil", key)
 			}
 
+			// Вызывающий отличает баг в своём коде от повреждённого сообщения
+			// по сентинелу, а не по тексту.
+			if !errors.Is(err, ErrInvalidKeyPart) {
+				t.Errorf("errors.Is(err, ErrInvalidKeyPart) = false, err: %v", err)
+			}
+
 			for _, want := range tt.wantContains {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("ошибка %q не содержит %q", err, want)
@@ -292,19 +294,112 @@ func TestEncodeKey_UnsupportedType(t *testing.T) {
 	}
 }
 
+// Вторая половина двухпроходной сборки: appendTo вызывается только после
+// успешного size, поэтому на невалидной части он обязан ничего не писать.
+// Иначе ошибка в порядке вызовов дала бы ключ с мусорными байтами.
+func TestKeyPart_AppendToInvalidWritesNothing(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		part KeyPart
+	}{
+		{name: "нулевое значение", part: KeyPart{}},
+		{name: "неизвестный kind", part: KeyPart{kind: 200}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			buf := []byte{0xAA}
+
+			if got := tt.part.appendTo(buf); !bytes.Equal(got, buf) {
+				t.Errorf("appendTo дописал % X, ожидался неизменный буфер", got)
+			}
+		})
+	}
+}
+
+// RF-PERF-05: размер считается первым проходом, запись идёт в один буфер.
+// Регрессия сюда возвращает по два make на часть и рост буфера из nil, то есть
+// четыре аллокации на ключ у всех, кто кодирует его на каждое сообщение.
+//
+// Ни сам тест, ни его случаи не параллельны намеренно: testing.AllocsPerRun
+// паникует, если в этот момент выполняется хоть один параллельный тест
+// (testing/allocs.go). Подслучаи развёрнуты в цикл без t.Run по той же причине.
+//
+//nolint:paralleltest // AllocsPerRun несовместим с t.Parallel, см. комментарий выше
+func TestEncodeKey_SingleAllocation(t *testing.T) {
+	tests := []struct {
+		name  string
+		parts []KeyPart
+	}{
+		{name: "два uuid", parts: []KeyPart{UUID(testID1), UUID(testID2)}},
+		{
+			name:  "uuid + строка + int64 + bool",
+			parts: []KeyPart{UUID(testID1), Str(testBotID), Int64(7), Bool(true)},
+		},
+	}
+
+	for _, tt := range tests {
+		var key []byte
+
+		allocs := testing.AllocsPerRun(100, func() {
+			encoded, err := EncodeKey(tt.parts...)
+			if err != nil {
+				t.Errorf("%s: EncodeKey() вернул ошибку: %v", tt.name, err)
+			}
+
+			key = encoded
+		})
+
+		if key == nil {
+			t.Fatalf("%s: ключ не собран", tt.name)
+		}
+
+		if allocs > 1 {
+			t.Errorf("%s: EncodeKey() = %.0f аллокаций, want 1", tt.name, allocs)
+		}
+	}
+}
+
+// Буфер выделяется ровно под итоговый размер: лишняя ёмкость означала бы, что
+// первый проход считает не то, что пишет второй.
+func TestEncodeKey_ExactCapacity(t *testing.T) {
+	t.Parallel()
+
+	key, err := EncodeKey(UUID(testID1), Str(testBotID), Int64(7), Bool(true))
+	if err != nil {
+		t.Fatalf("EncodeKey() вернул ошибку: %v", err)
+	}
+
+	want := uuidSize + lenPrefixSize + len(testBotID) + int64Size + boolSize
+	if len(key) != want {
+		t.Fatalf("len(key) = %d, want %d", len(key), want)
+	}
+
+	if cap(key) != want {
+		t.Errorf("cap(key) = %d, want %d — буфер не преаллоцирован точно", cap(key), want)
+	}
+}
+
 func TestMatchKey_Match(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name  string
-		parts []any
+		parts []KeyPart
 	}{
-		{"один uuid", []any{testID1}},
-		{"uuid + string", []any{testID1, testBotID}},
-		{"пять частей всех типов", []any{testID1, testID2, "action", int64(7), true}},
-		{"только int64", []any{int64(1234567890123)}},
-		{"только bool", []any{true}},
-		{"пустая строка как часть", []any{testID1, ""}},
+		{"один uuid", []KeyPart{UUID(testID1)}},
+		{"uuid + string", []KeyPart{UUID(testID1), Str(testBotID)}},
+		{
+			"пять частей всех типов",
+			[]KeyPart{UUID(testID1), UUID(testID2), Str("action"), Int64(7), Bool(true)},
+		},
+		{"только int64", []KeyPart{Int64(1234567890123)}},
+		{"только bool", []KeyPart{Bool(true)}},
+		{"пустая строка как часть", []KeyPart{UUID(testID1), Str("")}},
 	}
 
 	for _, tt := range tests {
@@ -328,17 +423,33 @@ func TestMatchKey_Mismatch(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		encoded []any
-		probe   []any
+		encoded []KeyPart
+		probe   []KeyPart
 	}{
-		{"другая строка", []any{testID1, testBotID}, []any{testID1, "bot-2"}},
-		{"другой uuid", []any{testID1, testBotID}, []any{testID2, testBotID}},
-		{"другой int64", []any{int64(42)}, []any{int64(43)}},
-		{"true против false", []any{true}, []any{false}},
-		{"отличается последняя часть из пяти", []any{testID1, testID2, "action", int64(7), true}, []any{testID1, testID2, "action", int64(7), false}},
-		{"лишняя часть в конце", []any{testID1}, []any{testID1, "bot"}},
-		{"недостающая часть", []any{testID1, "bot"}, []any{testID1}},
-		{"те же части в обратном порядке", []any{testID1, testID2}, []any{testID2, testID1}},
+		{
+			"другая строка",
+			[]KeyPart{UUID(testID1), Str(testBotID)},
+			[]KeyPart{UUID(testID1), Str("bot-2")},
+		},
+		{
+			"другой uuid",
+			[]KeyPart{UUID(testID1), Str(testBotID)},
+			[]KeyPart{UUID(testID2), Str(testBotID)},
+		},
+		{"другой int64", []KeyPart{Int64(42)}, []KeyPart{Int64(43)}},
+		{"true против false", []KeyPart{Bool(true)}, []KeyPart{Bool(false)}},
+		{
+			"отличается последняя часть из пяти",
+			[]KeyPart{UUID(testID1), UUID(testID2), Str("action"), Int64(7), Bool(true)},
+			[]KeyPart{UUID(testID1), UUID(testID2), Str("action"), Int64(7), Bool(false)},
+		},
+		{"лишняя часть в конце", []KeyPart{UUID(testID1)}, []KeyPart{UUID(testID1), Str("bot")}},
+		{"недостающая часть", []KeyPart{UUID(testID1), Str("bot")}, []KeyPart{UUID(testID1)}},
+		{
+			"те же части в обратном порядке",
+			[]KeyPart{UUID(testID1), UUID(testID2)},
+			[]KeyPart{UUID(testID2), UUID(testID1)},
+		},
 	}
 
 	for _, tt := range tests {
@@ -365,11 +476,16 @@ func TestMatchKey_EmptyKey(t *testing.T) {
 	tests := []struct {
 		name  string
 		key   []byte
-		parts []any
+		parts []KeyPart
 		want  bool
 	}{
-		{"nil-ключ против непустых частей", nil, []any{testID1, testBotID}, false},
-		{"пустой срез против непустых частей", []byte{}, []any{testID1, testBotID}, false},
+		{"nil-ключ против непустых частей", nil, []KeyPart{UUID(testID1), Str(testBotID)}, false},
+		{
+			"пустой срез против непустых частей",
+			[]byte{},
+			[]KeyPart{UUID(testID1), Str(testBotID)},
+			false,
+		},
 		// Без частей ожидаемый ключ пуст, поэтому пустой ключ ему равен.
 		{"nil-ключ без частей", nil, nil, true},
 		{"пустой срез без частей", []byte{}, nil, true},
@@ -387,13 +503,13 @@ func TestMatchKey_EmptyKey(t *testing.T) {
 	}
 }
 
-// Неподдерживаемый тип части — ошибка программиста, а не «ключ не наш».
-// Тихий false по godoc-паттерну `if !MatchKey(...) { return nil }` отбрасывал
-// бы 100% трафика при зелёных метриках успеха, поэтому здесь именно паника.
-func TestMatchKey_UnsupportedTypePanics(t *testing.T) {
+// Невалидная часть — ошибка программиста, а не «ключ не наш». Тихий false по
+// godoc-паттерну `if !MatchKey(...) { return nil }` отбрасывал бы 100% трафика
+// при зелёных метриках успеха, поэтому здесь именно паника.
+func TestMatchKey_InvalidPartPanics(t *testing.T) {
 	t.Parallel()
 
-	key, err := EncodeKey(testID1, "bot")
+	key, err := EncodeKey(UUID(testID1), Str("bot"))
 	if err != nil {
 		t.Fatalf("EncodeKey() вернул ошибку: %v", err)
 	}
@@ -401,7 +517,7 @@ func TestMatchKey_UnsupportedTypePanics(t *testing.T) {
 	defer func() {
 		r := recover()
 		if r == nil {
-			t.Fatal("MatchKey() с int не паниковал")
+			t.Fatal("MatchKey() с нулевой частью не паниковал")
 		}
 
 		msg, ok := r.(string)
@@ -411,20 +527,90 @@ func TestMatchKey_UnsupportedTypePanics(t *testing.T) {
 
 		// Текст обязан называть и место, и причину: без них стек в проде
 		// разбирается вручную.
-		for _, want := range []string{"MatchKey", "unsupported key part type int", "position 1"} {
+		for _, want := range []string{"MatchKey", "zero-value KeyPart", "position 1"} {
 			if !strings.Contains(msg, want) {
 				t.Errorf("паника %q не содержит %q", msg, want)
 			}
 		}
 	}()
 
-	MatchKey(key, testID1, 123)
+	MatchKey(key, UUID(testID1), KeyPart{})
+}
+
+// Предкодированный Key — то, ради чего существует тип: части кодируются один
+// раз, дальше только сравнения. Байты обязаны совпадать с EncodeKey, иначе
+// консьюмер на Key и продюсер на EncodeKey разъедутся.
+func TestNewKey_BytesMatchEncodeKey(t *testing.T) {
+	t.Parallel()
+
+	parts := []KeyPart{UUID(testID1), Str(testBotID), Int64(7), Bool(false)}
+
+	encoded, err := EncodeKey(parts...)
+	if err != nil {
+		t.Fatalf("EncodeKey() вернул ошибку: %v", err)
+	}
+
+	key, err := NewKey(parts...)
+	if err != nil {
+		t.Fatalf("NewKey() вернул ошибку: %v", err)
+	}
+
+	if !bytes.Equal(key.Bytes(), encoded) {
+		t.Errorf("Key.Bytes() = % X, want % X", key.Bytes(), encoded)
+	}
+
+	if !key.Match(encoded) {
+		t.Error("Key.Match() = false для собственных байтов")
+	}
+
+	if err := key.ValidateLength(encoded); err != nil {
+		t.Errorf("Key.ValidateLength() = %v, want nil", err)
+	}
+}
+
+// Ошибка кодирования не должна давать полуготовый Key: с пустым raw он
+// совпадал бы с любым пустым ключом и пропускал бы весь трафик.
+func TestNewKey_InvalidPart(t *testing.T) {
+	t.Parallel()
+
+	key, err := NewKey(UUID(testID1), KeyPart{})
+	if err == nil {
+		t.Fatal("NewKey() = nil, ожидалась ошибка")
+	}
+
+	if !errors.Is(err, ErrInvalidKeyPart) {
+		t.Errorf("errors.Is(err, ErrInvalidKeyPart) = false, err: %v", err)
+	}
+
+	if key.Bytes() != nil {
+		t.Errorf("при ошибке Key.Bytes() = % X, ожидался nil", key.Bytes())
+	}
+}
+
+// Нулевой Key — это пустой ключ, а не «любой»: без частей ожидаемая длина 0,
+// поэтому проверка длины пропускает всё, а сравнение — только пустой ключ.
+func TestKey_Zero(t *testing.T) {
+	t.Parallel()
+
+	var key Key
+
+	if err := key.ValidateLength([]byte{1, 2, 3}); err != nil {
+		t.Errorf("ValidateLength() = %v, want nil", err)
+	}
+
+	if !key.Match(nil) {
+		t.Error("Match(nil) = false, want true")
+	}
+
+	if key.Match([]byte{1}) {
+		t.Error("Match(непустой) = true, want false")
+	}
 }
 
 func TestValidateKeyLength_OK(t *testing.T) {
 	t.Parallel()
 
-	key, err := EncodeKey(testID1, testBotID)
+	key, err := EncodeKey(UUID(testID1), Str(testBotID))
 	if err != nil {
 		t.Fatalf("EncodeKey() вернул ошибку: %v", err)
 	}
@@ -432,12 +618,12 @@ func TestValidateKeyLength_OK(t *testing.T) {
 	tests := []struct {
 		name  string
 		key   []byte
-		parts []any
+		parts []KeyPart
 	}{
-		{"длина ровно совпадает", key, []any{testID1, testBotID}},
+		{"длина ровно совпадает", key, []KeyPart{UUID(testID1), Str(testBotID)}},
 		// Длиннее ожидаемого — не повреждение: это просто чужой ключ, что
 		// обнаружит MatchKey, а не проверка длины.
-		{"ключ длиннее ожидаемого", key, []any{testID1}},
+		{"ключ длиннее ожидаемого", key, []KeyPart{UUID(testID1)}},
 		{"без частей ожидаемая длина 0", nil, nil},
 		{"без частей и непустой ключ", key, nil},
 	}
@@ -456,7 +642,7 @@ func TestValidateKeyLength_OK(t *testing.T) {
 func TestValidateKeyLength_TooShort(t *testing.T) {
 	t.Parallel()
 
-	full, err := EncodeKey(testID1, testBotID)
+	full, err := EncodeKey(UUID(testID1), Str(testBotID))
 	if err != nil {
 		t.Fatalf("EncodeKey() вернул ошибку: %v", err)
 	}
@@ -475,7 +661,7 @@ func TestValidateKeyLength_TooShort(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := ValidateKeyLength(tt.key, testID1, testBotID)
+			err := ValidateKeyLength(tt.key, UUID(testID1), Str(testBotID))
 			if err == nil {
 				t.Fatal("ValidateKeyLength() = nil, ожидалась ошибка")
 			}
@@ -485,17 +671,23 @@ func TestValidateKeyLength_TooShort(t *testing.T) {
 			if !errors.Is(err, ErrInvalidKey) {
 				t.Errorf("errors.Is(err, ErrInvalidKey) = false, err: %v", err)
 			}
+
+			// Длины в тексте — то, ради чего ошибка форматируется: без них
+			// «invalid composite key» не отличить от опечатки в частях.
+			if !strings.Contains(err.Error(), "want at least") {
+				t.Errorf("ошибка %q не называет ожидаемую длину", err)
+			}
 		})
 	}
 }
 
 // Ошибка кодирования пробрасывается как есть и не маскируется под ErrInvalidKey:
-// «неподдерживаемый тип» — баг вызывающего, а не повреждённое сообщение,
+// невалидная часть — баг вызывающего, а не повреждённое сообщение,
 // и middleware не должен списывать его на битые данные.
 func TestValidateKeyLength_EncodeError(t *testing.T) {
 	t.Parallel()
 
-	err := ValidateKeyLength([]byte{1, 2, 3}, 42)
+	err := ValidateKeyLength([]byte{1, 2, 3}, KeyPart{})
 	if err == nil {
 		t.Fatal("ValidateKeyLength() = nil, ожидалась ошибка")
 	}
@@ -504,7 +696,7 @@ func TestValidateKeyLength_EncodeError(t *testing.T) {
 		t.Error("errors.Is(err, ErrInvalidKey) = true, want false")
 	}
 
-	if !strings.Contains(err.Error(), "unsupported key part type int") {
-		t.Errorf("ошибка %q не содержит причину кодирования", err)
+	if !errors.Is(err, ErrInvalidKeyPart) {
+		t.Errorf("errors.Is(err, ErrInvalidKeyPart) = false, err: %v", err)
 	}
 }
