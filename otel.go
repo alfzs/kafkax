@@ -43,9 +43,20 @@ const instrumentationModule = "github.com/alfzs/kafkax/v2"
 // docs/audit/03-observability.md). Схемо-осведомлённый backend, поверив
 // объявлению, начал бы переименовывать атрибуты по правилам чужой схемы.
 func meterOptions() []metric.MeterOption {
+	return meterOptionsFor(moduleVersion(debug.ReadBuildInfo()))
+}
+
+// meterOptionsFor — тело meterOptions при уже известной версии.
+//
+// Чтение build info вынесено в вызывающего не ради красоты: build info
+// тестового бинаря принадлежит модулю пакета и всегда непустое, так что обе
+// ветки — «версия есть» и «версии нет» — из теста недостижимы, пока
+// debug.ReadBuildInfo зашит внутрь. Проверить на них нечего, и потеря ветки с
+// пустой строкой прошла бы молча: scope метрик уехал бы в экспорт с
+// instrumentation.version="".
+func meterOptionsFor(version string) []metric.MeterOption {
 	opts := []metric.MeterOption{}
 
-	version := moduleVersion()
 	if version == "" {
 		return opts
 	}
@@ -54,8 +65,13 @@ func meterOptions() []metric.MeterOption {
 }
 
 // moduleVersion достаёт версию модуля пакета из build info.
-func moduleVersion() string {
-	info, ok := debug.ReadBuildInfo()
+//
+// info и ok — ровно то, что вернул debug.ReadBuildInfo; параметрами, а не
+// вызовом внутри, по той же причине, что и у meterOptionsFor. Пакет бывает и
+// главным модулем (его собственные тесты и примеры), и зависимостью
+// (единственный способ, которым его видит приложение), поэтому ищется в обоих
+// местах.
+func moduleVersion(info *debug.BuildInfo, ok bool) string {
 	if !ok {
 		return ""
 	}
@@ -289,21 +305,39 @@ type telemetry struct {
 // group передаётся только консьюмером: kotel добавляет messaging.kafka.
 // consumer.group в спаны receive/process, и для продюсера это поле бессмысленно.
 func newTelemetry(clientID, group string) telemetry {
-	tracerOpts := []kotel.TracerOpt{
-		kotel.TracerProvider(otel.GetTracerProvider()),
-		kotel.TracerPropagator(otel.GetTextMapPropagator()),
-		kotel.ClientID(clientID),
-	}
-
-	if group != "" {
-		tracerOpts = append(tracerOpts, kotel.ConsumerGroup(group))
-	}
-
-	tracer := kotel.NewTracer(tracerOpts...)
+	tracer := kotel.NewTracer(tracerOpts(clientID, group)...)
 	meter := kotel.NewMeter(kotel.MeterProvider(otel.GetMeterProvider()))
 
 	return telemetry{
 		tracer: tracer,
 		hooks:  kotel.NewKotel(kotel.WithTracer(tracer), kotel.WithMeter(meter)).Hooks(),
 	}
+}
+
+// tracerOpts собирает опции трейсера kotel для одной роли.
+//
+// Отдельная функция ради проверяемости: у kotel.Tracer все поля неэкспортные, а
+// ConsumerGroup("") записывает в поле ту же пустую строку, что там и была, —
+// то есть по готовому трейсеру «опции не было» и «опция была с пустым
+// значением» неразличимы, и состав списка проверяется до NewTracer.
+//
+// TracerProvider и TracerPropagator повторяют то, что kotel подставил бы сам:
+// оба его умолчания — те же глобали OTel, прочитанные в тот же момент. Опции
+// оставлены явными, потому что зависимость от глобального состояния лучше
+// видеть в коде, чем узнавать из чужого README; наблюдаемого поведения они не
+// меняют, и теста на них поэтому нет.
+func tracerOpts(clientID, group string) []kotel.TracerOpt {
+	opts := []kotel.TracerOpt{
+		kotel.TracerProvider(otel.GetTracerProvider()),
+		kotel.TracerPropagator(otel.GetTextMapPropagator()),
+		kotel.ClientID(clientID),
+	}
+
+	// Группа — консьюмерский атрибут: kotel кладёт её в спаны receive/process,
+	// и у продюсера она означала бы принадлежность к группе, которой нет.
+	if group != "" {
+		opts = append(opts, kotel.ConsumerGroup(group))
+	}
+
+	return opts
 }
