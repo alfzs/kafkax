@@ -533,6 +533,17 @@ func TestConfigValidateProducerFields(t *testing.T) {
 			mutate: func(p *ProducerConfig) { p.MaxRetries = 0 },
 		},
 		{
+			// Верхнюю границу linger franz-go проверяет, нижней у него нет:
+			// минус проходит и конструктор, и первый батч. Дальше поле просто
+			// перестаёт значить написанное — путь «без задержки» выбирается по
+			// сравнению с нулём, а минус в него не попадает и уходит в таймер,
+			// просроченный в момент создания. Настройку, которая молча делает
+			// не то, отличить от работающей можно только по трафику.
+			name:   "отрицательный linger",
+			mutate: func(p *ProducerConfig) { p.Linger = -time.Second },
+			want:   cfgLabel("Producer.Linger") + " must not be negative",
+		},
+		{
 			// opts.go ставит kgo.MaxBufferedBytes только при значении > 0, так
 			// что минус означал бы «без лимита» — то же, что ноль, но не тем
 			// способом, каким это написано в godoc поля.
@@ -716,6 +727,16 @@ func consumerTimingFieldCases() []consumerFieldCase {
 			want:   cfgLabel("Consumer.MessageQueueSize") + " must be positive",
 		},
 		{
+			// Ноль опаснее минуса именно тем, что не падает: make(chan, 0)
+			// паники не даёт, он даёт небуферизованный канал — и цикл опроса
+			// начинает блокироваться на каждом батче до тех пор, пока его не
+			// заберёт воркер. Это молчаливая смена режима работы консьюмера, а
+			// не отказ, и по логам она неотличима от медленного обработчика.
+			name:   "нулевой message_queue_size",
+			mutate: func(c *ConsumerConfig) { c.MessageQueueSize = 0 },
+			want:   cfgLabel("Consumer.MessageQueueSize") + " must be positive",
+		},
+		{
 			name:   "нулевой max_poll_records",
 			mutate: func(c *ConsumerConfig) { c.MaxPollRecords = 0 },
 			want:   cfgLabel("Consumer.MaxPollRecords") + " must be positive",
@@ -843,6 +864,88 @@ func TestConfigValidateFetchSizesReportSeparately(t *testing.T) {
 	}
 
 	cfgWantErr(t, errs[0], cfgLabel("Consumer.MaxBytes")+" must be positive")
+}
+
+// TestConfigValidateSessionTimeoutReportsOnce — нулевой session_timeout не
+// тянет за собой претензию к heartbeat.
+//
+// Тот же принцип, что и у пары байтовых границ выше: правило «heartbeat не
+// больше трети сессии» осмысленно только при положительной сессии, иначе одна
+// забытая строка конфигурации порождает две ошибки, из которых вторая
+// указывает на поле, где всё в порядке. Список претензий читают как список
+// того, что надо править, и лишняя строка в нём стоит перезапуска.
+//
+// Guard, который это обеспечивает, не проверялся ничем: его снятие оставляло
+// набор зелёным, потому что первая — верная — претензия никуда не девается.
+func TestConfigValidateSessionTimeoutReportsOnce(t *testing.T) {
+	t.Parallel()
+
+	cfg := testConfig(t)
+	cfg.Consumer.SessionTimeout = 0
+
+	err := cfg.validateConsumer()
+	cfgWantErr(t, err, cfgLabel("Consumer.SessionTimeout")+" must be positive")
+
+	if strings.Contains(err.Error(), "third of Consumer.SessionTimeout") {
+		t.Errorf("нулевой session_timeout породил вторую претензию — к исправному heartbeat:\n%v", err)
+	}
+
+	if got := len(cfgUnwrapJoined(t, err)); got != 1 {
+		t.Errorf("получено %d ошибок, ожидалась одна: %v", got, err)
+	}
+}
+
+// TestValidationErrorNamesEnvVariableLiterally — суффикс «(env KAFKAX_…)»
+// закреплён в тексте ошибки литералом.
+//
+// Остальные подтесты валидации собирают ожидаемую подстроку через cfgLabel, то
+// есть через ту же функцию, которая текст и производит. Пока проверяемое и
+// ожидаемое приезжают из одного вызова, они совпадут при любом его содержимом:
+// cfgField.String(), переставший добавлять имя переменной окружения, оставлял
+// набор зелёным целиком (находка С3, docs/audit/09-mutation-sweep.md). Литерал
+// здесь не дубль cfgLabel, а единственный свидетель со стороны.
+//
+// Одного якоря хватает, и размножать его на все два десятка подтестов незачем.
+// cfgField — одна функция на весь пакет, через неё проходит каждая претензия,
+// поэтому пропажа суффикса краснеет здесь независимо от того, о каком поле шла
+// речь. Правильность самих имён переменных — отдельный вопрос и отдельный тест:
+// TestEnvNamesMatchStructTags сверяет envName с тегами всех полей структуры.
+// Сорок литералов рядом с ним дали бы не вторую проверку, а вторую копию тегов,
+// которую пришлось бы править на каждое переименование поля.
+//
+// Полей всё же два: вложенное показывает и точку, ставшую подчёркиванием, и
+// разрыв слова внутри имени, а поле верхнего уровня — что аббревиатура не
+// рассыпается, а префикс не приклеивается к несуществующей секции.
+func TestValidationErrorNamesEnvVariableLiterally(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			name:   "вложенное поле",
+			mutate: func(c *Config) { c.Producer.MessageTimeout = 0 },
+			want:   "Producer.MessageTimeout (env KAFKAX_PRODUCER_MESSAGE_TIMEOUT)",
+		},
+		{
+			name:   "поле верхнего уровня",
+			mutate: func(c *Config) { c.ClientID = "" },
+			want:   "ClientID (env KAFKAX_CLIENT_ID)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := testConfig(t)
+			tt.mutate(&cfg)
+
+			cfgWantErr(t, cfg.Validate(), tt.want)
+		})
+	}
 }
 
 func TestConfigValidateConsumerFields(t *testing.T) {

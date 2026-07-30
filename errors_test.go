@@ -388,6 +388,26 @@ func TestFlushErrorCarriesRemaining(t *testing.T) {
 	if !errors.Is(err, cause) {
 		t.Errorf("причина %v потеряна в %v", cause, err)
 	}
+
+	// Второй из двух исходов, которые godoc типа обещает в тексте. Первый
+	// («flush budget exhausted» при пустой Err) проверяется в
+	// TestFlushErrorIsSentinelWithoutWrapping, но поодиночке они ничего не
+	// стоят: Error(), всегда возвращавшая «flush budget exhausted», проходила
+	// оба теста и весь остальной набор. Тем, кто просто печатает ошибку Close,
+	// эти два текста — единственное, чем «бюджет кончился, flush не начинался»
+	// отличается от «flush шёл и отказал»; числа они уже не видят, оно уехало
+	// в поле.
+	t.Run("текст различает исчерпанный бюджет и отказ клиента", func(t *testing.T) {
+		t.Parallel()
+
+		if got, want := flushErr.Error(), cause.Error(); got != want {
+			t.Errorf("текст при непустой Err = %q, ожидалась причина %q", got, want)
+		}
+
+		if got := flushErr.Error(); got == (&FlushError{Remaining: 42}).Error() {
+			t.Errorf("отказ клиента и исчерпанный бюджет дают один текст %q — по логу их не различить", got)
+		}
+	})
 }
 
 // TestFlushErrorIsSentinelWithoutWrapping — errors.Is опознаёт *FlushError и
