@@ -200,8 +200,12 @@ func (h recordingHistogram) Record(_ context.Context, value float64, opts ...met
 
 // recordingSpan перехватывает RecordError/SetStatus — единственные методы
 // спана, которые библиотека вызывает сама. Под -race это ещё и проверка, что
-// вызовы приходят из разных горутин корректно; геттеры к errs/statusCode
-// появятся вместе с тестами трейсинга, которые начнут их читать.
+// вызовы приходят из разных горутин корректно.
+//
+// Журнал именно накопительный: важен не факт записи ошибки, а их число.
+// Контракт пакета — одна запись на отказ сообщения независимо от числа
+// повторов, и хранение «последней ошибки» скрыло бы ровно ту поломку, ради
+// которой заглушка заведена.
 type recordingSpan struct {
 	tracenoop.Span
 
@@ -224,6 +228,25 @@ func (s *recordingSpan) SetStatus(code codes.Code, description string) {
 
 	s.statusCode = code
 	s.statusDesc = description
+}
+
+// recordedErrs возвращает снимок ошибок, попавших в спан.
+//
+// Снимок, а не сам слайс: спан продолжает жить после чтения, и отданный наружу
+// slice header читался бы тестом, пока воркер дописывает в него под -race.
+func (s *recordingSpan) recordedErrs() []error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]error(nil), s.errs...)
+}
+
+// status возвращает последний установленный статус спана.
+func (s *recordingSpan) status() (codes.Code, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.statusCode, s.statusDesc
 }
 
 // recordingTracer выдаёт recordingSpan на каждый Start и хранит все выданные.
@@ -252,4 +275,47 @@ func (t *recordingTracer) started() []*recordingSpan {
 	defer t.mu.Unlock()
 
 	return append([]*recordingSpan(nil), t.spans...)
+}
+
+// recordedErrs собирает ошибки со всех выданных спанов.
+//
+// Считать приходится по всему трейсеру, а не по одному спану: на каждую запись
+// kotel заводит и receive-, и process-спан, и тест не знает заранее, какой из
+// них библиотека выберет для отметки об отказе. Утверждение при этом остаётся
+// строгим — суммарное число записей об ошибке и есть то, что увидит человек,
+// открывший трейс.
+func (t *recordingTracer) recordedErrs() []error {
+	var out []error
+
+	for _, span := range t.started() {
+		out = append(out, span.recordedErrs()...)
+	}
+
+	return out
+}
+
+// erroredSpans возвращает спаны, чей статус выставлен в codes.Error.
+func (t *recordingTracer) erroredSpans() []*recordingSpan {
+	var out []*recordingSpan
+
+	for _, span := range t.started() {
+		if code, _ := span.status(); code == codes.Error {
+			out = append(out, span)
+		}
+	}
+
+	return out
+}
+
+// recordingTracerProvider отдаёт один и тот же записывающий трейсер на любой
+// scope. Скоуп спанов принадлежит kotel, и различать его в тестах нечем и
+// незачем: пакет своих спанов не заводит вовсе.
+type recordingTracerProvider struct {
+	tracenoop.TracerProvider
+
+	tracer *recordingTracer
+}
+
+func (p recordingTracerProvider) Tracer(_ string, _ ...trace.TracerOption) trace.Tracer {
+	return p.tracer
 }
