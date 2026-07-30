@@ -19,8 +19,6 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
-
-	"github.com/alfzs/kafkax/v2"
 )
 
 // TestCooperativeRebalanceSplitsPartitionsBetweenInstances ловит дефекты
@@ -57,7 +55,7 @@ func TestCooperativeRebalanceSplitsPartitionsBetweenInstances(t *testing.T) {
 	producer := openProducer(t, cfg)
 
 	settled := waveValues("settled", 24)
-	publishValues(t, producer, topic, settled)
+	publishValues(t, producer, topic, settled...)
 
 	ends := requireFedEveryPartition(t, admin, topic, nil)
 
@@ -82,7 +80,7 @@ func TestCooperativeRebalanceSplitsPartitionsBetweenInstances(t *testing.T) {
 	// продолжить обработку — до сих пор второй экземпляр мог не сделать ни
 	// одного успешного цикла опроса.
 	shared := waveValues("shared", 24)
-	publishValues(t, producer, topic, shared)
+	publishValues(t, producer, topic, shared...)
 	requireFedEveryPartition(t, admin, topic, ends)
 
 	await(t, "волна после ребаланса дошла целиком", func() bool {
@@ -145,7 +143,7 @@ func TestLeavingInstanceHandsOffPartitionsWithoutRedelivery(t *testing.T) {
 	awaitAssignment(t, admin, cfg.Consumer.Group, topic, 2, partitions)
 
 	before := waveValues("before", 24)
-	publishValues(t, producer, topic, before)
+	publishValues(t, producer, topic, before...)
 
 	ends := requireFedEveryPartition(t, admin, topic, nil)
 
@@ -168,7 +166,7 @@ func TestLeavingInstanceHandsOffPartitionsWithoutRedelivery(t *testing.T) {
 	awaitAssignment(t, admin, cfg.Consumer.Group, topic, 1, partitions)
 
 	after := waveValues("after", 24)
-	publishValues(t, producer, topic, after)
+	publishValues(t, producer, topic, after...)
 	requireFedEveryPartition(t, admin, topic, ends)
 
 	await(t, "оставшийся экземпляр обработал волну в переехавших партициях", func() bool {
@@ -211,7 +209,7 @@ func TestFreshInstanceResumesFromCommittedOffset(t *testing.T) {
 	producer := openProducer(t, cfg)
 
 	processed := waveValues("processed", batch)
-	publishValues(t, producer, topic, processed)
+	publishValues(t, producer, topic, processed...)
 
 	first := &collector{}
 	stopped := startConsumer(t, cfg, topic, first)
@@ -233,7 +231,7 @@ func TestFreshInstanceResumesFromCommittedOffset(t *testing.T) {
 	}
 
 	tail := waveValues("tail", batch)
-	publishValues(t, producer, topic, tail)
+	publishValues(t, producer, topic, tail...)
 
 	second := &collector{}
 	resumed := startConsumer(t, cfg, topic, second)
@@ -296,7 +294,7 @@ func TestNoMessageLostWhenRebalanceHitsLiveStream(t *testing.T) {
 	startConsumer(t, cfg, topic, first)
 
 	head := waveValues("head", waveSize)
-	publishValues(t, producer, topic, head)
+	publishValues(t, producer, topic, head...)
 
 	ends := requireFedEveryPartition(t, admin, topic, nil)
 
@@ -310,13 +308,13 @@ func TestNoMessageLostWhenRebalanceHitsLiveStream(t *testing.T) {
 	startConsumer(t, cfg, topic, second)
 
 	during := waveValues("during", waveSize)
-	publishValues(t, producer, topic, during)
+	publishValues(t, producer, topic, during...)
 	ends = requireFedEveryPartition(t, admin, topic, ends)
 
 	awaitAssignment(t, admin, cfg.Consumer.Group, topic, 2, partitions)
 
 	tail := waveValues("tail", waveSize)
-	publishValues(t, producer, topic, tail)
+	publishValues(t, producer, topic, tail...)
 	requireFedEveryPartition(t, admin, topic, ends)
 
 	stream := slices.Concat(head, during, tail)
@@ -338,21 +336,6 @@ func TestNoMessageLostWhenRebalanceHitsLiveStream(t *testing.T) {
 		len(stream), total, total-len(stream))
 }
 
-// openProducer создаёт продюсера, указывающего на тот же брокер, и закрывает
-// его по окончании теста.
-func openProducer(t *testing.T, cfg kafkax.Config) *kafkax.Producer {
-	t.Helper()
-
-	producer, err := kafkax.NewProducer(cfg)
-	if err != nil {
-		t.Fatalf("NewProducer: %v", err)
-	}
-
-	t.Cleanup(func() { _ = producer.Close() })
-
-	return producer
-}
-
 // waveValues строит волну значений с общим префиксом.
 //
 // Порядковый номер дополнен нулями, чтобы лексикографический порядок совпадал с
@@ -365,25 +348,6 @@ func waveValues(prefix string, n int) []string {
 	}
 
 	return values
-}
-
-// publishValues отправляет по сообщению на каждое значение, делая ключом само
-// значение.
-//
-// Ключ обязателен: именно он определяет партицию, а сценарии здесь держатся на
-// том, что поток растащен по всем партициям темы, а не сложен подряд в одну.
-func publishValues(t *testing.T, producer *kafkax.Producer, topic string, values []string) {
-	t.Helper()
-
-	for _, value := range values {
-		if err := producer.SendMessage(t.Context(), kafkax.PublishRequest{
-			Topic: topic,
-			Key:   []byte(value),
-			Value: []byte(value),
-		}); err != nil {
-			t.Fatalf("SendMessage(%s): %v", value, err)
-		}
-	}
 }
 
 // groupAssignment спрашивает координатора, как партиции темы разложены по
@@ -486,31 +450,6 @@ func awaitAssignment(
 	})
 
 	return settled
-}
-
-// committedOffset читает закоммиченный группой оффсет партиции.
-//
-// Утверждение о состоянии в брокере, а не о его последствиях: доставка отвечает
-// на вопрос «что приедет дальше», оффсет — на вопрос «что группа считает
-// сделанным», и различить коммит не туда от коммита вовремя можно только вторым.
-func committedOffset(t *testing.T, admin *kadm.Client, group, topic string, partition int32) int64 {
-	t.Helper()
-
-	offsets, err := admin.FetchOffsets(t.Context(), group)
-	if err != nil {
-		t.Fatalf("FetchOffsets(%s): %v", group, err)
-	}
-
-	response, ok := offsets.Lookup(topic, partition)
-	if !ok {
-		t.Fatalf("у группы %s нет закоммиченного оффсета для %s/%d", group, topic, partition)
-	}
-
-	if response.Err != nil {
-		t.Fatalf("закоммиченный оффсет %s/%d: %v", topic, partition, response.Err)
-	}
-
-	return response.At
 }
 
 // partitionEnds отдаёт конечные оффсеты всех партиций темы.
