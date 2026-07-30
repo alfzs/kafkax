@@ -59,6 +59,14 @@ franz-go, так что «синхронный» не означает «по з
 отправки укладывается в один бюджет — `Producer.MessageTimeout`, отсчитываемый
 от входа в метод.
 
+При `EnableIdempotence: true` (умолчание) этот бюджет — **верхняя граница
+ожидания вызывающим, а не гарантия отмены записи**: провалить запись в полёте
+franz-go не может, это оставило бы дыру в последовательности sequence numbers
+и сломало бы порядок. `SendMessage` поэтому способен вернуться позже
+`MessageTimeout` — код с собственным жёстким дедлайном (HTTP-обработчик,
+воркер очереди) должен это учитывать. При выключенной идемпотентности бюджет
+жёсткий.
+
 Ключи `traceparent`, `tracestate` и `baggage` зарезервированы за W3C trace
 propagation: `SendMessage` вернёт `ErrReservedHeaderKey`, если один из них
 встретится в `PublishRequest.Headers`.
@@ -396,7 +404,22 @@ poll ──┬─► partition 0 ──► ProcessMessage (последоват�
 
 Пропускная способность настраивается числом партиций топика, а не параметрами
 библиотеки. `Consumer.MessageQueueSize` задаёт, насколько цикл опроса может
-обгонять обработку.
+обгонять обработку — в **батчах**, не в записях.
+
+Это же поле задаёт верхнюю границу памяти под непрочитанные сообщения, и
+граница выходит крупнее, чем кажется: записи не копируются, `Key`/`Value`/
+`Headers` алиасят буферы franz-go и резидентны, пока батч лежит в канале.
+Худший случай на экземпляр —
+
+```
+назначенные партиции × MessageQueueSize × MaxPartitionBytes
+```
+
+то есть на умолчаниях (30 партиций, 100 батчей, 1 MiB) около **3 ГиБ**.
+Байтового потолка у консьюмера нет, в отличие от продюсера с его
+`MaxBufferedBytes`: блокирующая отправка в очередь тормозит опрос только тогда,
+когда память уже набрана. В развёртывании с жёстким лимитом памяти это поле
+считают, а не оставляют по умолчанию.
 
 У продюсера собственного слоя очередей и воркеров нет: батчинг, упорядочивание
 по партиции и лимит памяти делает клиент Kafka. Backpressure — это
@@ -448,8 +471,11 @@ otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 | `kafkax.consumer.messages.processed` | Counter | `topic`, `status` | Сообщения с терминальным исходом: `success`, `skipped`, `error`, `cancelled`, `dropped` |
 | `kafkax.consumer.message.duration` | Histogram (s) | `topic`, `status` | Время обработчика включая все повторы и паузы; под `cancelled` и `dropped` не пишется |
 | `kafkax.consumer.handler.retries` | Counter | `topic` | Неудачные вызовы обработчика, за которыми последовал повтор |
-| `kafkax.consumer.fetch.errors` | Counter | `topic` | Эпизоды партиционных ошибок опроса: инкремент на смену состояния, не на каждый опрос |
+| `kafkax.consumer.fetch.errors` | Counter | `topic`, `reason` | Эпизоды партиционных ошибок опроса: инкремент на смену состояния, не на каждый опрос. `reason` — `data_loss`, `offset_out_of_range`, `fetch` |
 | `kafkax.consumer.group.errors` | Counter | — | Эпизоды отказа сессии группы: сообщений нет вообще, ни по одной партиции |
+| `kafkax.consumer.commit.errors` | Counter | `phase` | Проваленные коммиты оффсетов: `revoke`, `shutdown` |
+| `kafkax.consumer.partitions.lost` | Counter | — | Партиции, отобранные без возможности закоммитить. Считаются партиции, не события |
+| `kafkax.consumer.drain.timeouts` | Counter | `phase` | Исчерпанные бюджеты мягкой остановки: `poll_loop`, `workers` |
 | `kafkax.consumer.workers.active` | UpDownCounter | — | Работающие партиционные воркеры |
 | `kafkax.consumer.partitions.paused` | UpDownCounter | — | Партиции, стоящие на непрокоммиченном оффсете: отравленное сообщение либо погибший воркер |
 | `kafkax.consumer.panics` | Counter | `site` | Перехваченные паники в горутинах библиотеки: `handler`, `process_message`, `partition_worker`, `poll_loop`, `on_message_skipped`, `on_panic` |
@@ -458,6 +484,26 @@ otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 явно, потому что умолчание SDK размечено под миллисекунды. Атрибута `partition`
 нет ни у одной метрики: он умножает кардинальность на число партиций, не давая
 ничего сверх того, что уже есть в спане.
+
+Имена атрибутов доменных метрик (`topic`, `status`) от messaging semantic
+conventions отклоняются намеренно: они короче в PromQL, а привязку к
+конвенциям даёт спан, где эти же поля есть под каноническими именами. Плата —
+корреляция «спан ↔ метрика» по имени атрибута не работает: у спанов kotel
+`messaging.source.name`, у метрик пакета `topic`. По той же причине scope
+метрик объявлен без `SchemaURL`: заявить соответствие схеме и не следовать ей
+хуже, чем не заявлять.
+
+### Три сигнала, которых больше нет только в логе
+
+`commit.errors`, `partitions.lost` и `drain.timeouts` заведены потому, что
+каждое из этих событий означает потерю или дублирование данных, а до них
+существовало лишь строкой в журнале. Проваленный коммит на `revoke` — самый
+частый источник дубликатов; `drain.timeouts` означает, что `GracefulTimeout`
+мал для реального времени обработки.
+
+Там, где ошибка возвращается вызывающему (`Stop`, `Close`), пакет её **не
+логирует**: иначе событие удваивалось бы в журнале. Читайте возвращённое
+значение — а для алертов используйте счётчики.
 
 Статусы `messages.processed` разделены по одному признаку — сдвинулся ли коммит
 за записью:
@@ -482,8 +528,12 @@ otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 приложение, подставляющее в топик пользовательский ввод, порождало бы новую
 серию на каждое уникальное значение.
 
-Транспортные метрики (соединения, байты, ошибки чтения и записи) регистрирует
-kotel под своими именами.
+Транспортные метрики (соединения, байты, ошибки чтения и записи, записи и байты
+produce/fetch) регистрирует kotel под своими именами. Все они — счётчики:
+гистограмм в kotel v1.7.0 нет, поэтому латентность запроса к брокеру и
+распределение размеров батчей не измеряет никто. `kafkax.producer.message.duration`
+и `kafkax.consumer.message.duration` меряют путь через пакет, а не запрос к
+брокеру.
 
 ## Конфигурация
 
@@ -495,6 +545,7 @@ kotel под своими именами.
 | `ClientID` | `KAFKAX_CLIENT_ID` | — | Идентификатор клиента в логах и метриках брокера. **Обязателен**, умолчания нет: поле помечено `env-required`, и без переменной окружения `cleanenv.ReadEnv` завершится ошибкой |
 | `GracefulTimeout` | `KAFKAX_GRACEFUL_TIMEOUT` | `3m` | Общий бюджет на остановку в `Close`/`Stop` |
 | `DialTimeout` | `KAFKAX_DIAL_TIMEOUT` | `10s` | Таймаут установки соединения с брокером |
+| `KafkaLogLevel` | `KAFKAX_KAFKA_LOG_LEVEL` | `info` | Порог логов самого franz-go: `debug`, `info`, `warn`, `error`, `none`. Только ужесточение — уровень `Logger` остаётся внешним фильтром |
 
 Отдельного поля с протоколом безопасности нет: протокол выводится из
 конфигурации. TLS включается флагом `TLS.Enabled`, SASL — непустым
@@ -504,7 +555,7 @@ kotel под своими именами.
 
 | Поле | Описание |
 |---|---|
-| `Logger` | `*slog.Logger` библиотеки. При `nil` — `slog.Default()`. Логи franz-go идут туда же на уровне `Debug` |
+| `Logger` | `*slog.Logger` библиотеки. При `nil` — `slog.Default()`. Логи franz-go идут туда же, но не ниже `KafkaLogLevel` |
 | `TLSConfig` | Готовый `*tls.Config`. Задан — имеет приоритет над всей секцией `TLS`. Нужен для mTLS с ротацией, кастомного `VerifyPeerCertificate`, сертификатов из памяти |
 | `ExtraOpts` | `[]kgo.Opt`, добавляются последними и побеждают всё, что вывела библиотека. Аварийный выход, не замена конфигурации |
 | `OnPanic` | Вызывается после восстановления паники в горутине библиотеки: `site` типа `kafkax.PanicSite` (`PanicSiteHandler`, `PanicSiteProcessMessage`, `PanicSitePartitionWorker`, `PanicSitePollLoop`, `PanicSiteMessageSkipped`, `PanicSitePanicHook`), `recovered`, `stack`. Синхронный — не должен блокироваться |
@@ -564,7 +615,7 @@ kotel под своими именами.
 | `CompressionType` | `COMPRESSION_TYPE` | `lz4` | `none`, `gzip`, `snappy`, `lz4`, `zstd` |
 | `MaxBufferedRecords` | `MAX_BUFFERED_RECORDS` | `10000` | Записей в памяти до подтверждения. Это и есть backpressure — лимит общий на клиента |
 | `MaxBufferedBytes` | `MAX_BUFFERED_BYTES` | `0` | Тот же лимит в байтах. `0` — без лимита. Отрицательное значение отвергается |
-| `MessageTimeout` | `MESSAGE_TIMEOUT` | `30s` | Полный бюджет одного `SendMessage`. Минимум — `1s` |
+| `MessageTimeout` | `MESSAGE_TIMEOUT` | `30s` | Полный бюджет одного `SendMessage`. Минимум — `1s`. При `EnableIdempotence` — верхняя граница ожидания, а не гарантия отмены записи |
 | `FlushTimeout` | `FLUSH_TIMEOUT` | `1m` | Верхняя граница финального flush при `Close`. Реально — `min(FlushTimeout, остаток GracefulTimeout)` |
 
 ### Консьюмер
@@ -582,7 +633,7 @@ kotel под своими именами.
 | `RebalanceTimeout` | `REBALANCE_TIMEOUT` | `1m` | Сколько координатор ждёт отдачи партиций. Должен превышать максимальное время обработки батча |
 | `IsolationLevel` | `ISOLATION_LEVEL` | `read_committed` | `read_committed` или `read_uncommitted` |
 | `MaxPollRecords` | `MAX_POLL_RECORDS` | `500` | Верхняя граница числа записей за один опрос |
-| `MessageQueueSize` | `MESSAGE_QUEUE_SIZE` | `100` | Ёмкость канала партиционного воркера |
+| `MessageQueueSize` | `MESSAGE_QUEUE_SIZE` | `100` | Ёмкость канала партиционного воркера в батчах. Задаёт и потолок памяти: `партиции × MessageQueueSize × MaxPartitionBytes` |
 | `CommitInterval` | `COMMIT_INTERVAL` | `5s` | Период фоновой отправки отмеченных оффсетов. Влияет на окно переобработки, но не на гарантию at-least-once |
 | `HandlerMaxRetries` | `HANDLER_MAX_RETRIES` | `0` | `0` без повторов, `N` — `N` повторов, `-1` бесконечно. См. «Политика повторов» |
 | `HandlerRetryDelay` | `HANDLER_RETRY_DELAY` | `1s` | Пауза между повторами. Обязателен при `HandlerMaxRetries != 0` |

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -69,11 +70,29 @@ func TestStopCommitsMarkedOffsets(t *testing.T) {
 // Кластер гасится целиком: подделать отказ именно коммита подменой
 // конфигурации нельзя, а обрыв связи с координатором — та самая причина, по
 // которой ветка вообще существует.
+//
+// Вторая половина того же контракта — метрика. Дисциплины «читать возврат
+// Stop» у типового `defer c.Stop()` нет, и без счётчика проваленный финальный
+// коммит — самый частый источник дубликатов после деплоя — не существовал бы
+// ни для одного алерта. Записи в лог при этом быть не должно: ошибка уходит
+// вызывающему, он её и залогирует, а пакет, залогировав сам, удваивал бы
+// событие в журнале.
+//
+//nolint:paralleltest // captureMetrics подменяет глобальный MeterProvider
 func TestStopReportsFailedFinalCommit(t *testing.T) {
-	t.Parallel()
+	rec := captureMetrics(t)
 
 	cluster, brokers := newFakeClusterHandle(t, 1, testTopic)
+
+	levels := &levelCount{}
+
 	cfg := testConfig(t, brokers...)
+	cfg.Logger = slog.New(&levelCountHandler{inner: cfg.Logger.Handler(), count: levels})
+	// Логи franz-go выключены целиком: мёртвый кластер он комментирует своими
+	// записями уровня Error («group manage loop errored»), и без порога тест
+	// считал бы их наравне с записями пакета. Заодно это единственный сценарий,
+	// где KafkaLogLevel="none" проверяется в деле.
+	cfg.KafkaLogLevel = KafkaLogNone
 	// Автокоммит не должен успеть: иначе к моменту Stop коммитить будет нечего,
 	// franz-go вернёт nil, не сходив к брокеру, и тест проверял бы пустоту.
 	cfg.Consumer.CommitInterval = time.Hour
@@ -110,6 +129,18 @@ func TestStopReportsFailedFinalCommit(t *testing.T) {
 
 	if errors.Is(list[1], ErrCommitFailed) {
 		t.Fatalf("вместо причины развернулся тот же сентинел: %v", list[1])
+	}
+
+	if got := rec.sum(consMetricCommitErrors,
+		attribute.String("phase", phaseShutdown)); got != 1 {
+		t.Fatalf("commit.errors{phase=%s} = %d, want 1: проваленный финальный коммит "+
+			"не существует ни для одного алерта", phaseShutdown, got)
+	}
+
+	// Ни одной записи Error от самого пакета: событие уже уехало вызывающему
+	// возвратом. Логи franz-go отключены выше, так что считать больше нечего.
+	if got := levels.of(slog.LevelError); got != 0 {
+		t.Fatalf("записей уровня Error: %d, want 0 — ошибка возвращается, а не логируется", got)
 	}
 }
 

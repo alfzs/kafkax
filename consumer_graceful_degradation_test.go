@@ -13,6 +13,7 @@ import (
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Тесты деградации graceful stop: что делает Stop, когда мягкая фаза в бюджет
@@ -157,6 +158,18 @@ func TestStopAbandonsHandlerIgnoringCancellation(t *testing.T) {
 	// метрика и заведена.
 	if got := rec.sum(consMetricWorkers); got != 1 {
 		t.Fatalf("workers.active = %d сразу после Stop, want 1: брошенный воркер не виден в метрике", got)
+	}
+
+	// Исчерпанный бюджет дренажа — это оборванная обработка и, скорее всего,
+	// дубликаты после перезапуска. Событие одно на бюджет, а не на воркера:
+	// бюджет общий, и «не уложились» — одно решение по всем оставшимся сразу.
+	// Сигнал прикладной: он означает, что GracefulTimeout мал для реального
+	// времени обработки, и без счётчика это видно только тому, кто читает логи
+	// каждого деплоя.
+	if got := rec.sum(consMetricDrainTimeouts,
+		attribute.String("phase", phaseWorkers)); got != 1 {
+		t.Fatalf("drain.timeouts{phase=%s} = %d, want 1: исчерпание бюджета дренажа "+
+			"видно только в логе", phaseWorkers, got)
 	}
 
 	close(release)

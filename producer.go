@@ -122,7 +122,7 @@ func NewKafkaProducer(config Config) (*KafkaProducer, error) {
 		gracefulTimeout: config.GracefulTimeout,
 	}
 
-	if err := p.initMetrics(otel.GetMeterProvider().Meter(instrumentationName)); err != nil {
+	if err := p.initMetrics(otel.GetMeterProvider().Meter(instrumentationName, meterOptions()...)); err != nil {
 		return nil, err
 	}
 
@@ -138,9 +138,11 @@ func NewKafkaProducer(config Config) (*KafkaProducer, error) {
 
 // initMetrics регистрирует доменные метрики продюсера.
 //
-// Транспортные счётчики (соединения, байты, ошибки чтения/записи) приезжают
-// из kotel и здесь не дублируются: он снимает их с хуков клиента, куда у
-// этого слоя доступа нет.
+// Транспортные счётчики (соединения, байты, ошибки чтения/записи, записи и
+// байты produce) приезжают из kotel и здесь не дублируются: он снимает их с
+// хуков клиента, куда у этого слоя доступа нет. Именно счётчики: гистограмм в
+// kotel v1.7.0 нет ни одной, латентность запроса к брокеру не измеряет никто —
+// kafkax.producer.message.duration меряет SendMessage целиком, а не запрос.
 //
 // Счётчика kafkax.producer.panics здесь нет: собственных горутин у продюсера
 // не заведено, восстанавливать паники негде и не из чего. Config.OnPanic
@@ -391,13 +393,17 @@ func (p *KafkaProducer) awaitInflight(deadline time.Time) {
 }
 
 // flush досылает буферизованные записи в пределах остатка бюджета.
+//
+// Оба отказа только возвращаются, без записи в лог: ошибку получает вызывающий
+// Close, и он её залогирует — пакет, залогировав сам, удваивал бы событие в
+// журнале. Число недосланных записей уходит в текст ошибки, а не в атрибут
+// лога, ровно поэтому: иначе оно оставалось бы в строке, которую никто не
+// связал бы с возвращённым ErrFlushIncomplete.
 func (p *KafkaProducer) flush(deadline time.Time) error {
 	budget := min(time.Until(deadline), p.flushTimeout)
 	if budget <= 0 {
-		p.logger.Warn("No time left for flush, dropping buffered records",
-			slog.Int64("buffered", p.client.BufferedProduceRecords()))
-
-		return fmt.Errorf("closing producer: %w: flush budget exhausted", ErrFlushIncomplete)
+		return fmt.Errorf("closing producer: %w: flush budget exhausted, %d records buffered",
+			ErrFlushIncomplete, p.client.BufferedProduceRecords())
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
@@ -407,12 +413,8 @@ func (p *KafkaProducer) flush(deadline time.Time) error {
 	// спрашивается отдельно — оно и есть то, что потеряется при закрытии
 	// клиента.
 	if err := p.client.Flush(ctx); err != nil {
-		remaining := p.client.BufferedProduceRecords()
-		p.logger.Warn("Flush timed out, messages remaining in buffer",
-			slog.Int64("remaining", remaining))
-
 		return fmt.Errorf("closing producer: %w: %d records remaining: %w",
-			ErrFlushIncomplete, remaining, err)
+			ErrFlushIncomplete, p.client.BufferedProduceRecords(), err)
 	}
 
 	p.logger.Info("All buffered messages flushed")

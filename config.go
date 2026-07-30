@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"time"
 
@@ -30,6 +31,18 @@ const (
 const (
 	IsolationReadCommitted   = "read_committed"
 	IsolationReadUncommitted = "read_uncommitted"
+)
+
+// Допустимые значения Config.KafkaLogLevel. Сравнение регистронезависимое.
+// Пустая строка равнозначна KafkaLogInfo.
+const (
+	KafkaLogDebug = "debug"
+	KafkaLogInfo  = "info"
+	KafkaLogWarn  = "warn"
+	KafkaLogError = "error"
+	// KafkaLogNone выключает логи franz-go целиком. При нём kslog сообщает
+	// клиенту kgo.LogLevelNone, и тот не собирает сообщения вовсе.
+	KafkaLogNone = "none"
 )
 
 // Допустимые значения Producer.CompressionType.
@@ -63,8 +76,22 @@ type Config struct {
 	Producer Producer `yaml:"producer"`
 	Consumer Consumer `yaml:"consumer"`
 
+	// KafkaLogLevel — порог логов самого franz-go: debug, info, warn, error
+	// или none. Умолчание — info.
+	//
+	// Отдельно от уровня Logger'а, потому что это разные вопросы. kslog
+	// отображает уровни один в один, и приложение, поднятое с LevelDebug на
+	// время разбора инцидента, получало бы запись franz-go на каждый
+	// produce/fetch/metadata — включая «fetch stripped partitions» на каждом
+	// цикле опроса. Порог, объявленный здесь, отвязывает второе от первого.
+	//
+	// Работает только в сторону ужесточения: уровень Logger'а остаётся
+	// внешним фильтром, и debug здесь не включит отладку у логгера,
+	// настроенного на Warn. Действующий порог — строгий из двух.
+	KafkaLogLevel string `yaml:"kafka_log_level" env:"KAFKAX_KAFKA_LOG_LEVEL" env-default:"info"`
+
 	// Logger — логгер библиотеки. При nil используется slog.Default().
-	// Логи самого franz-go пишутся в него же на уровне Debug.
+	// Логи самого franz-go пишутся в него же, но не ниже KafkaLogLevel.
 	Logger *slog.Logger `yaml:"-"`
 
 	// TLSConfig — готовый *tls.Config. Задан — имеет приоритет над секцией
@@ -359,6 +386,18 @@ type Producer struct {
 	//
 	// Минимум — одна секунда: franz-go отвергает меньшее значение при создании
 	// клиента, и Validate проверяет границу раньше, чем конструктор.
+	//
+	// При EnableIdempotence=true это верхняя граница ожидания вызывающим, а НЕ
+	// гарантия отмены записи. Без kgo.AllowIdempotentProduceCancellation
+	// (пакет её не включает) franz-go не может провалить запись, уже
+	// находящуюся в полёте, — ни по отмене контекста, ни по этому таймауту, ни
+	// по исчерпании повторов: провал оставил бы дыру в последовательности
+	// sequence numbers и сломал бы порядок. Поэтому SendMessage способен
+	// вернуться позже MessageTimeout, и код с собственным жёстким дедлайном
+	// (HTTP-обработчик, воркер очереди) должен это учитывать.
+	//
+	// При EnableIdempotence=false бюджет жёсткий: отменить запись в полёте
+	// можно, порядок терять уже нечего.
 	MessageTimeout time.Duration `yaml:"message_timeout" env:"KAFKAX_PRODUCER_MESSAGE_TIMEOUT" env-default:"30s"`
 	// FlushTimeout — верхняя граница финального Flush при Close. Реальная
 	// длительность — min(FlushTimeout, остаток GracefulTimeout).
@@ -396,8 +435,22 @@ type Consumer struct {
 	IsolationLevel string `yaml:"isolation_level" env:"KAFKAX_CONSUMER_ISOLATION_LEVEL" env-default:"read_committed"`
 	// MaxPollRecords — верхняя граница числа записей за один опрос.
 	MaxPollRecords int `yaml:"max_poll_records" env:"KAFKAX_CONSUMER_MAX_POLL_RECORDS" env-default:"500"`
-	// MessageQueueSize — ёмкость канала партиционного воркера. Определяет,
-	// насколько цикл опроса может обгонять обработку.
+	// MessageQueueSize — ёмкость канала партиционного воркера в БАТЧАХ (не в
+	// записях). Определяет, насколько цикл опроса может обгонять обработку.
+	//
+	// Это же поле задаёт верхнюю границу памяти под непрочитанные сообщения, и
+	// граница выходит крупнее, чем кажется. Записи не копируются: Key, Value и
+	// Headers у IncomingMessage алиасят буферы franz-go и резидентны, пока батч
+	// лежит в канале. Худший случай на экземпляр —
+	//
+	//	назначенные партиции × MessageQueueSize × MaxPartitionBytes
+	//
+	// то есть на умолчаниях (30 партиций, 100 батчей, 1 MiB) около 3 ГиБ.
+	// Байтового потолка у консьюмера нет — в отличие от продюсера, где ту же
+	// роль играет Producer.MaxBufferedBytes. Блокирующая отправка в очередь
+	// тормозит опрос только тогда, когда память уже набрана, поэтому в
+	// развёртывании с жёстким лимитом памяти это поле считают, а не оставляют
+	// по умолчанию.
 	MessageQueueSize int `yaml:"message_queue_size" env:"KAFKAX_CONSUMER_MESSAGE_QUEUE_SIZE" env-default:"100"`
 	// CommitInterval — период фоновой отправки отмеченных оффсетов.
 	// Коммитится только отмеченное (MarkCommitRecords после успешной
@@ -446,6 +499,7 @@ func DefaultConfig() Config {
 	return Config{
 		GracefulTimeout: 3 * time.Minute,
 		DialTimeout:     10 * time.Second,
+		KafkaLogLevel:   KafkaLogInfo,
 		Producer: Producer{
 			RequiredAcks:       -1,
 			EnableIdempotence:  true,
@@ -567,6 +621,13 @@ func (c Config) commonErrors() []error {
 	errs = appendNonPositive(errs,
 		positiveDuration{"graceful_timeout", c.GracefulTimeout},
 		positiveDuration{"dial_timeout", c.DialTimeout})
+
+	if _, ok := kafkaLogLevel(c.KafkaLogLevel); !ok {
+		errs = append(errs, fmt.Errorf(
+			"kafka_log_level must be one of %s, %s, %s, %s, %s (or empty); got %q",
+			KafkaLogDebug, KafkaLogInfo, KafkaLogWarn, KafkaLogError, KafkaLogNone,
+			c.KafkaLogLevel))
+	}
 
 	errs = append(errs, c.saslErrors()...)
 	errs = append(errs, c.tlsErrors()...)
@@ -900,4 +961,76 @@ func (c Config) logger(component string) *slog.Logger {
 	}
 
 	return base.With(slog.String("component", component))
+}
+
+// levelNone — порог выше любого уровня slog: с ним не проходит ничего.
+// slog.LevelError равен 8, шага между уровнями хватает с запасом.
+const levelNone = slog.Level(math.MaxInt)
+
+// kafkaLogLevel разбирает Config.KafkaLogLevel. Второй результат — признак
+// того, что значение опознано; на нём же стоит валидация.
+//
+// Пустая строка — валидное значение, означающее умолчание. Из окружения поле
+// приезжает заполненным (env-default), но Config, собранный литералом, — путь,
+// который пакет поддерживает наравне, — оставил бы его пустым, и отвергать
+// такую конфигурацию значило бы ломать всех, кто не читает конфиг из env.
+func kafkaLogLevel(name string) (slog.Level, bool) {
+	switch strings.ToLower(name) {
+	case "", KafkaLogInfo:
+		return slog.LevelInfo, true
+	case KafkaLogDebug:
+		return slog.LevelDebug, true
+	case KafkaLogWarn:
+		return slog.LevelWarn, true
+	case KafkaLogError:
+		return slog.LevelError, true
+	case KafkaLogNone:
+		return levelNone, true
+	default:
+		return slog.LevelInfo, false
+	}
+}
+
+// kafkaLogger возвращает логгер для franz-go: тот же, что у библиотеки, но с
+// поднятым порогом.
+//
+// Порог реализован обёрткой над Handler, а не отдельным логгером, и это важно
+// для kslog: он выводит kgo.LogLevel из Logger.Enabled, поэтому при пороге
+// выше Debug franz-go не станет даже собирать сообщение — экономится не только
+// вывод, но и форматирование на горячем пути.
+func (c Config) kafkaLogger(base *slog.Logger) *slog.Logger {
+	level, ok := kafkaLogLevel(c.KafkaLogLevel)
+	if !ok {
+		// Сюда попадает только конструктор, вызванный в обход Validate. Порог
+		// по умолчанию лучше паники и лучше молчаливого Debug.
+		level = slog.LevelInfo
+	}
+
+	return slog.New(&minLevelHandler{inner: base.Handler(), min: level})
+}
+
+// minLevelHandler отбрасывает записи ниже порога, остальное отдаёт вложенному
+// хендлеру.
+//
+// Ужесточение, а не подмена: вложенный хендлер сохраняет собственный фильтр, и
+// действующим порогом остаётся строгий из двух.
+type minLevelHandler struct {
+	inner slog.Handler
+	min   slog.Level
+}
+
+func (h *minLevelHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return level >= h.min && h.inner.Enabled(ctx, level)
+}
+
+func (h *minLevelHandler) Handle(ctx context.Context, record slog.Record) error {
+	return h.inner.Handle(ctx, record)
+}
+
+func (h *minLevelHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &minLevelHandler{inner: h.inner.WithAttrs(attrs), min: h.min}
+}
+
+func (h *minLevelHandler) WithGroup(name string) slog.Handler {
+	return &minLevelHandler{inner: h.inner.WithGroup(name), min: h.min}
 }

@@ -12,8 +12,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
@@ -189,19 +191,42 @@ func (w *partitionWorker) stop() {
 	w.stopOnce.Do(func() { close(w.records) })
 }
 
-// consumerMetrics — собственные метрики домена консьюмера. Транспортный
-// уровень (задержки запросов, размеры батчей, состояние соединений) измеряет
-// kotel, дублировать его здесь нечем.
+// consumerMetrics — собственные метрики домена консьюмера.
+//
+// Транспортный уровень измеряет kotel, и дублировать его здесь нечем — но
+// измеряет он меньше, чем можно подумать: в kotel v1.7.0 только счётчики
+// (соединения, разрывы, ошибки и байты чтения/записи, записи и байты
+// produce/fetch) и ни одной гистограммы. Латентности запросов к брокеру и
+// распределения размеров батчей не меряет никто. Если она понадобится, её
+// придётся заводить здесь, а не искать в kotel.
 type consumerMetrics struct {
 	processed        metric.Int64Counter
 	duration         metric.Float64Histogram
 	retries          metric.Int64Counter
 	fetchErrors      metric.Int64Counter
 	groupErrors      metric.Int64Counter
+	commitErrors     metric.Int64Counter
+	partitionsLost   metric.Int64Counter
+	drainTimeouts    metric.Int64Counter
 	workersActive    metric.Int64UpDownCounter
 	partitionsPaused metric.Int64UpDownCounter
 	panics           metric.Int64Counter
 }
+
+// Значения атрибута phase у kafkax.consumer.commit.errors и
+// kafkax.consumer.drain.timeouts. Множество замкнутое: фаза — это ветка кода,
+// а не входные данные.
+const (
+	// phaseRevoke — отзыв партиций на ребалансе.
+	phaseRevoke = "revoke"
+	// phaseShutdown — остановка консьюмера.
+	phaseShutdown = "shutdown"
+	// phasePollLoop — цикл опроса не вышел за отведённый ему бюджет.
+	phasePollLoop = "poll_loop"
+	// phaseWorkers — партиционные воркеры не дренировались за бюджет и были
+	// отменены жёстко.
+	phaseWorkers = "workers"
+)
 
 // newConsumerMetrics регистрирует инструменты, собирая все ошибки разом.
 //
@@ -213,7 +238,8 @@ func newConsumerMetrics(meter metric.Meter) (consumerMetrics, error) {
 
 	processedName := "kafkax.consumer.messages.processed"
 	processed, err := meter.Int64Counter(processedName,
-		metric.WithDescription("Messages that reached a terminal outcome, by topic and status"))
+		metric.WithDescription("Messages that reached a terminal outcome, by topic and status"),
+		metric.WithUnit("{message}"))
 	m := consumerMetrics{processed: record(&reg, processedName, processed, err)}
 
 	// Единица — секунды, а не миллисекунды: Milliseconds() усекает до целого,
@@ -228,7 +254,8 @@ func newConsumerMetrics(meter metric.Meter) (consumerMetrics, error) {
 
 	retriesName := "kafkax.consumer.handler.retries"
 	retries, err := meter.Int64Counter(retriesName,
-		metric.WithDescription("Handler invocations that failed and were retried"))
+		metric.WithDescription("Handler invocations that failed and were retried"),
+		metric.WithUnit("{retry}"))
 	m.retries = record(&reg, retriesName, retries, err)
 
 	// Считаются эпизоды, а не опросы: неретраибельную ошибку партиции franz-go
@@ -237,7 +264,8 @@ func newConsumerMetrics(meter metric.Meter) (consumerMetrics, error) {
 	// «партиция была здорова → сломалась» и на смену текста ошибки.
 	fetchErrorsName := "kafkax.consumer.fetch.errors"
 	fetchErrors, err := meter.Int64Counter(fetchErrorsName,
-		metric.WithDescription("Partition-level fetch error episodes, counted on state change"))
+		metric.WithDescription("Partition-level fetch error episodes, counted on state change"),
+		metric.WithUnit("{episode}"))
 	m.fetchErrors = record(&reg, fetchErrorsName, fetchErrors, err)
 
 	// Отказ уровня группы — не то же самое, что отказ партиции: сообщений нет
@@ -247,12 +275,44 @@ func newConsumerMetrics(meter metric.Meter) (consumerMetrics, error) {
 	// Атрибутов нет намеренно: топика у этой ошибки не существует.
 	groupErrorsName := "kafkax.consumer.group.errors"
 	groupErrors, err := meter.Int64Counter(groupErrorsName,
-		metric.WithDescription("Group session error episodes, counted on state change"))
+		metric.WithDescription("Group session error episodes, counted on state change"),
+		metric.WithUnit("{episode}"))
 	m.groupErrors = record(&reg, groupErrorsName, groupErrors, err)
+
+	// Проваленный коммит — самый частый источник дубликатов, и до этого
+	// счётчика он существовал только в логе. Атрибут phase разделяет два случая
+	// с разной ценой: на revoke партиция уходит другому участнику, и он
+	// перечитает хвост немедленно; на shutdown хвост перечитает следующий
+	// экземпляр после старта.
+	commitErrorsName := "kafkax.consumer.commit.errors"
+	commitErrors, err := meter.Int64Counter(commitErrorsName,
+		metric.WithDescription("Offset commits that failed, by phase"),
+		metric.WithUnit("{commit}"))
+	m.commitErrors = record(&reg, commitErrorsName, commitErrors, err)
+
+	// Потеря партиций — это отзыв БЕЗ возможности закоммитить: сессия группы
+	// уже разорвана. Считаются партиции, а не события: одно событие уносит
+	// столько партиций, сколько было назначено, и «потеряли одну из тридцати»
+	// от «потеряли все тридцать» иначе не отличить.
+	lostName := "kafkax.consumer.partitions.lost"
+	lost, err := meter.Int64Counter(lostName,
+		metric.WithDescription("Partitions lost without a chance to commit"),
+		metric.WithUnit("{partition}"))
+	m.partitionsLost = record(&reg, lostName, lost, err)
+
+	// Исчерпание бюджета мягкой остановки. Каждое такое событие означает
+	// оборванную обработку и, скорее всего, дубликаты после перезапуска —
+	// сигнал, что GracefulTimeout мал для реального времени обработки.
+	drainName := "kafkax.consumer.drain.timeouts"
+	drain, err := meter.Int64Counter(drainName,
+		metric.WithDescription("Graceful drain budgets exhausted, by phase"),
+		metric.WithUnit("{timeout}"))
+	m.drainTimeouts = record(&reg, drainName, drain, err)
 
 	workersName := "kafkax.consumer.workers.active"
 	workers, err := meter.Int64UpDownCounter(workersName,
-		metric.WithDescription("Partition workers currently running"))
+		metric.WithDescription("Partition workers currently running"),
+		metric.WithUnit("{worker}"))
 	m.workersActive = record(&reg, workersName, workers, err)
 
 	// Продолжающийся сигнал для штатного исхода политики отравленного
@@ -261,12 +321,14 @@ func newConsumerMetrics(meter metric.Meter) (consumerMetrics, error) {
 	// моменту дежурства уже уехало из окна.
 	pausedName := "kafkax.consumer.partitions.paused"
 	paused, err := meter.Int64UpDownCounter(pausedName,
-		metric.WithDescription("Partitions currently paused at an uncommitted offset"))
+		metric.WithDescription("Partitions currently paused at an uncommitted offset"),
+		metric.WithUnit("{partition}"))
 	m.partitionsPaused = record(&reg, pausedName, paused, err)
 
 	panicsName := "kafkax.consumer.panics"
 	panicsCounter, err := meter.Int64Counter(panicsName,
-		metric.WithDescription("Panics recovered inside kafkax consumer goroutines, by site"))
+		metric.WithDescription("Panics recovered inside kafkax consumer goroutines, by site"),
+		metric.WithUnit("{panic}"))
 	m.panics = record(&reg, panicsName, panicsCounter, err)
 
 	return m, reg.err()
@@ -413,7 +475,7 @@ func NewKafkaConsumer(config Config) (*KafkaConsumer, error) {
 
 	logger := config.logger("kafka_consumer").With(slog.String("group", config.Consumer.Group))
 
-	metrics, err := newConsumerMetrics(otel.Meter(instrumentationName))
+	metrics, err := newConsumerMetrics(otel.Meter(instrumentationName, meterOptions()...))
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
@@ -719,12 +781,70 @@ func (c *KafkaConsumer) reportFetchError(topic string, partition int32, err erro
 		return
 	}
 
+	// Разбор отделяет два класса, которые означают РЕАЛЬНУЮ потерю данных, от
+	// обычного сбоя фетча. Он стоит две проверки на эпизод, а не на опрос:
+	// дедуп по смене состояния уже отсеял повторы, и сюда доходит только первая
+	// ошибка эпизода. Поэтому же атрибуты собираются на месте, а не берутся из
+	// кэша opts: горячего пути здесь нет.
+	reason := fetchErrorReason(err)
+
 	c.metrics.fetchErrors.Add(context.WithoutCancel(c.lifeCtx), 1,
-		c.opts.get(topic, noStatus).add...)
+		metric.WithAttributes(
+			attribute.String("topic", topic),
+			attribute.String("reason", reason)))
+
+	// Потеря данных — это Error по любому счёту; обычный сбой фетча тоже
+	// остаётся Error, потому что неретраибельная ошибка партиции требует
+	// вмешательства. Различает их атрибут reason, по нему и строится алерт:
+	// «брокер недоступен» чинится сам, «данные пропали» — нет.
 	c.logger.Error("Partition fetch error",
 		slog.String("topic", topic),
 		slog.Int("partition", int(partition)),
+		slog.String("reason", reason),
 		slog.Any("error", err))
+}
+
+// Значения атрибута reason в записи о партиционной ошибке фетча.
+const (
+	// fetchReasonDataLoss — franz-go обнаружил безвозвратно пропущенные записи
+	// и сам сбросил позицию. Данные потеряны на стороне брокера: усечение по
+	// retention, откат лидера, восстановление из бэкапа.
+	fetchReasonDataLoss = "data_loss"
+	// fetchReasonOffsetOutOfRange — запрошенного оффсета на брокере больше нет,
+	// позиция сбрасывается на Consumer.InitialOffset. При earliest это
+	// перечитывание с начала, при latest — молчаливый перескок через весь
+	// неотставший хвост.
+	fetchReasonOffsetOutOfRange = "offset_out_of_range"
+	// fetchReasonFetch — всё остальное: недоступный брокер, смена лидера,
+	// таймаут запроса. Данные на месте, отказ временный или требует починки
+	// кластера, но ничего не пропало.
+	fetchReasonFetch = "fetch"
+)
+
+// fetchErrorReason классифицирует ошибку фетча.
+//
+// Смысл разбора в том, что по одному лишь тексту ошибки алерт «мы потеряли
+// данные» не построишь, а от «брокер недоступен» он отличается ценой: второе
+// чинится само, первое требует решения, что делать с дырой в потоке.
+func fetchErrorReason(err error) string {
+	// AsType, а не Is: kgo.ErrDataLoss — структура с полями (топик, партиция,
+	// потерянный и восстановленный оффсеты), а не сентинел, и сравнивать с ней
+	// нечего.
+	// Значение именованное, а не `_`: у *kgo.ErrDataLoss есть Error(), то есть
+	// это ошибка, и линтер справедливо не даёт молча выбросить её в пустоту.
+	if lost, isLoss := errors.AsType[*kgo.ErrDataLoss](err); isLoss && lost != nil {
+		return fetchReasonDataLoss
+	}
+
+	// Сравнение по коду, а не по значению: kerr.OffsetOutOfRange — экземпляр
+	// *kerr.Error, а брокер присылает свой; равенство указателей здесь ничего
+	// не значит.
+	if kerrErr, ok := errors.AsType[*kerr.Error](err); ok &&
+		kerrErr.Code == kerr.OffsetOutOfRange.Code {
+		return fetchReasonOffsetOutOfRange
+	}
+
+	return fetchReasonFetch
 }
 
 // firstReport сообщает, изменилось ли состояние ошибки на key.
@@ -1412,6 +1532,12 @@ func (c *KafkaConsumer) onPartitionsRevoked(ctx context.Context, client *kgo.Cli
 	defer cancelCommit()
 
 	if err := client.CommitMarkedOffsets(commitCtx); err != nil {
+		// Наружу этот отказ вернуть некому — колбэк ребаланса зовёт franz-go, а
+		// не приложение, — поэтому здесь лог обязателен, и рядом с ним счётчик:
+		// проваленный коммит на revoke означает, что новый владелец перечитает
+		// хвост, и алерт по нему строится, а по строке в логе нет.
+		c.metrics.commitErrors.Add(context.WithoutCancel(ctx), 1,
+			metric.WithAttributes(attribute.String("phase", phaseRevoke)))
 		c.logger.Error("Failed to commit marked offsets on revoke",
 			slog.Any("partitions", revoked),
 			slog.Any("error", err))
@@ -1433,6 +1559,15 @@ func (c *KafkaConsumer) onPartitionsLost(ctx context.Context, client *kgo.Client
 
 	c.stopWorkers(ctx, client, lost)
 
+	// Считаются партиции, а не события: одно событие уносит столько партиций,
+	// сколько было назначено, и «потеряли одну из тридцати» от «потеряли все
+	// тридцать» по счётчику событий не отличить.
+	total := 0
+	for _, parts := range lost {
+		total += len(parts)
+	}
+
+	c.metrics.partitionsLost.Add(context.WithoutCancel(ctx), int64(total))
 	c.logger.Warn("Partitions lost", slog.Any("partitions", lost))
 }
 
@@ -1545,6 +1680,12 @@ func (c *KafkaConsumer) awaitWorkers(ctx context.Context, stopped []keyedWorker)
 		context.WithoutCancel(c.lifeCtx), c.config.Consumer.RebalanceTimeout)
 	defer cancel()
 
+	// Одно событие на исчерпанный бюджет, а не на воркера: бюджет общий, и
+	// «не уложились» — это одно решение, принятое разом по всем оставшимся.
+	// Сколько именно воркеров оборвано, видно в логе.
+	c.metrics.drainTimeouts.Add(context.WithoutCancel(c.lifeCtx), 1,
+		metric.WithAttributes(attribute.String("phase", phaseWorkers)))
+
 	for _, kw := range pending {
 		c.logger.Warn("Partition worker did not stop in time, cancelling",
 			slog.String("topic", kw.key.topic),
@@ -1619,6 +1760,11 @@ func (c *KafkaConsumer) shutdown() error {
 	pollCancel()
 
 	if !c.awaitPollLoop(ctx) {
+		// Здесь лог остаётся: ErrPollLoopStuck сообщает вызывающему факт, но не
+		// его последствие — открытого клиента, который переживёт Stop. Это
+		// состояние процесса, а не результат вызова, и место ему в журнале.
+		c.metrics.drainTimeouts.Add(context.WithoutCancel(c.lifeCtx), 1,
+			metric.WithAttributes(attribute.String("phase", phasePollLoop)))
 		c.logger.Error("Poll loop is still running after hard cancellation; " +
 			"leaving the kafka client open to avoid racing it")
 
@@ -1639,7 +1785,14 @@ func (c *KafkaConsumer) shutdown() error {
 	var err error
 
 	if commitErr := client.CommitMarkedOffsets(commitCtx); commitErr != nil {
-		c.logger.Error("Failed to commit marked offsets on shutdown", slog.Any("error", commitErr))
+		// Только счётчик и возврат, без записи в лог: ошибка уходит
+		// вызывающему, и он её залогирует — а пакет, залогировав сам, удваивал
+		// бы событие в журнале. Метрика нужна ровно потому, что дисциплины
+		// «читать возврат Stop» у типового defer нет, и без неё проваленный
+		// финальный коммит не существовал бы ни для одного алерта.
+		c.metrics.commitErrors.Add(context.WithoutCancel(c.lifeCtx), 1,
+			metric.WithAttributes(attribute.String("phase", phaseShutdown)))
+
 		err = fmt.Errorf("%w: %w", ErrCommitFailed, commitErr)
 	}
 

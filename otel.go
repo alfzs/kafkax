@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 
@@ -14,11 +15,63 @@ import (
 	"go.opentelemetry.io/otel/metric"
 )
 
-// Имя инструментационной библиотеки — общий scope для трейсов и метрик обеих
-// ролей. Роль различается атрибутами спанов и именами метрик, а не scope'ом:
-// приложение, создающее и продюсера, и консьюмера, не должно видеть два
-// разных instrumentation scope для одной библиотеки.
+// instrumentationName — scope доменных МЕТРИК пакета, общий для обеих ролей.
+// Роль различается именами метрик, а не scope'ом: приложение, создающее и
+// продюсера, и консьюмера, не должно видеть два разных instrumentation scope
+// для одной библиотеки.
+//
+// Спаны сюда не относятся: их создаёт kotel под собственным scope
+// github.com/twmb/franz-go/plugin/kotel, и подменить его пакет не может.
+// Транспортные метрики kotel — там же.
 const instrumentationName = "github.com/alfzs/kafkax/v2"
+
+// instrumentationModule — путь модуля, по которому в build info ищется версия
+// пакета для scope метрик.
+const instrumentationModule = "github.com/alfzs/kafkax/v2"
+
+// meterOptions собирает опции scope доменных метрик.
+//
+// Версия читается из build info, а не хардкодится константой: константу забыли
+// бы обновить на первом же релизе, и scope врал бы уверенно. Отсутствие версии
+// (сборка без модуля, go run по файлам) не ошибка — scope просто останется без
+// неё, как было до этой функции.
+//
+// WithSchemaURL здесь намеренно нет. Он объявляет соответствие конкретной
+// версии семантических соглашений, а доменные метрики пакета от messaging
+// semantic conventions осознанно отклоняются (topic/status вместо
+// messaging.destination.name — см. «Что осознанно не делаем» в
+// docs/audit/03-observability.md). Схемо-осведомлённый backend, поверив
+// объявлению, начал бы переименовывать атрибуты по правилам чужой схемы.
+func meterOptions() []metric.MeterOption {
+	opts := []metric.MeterOption{}
+
+	version := moduleVersion()
+	if version == "" {
+		return opts
+	}
+
+	return append(opts, metric.WithInstrumentationVersion(version))
+}
+
+// moduleVersion достаёт версию модуля пакета из build info.
+func moduleVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+
+	if info.Main.Path == instrumentationModule {
+		return info.Main.Version
+	}
+
+	for _, dep := range info.Deps {
+		if dep.Path == instrumentationModule {
+			return dep.Version
+		}
+	}
+
+	return ""
+}
 
 // Границы бакетов гистограмм длительности, в секундах.
 //

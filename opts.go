@@ -28,7 +28,7 @@ func (c Config) commonOpts(logger *slog.Logger) ([]kgo.Opt, error) {
 		kgo.SeedBrokers(c.Brokers...),
 		kgo.ClientID(c.ClientID),
 		kgo.DialTimeout(c.DialTimeout),
-		kgo.WithLogger(kslog.New(logger)),
+		kgo.WithLogger(kslog.New(c.kafkaLogger(logger))),
 	}
 
 	tlsCfg, err := c.tlsConfig(logger)
