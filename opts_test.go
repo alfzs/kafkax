@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/sasl"
 )
 
 // Тесты сборки опций kgo.
@@ -501,8 +502,20 @@ func TestCommonOptsAttachSASL(t *testing.T) {
 
 	// Механизм должен доехать до клиента: без kgo.SASL клиент подключится без
 	// аутентификации и получит отказ уже от брокера.
-	if got := optsClient(t, opts).OptValue(kgo.SASL); got == nil {
-		t.Fatal("SASL-механизм не попал в опции клиента")
+	//
+	// Сравнение с nil здесь недостижимо, и на этом тест однажды уже прогорел:
+	// OptValue возвращает any, в который упакован []sasl.Mechanism, поэтому
+	// интерфейс не-nil даже у клиента без единой опции SASL — там лежит
+	// типизированный nil-слайс. Судится длина слайса и имя механизма; за
+	// «доехали ли учётные данные» отвечает круг против брокера в
+	// opts_sasl_tls_test.go, потому что наружу sasl.Mechanism их не отдаёт.
+	mechs, ok := optsClient(t, opts).OptValue(kgo.SASL).([]sasl.Mechanism)
+	if !ok || len(mechs) != 1 {
+		t.Fatalf("SASL-механизм не попал в опции клиента: %#v", mechs)
+	}
+
+	if got := mechs[0].Name(); got != "SCRAM-SHA-512" {
+		t.Errorf("Name() = %q, want %q", got, "SCRAM-SHA-512")
 	}
 
 	cfg.SASL.Mechanism = "GSSAPI"
