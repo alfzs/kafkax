@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,6 +123,43 @@ func prodFailProduce(cluster *kfake.Cluster, code int16) {
 
 		return presp, nil, true
 	})
+}
+
+// prodHoldProduce задерживает у брокера первый запрос Produce: закрывает
+// onWire, когда запрос доехал, и позволяет ответить на него, когда тест закроет
+// release.
+//
+// Это единственная наблюдаемая граница «запись ушла в сеть». Хуки клиента её не
+// дают: OnProduceRecordBuffered срабатывает заметно раньше — когда запись ещё
+// внутри kgo.Produce, — а именно по этой границе меняется контракт отмены.
+//
+// SleepControl, а не блокировка прямо в теле управляющей функции: он отпускает
+// поток кластера, и метаданные с InitProducerID продолжают обслуживаться, пока
+// produce ждёт теста.
+func prodHoldProduce(t *testing.T, cluster *kfake.Cluster) (onWire, release chan struct{}) {
+	t.Helper()
+
+	onWire = make(chan struct{})
+	release = make(chan struct{})
+
+	// Пока функция спит, она остаётся зарегистрированной, и следующий Produce
+	// зайдёт в неё же. Флаг оставляет задержку ровно на первой отправке:
+	// остальные (маркер, повторы franz-go) обслуживаются штатно.
+	var held atomic.Bool
+
+	cluster.ControlKey(kmsg.Produce.Int16(), func(kmsg.Request) (kmsg.Response, error, bool) {
+		if !held.Swap(true) {
+			cluster.SleepControl(func() {
+				close(onWire)
+				<-release
+			})
+		}
+
+		// Ответ собирает сам kfake: тесту нужна задержка, а не подмена.
+		return nil, nil, false
+	})
+
+	return onWire, release
 }
 
 // prodCluster поднимает брокер kfake напрямую, когда тесту нужен сам *Cluster
@@ -321,7 +359,11 @@ func TestProducerSendMessageInvalidHeaders(t *testing.T) {
 // compacted-топик трактует как удаление ключа. Проверка защищает от соблазна
 // «заодно» отвергнуть их вместе с пустым топиком.
 //
-//nolint:paralleltest // подтесты последовательны: порядок записей в топике сверяется с порядком таблицы
+// Сам тест параллельный — t.Parallel() стоит первой строкой; подавлено
+// требование линтера к ПОДТЕСТАМ: они идут последовательно, потому что записи
+// ниже сверяются по индексу с порядком таблицы.
+//
+//nolint:paralleltest // t.Parallel() у теста есть; подтесты последовательны намеренно
 func TestProducerSendMessageNilAndEmptyKeyValue(t *testing.T) {
 	t.Parallel()
 
@@ -372,10 +414,17 @@ func TestProducerSendMessageNilAndEmptyKeyValue(t *testing.T) {
 // на него MessageTimeout и возвращает именно context.Canceled, по которому
 // видно, что виноват не брокер.
 //
-//nolint:paralleltest // измеряет длительность возврата: параллельная нагрузка размывает границу
+//nolint:paralleltest // предохранитель по длительности возврата: параллельная нагрузка размывает границу
 func TestProducerSendMessageCanceledContext(t *testing.T) {
 	brokers := newFakeCluster(t, 1, testTopic)
-	p := mustProducer(t, testConfig(t, brokers...))
+
+	cfg := testConfig(t, brokers...)
+	// Бюджет разведён с потолком проверки на порядок: при 3s из testConfig
+	// «отработало сразу» и «сожгло бюджет» разделяла всего секунда, и запас
+	// съедала любая нагрузка на планировщик.
+	cfg.Producer.MessageTimeout = 30 * time.Second
+
+	p := mustProducer(t, cfg)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
@@ -387,14 +436,167 @@ func TestProducerSendMessageCanceledContext(t *testing.T) {
 		t.Fatalf("SendMessage(отменённый ctx) = %v, want context.Canceled", err)
 	}
 
-	// Отмена не должна превращаться в ожидание MessageTimeout (3s в
-	// testConfig): бюджет тратится только на живой контекст.
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("возврат занял %s — отменённый контекст не отработал сразу", elapsed)
-	}
-
+	// Класс ошибки, а не часы, доказывает, что бюджет не тратился: сожжённый
+	// MessageTimeout вернул бы ErrDeliveryTimeout, и отличить его от отмены
+	// можно без единого измерения.
 	if errors.Is(err, ErrDeliveryTimeout) {
 		t.Errorf("отмена не должна выдаваться за таймаут доставки: %v", err)
+	}
+
+	// Предохранитель на вырожденный случай, когда franz-go проверил бы
+	// контекст только в конце ожидания и всё равно назвал исход отменой:
+	// вызов не ходит в сеть, а между потолком и бюджетом шесть раз по пять
+	// секунд.
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("возврат занял %s при MessageTimeout=%s — отменённый контекст не отработал сразу",
+			elapsed, cfg.Producer.MessageTimeout)
+	}
+}
+
+// Отмена прилетела внутрь уже начатого ProduceSync, до записи в сеть: исход
+// обязан быть однозначным «не доставлено».
+//
+// Класс дефекта — неопределённый исход отправки. Отмена в полёте оставляет
+// вызывающего с вопросом «повторять или будет дубликат», и ответ на него даёт
+// только класс ошибки: ErrDeliveryTimeout означает «могло доехать»,
+// ErrDeliveryFailed — «брокер видел запись». Пока запись не ушла в сеть, отмена
+// не равна ни тому, ни другому, и подмена класса стоила бы дубликата.
+//
+// Ассерт двойной, потому что одной ошибки мало: она говорит, во что верит
+// клиент, но не что лежит в топике. Отсутствие записи доказывается маркером —
+// он отправляется последним и обязан оказаться сразу за удержанной записью;
+// проскочившая отмена вклинилась бы между ними.
+//
+// Синхронизация без sleep: первая отправка удерживается у брокера и занимает
+// весь буфер клиента (MaxBufferedRecords=1), поэтому вторая гарантированно
+// застревает внутри kgo.Produce, а второе срабатывание хука буфера — сигнал,
+// что она туда уже вошла.
+func TestProducerSendMessageCanceledInFlight(t *testing.T) {
+	t.Parallel()
+
+	const (
+		heldValue     = "on-wire"
+		canceledValue = "canceled-in-flight"
+		markerValue   = "after-cancel"
+	)
+
+	cluster := prodCluster(t, 1, testTopic)
+	onWire, release := prodHoldProduce(t, cluster)
+
+	hook := &prodBufferedHook{}
+
+	cfg := testConfig(t, cluster.ListenAddrs()...)
+	// Буфер на одну запись: пока удержанная отправка ждёт ответа брокера,
+	// следующая физически не может в него попасть.
+	cfg.Producer.MaxBufferedRecords = 1
+	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
+
+	p := mustProducer(t, cfg)
+
+	heldDone := make(chan error, 1)
+
+	go func() {
+		heldDone <- p.SendMessage(t.Context(), PublishRequest{Topic: testTopic, Value: []byte(heldValue)})
+	}()
+
+	// Запрос доехал до брокера — значит запись занимает буфер и будет занимать
+	// его, пока тест не отпустит ответ.
+	<-onWire
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	canceledDone := make(chan error, 1)
+
+	go func() {
+		canceledDone <- p.SendMessage(ctx, PublishRequest{Topic: testTopic, Value: []byte(canceledValue)})
+	}()
+
+	// Хук вызывается в самом начале kgo.Produce, ещё до упора в лимит буфера,
+	// поэтому два срабатывания означают именно «вторая отправка уже внутри
+	// ProduceSync», а не «уже отправлена».
+	waitFor(t, consWait, "вторая отправка вошла в ProduceSync", func() bool {
+		return hook.n.Load() == 2
+	})
+
+	cancel()
+
+	err := <-canceledDone
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SendMessage(отмена в полёте) = %v, want context.Canceled", err)
+	}
+
+	// Классы ошибок не должны сливаться: у каждого своя рекомендация по
+	// повтору, и отмена не совпадает ни с одной из трёх.
+	for _, wrong := range []error{ErrDeliveryTimeout, ErrDeliveryFailed, ErrProducerClosed} {
+		if errors.Is(err, wrong) {
+			t.Errorf("отмена в полёте отнесена к чужому классу ошибок (%v): %v", wrong, err)
+		}
+	}
+
+	close(release)
+
+	if err := <-heldDone; err != nil {
+		t.Fatalf("удержанная отправка: %v", err)
+	}
+
+	if err := p.SendMessage(t.Context(), PublishRequest{Topic: testTopic, Value: []byte(markerValue)}); err != nil {
+		t.Fatalf("SendMessage(маркер): %v", err)
+	}
+
+	recs := prodFetchRecords(t, cluster.ListenAddrs(), testTopic, 2)
+
+	got := []string{string(recs[0].Value), string(recs[1].Value)}
+	if got[0] != heldValue || got[1] != markerValue {
+		t.Fatalf("записи топика = %q, want [%q %q] — отменённая отправка всё-таки ушла",
+			got, heldValue, markerValue)
+	}
+}
+
+// Отмена прилетела после того, как запись ушла в сеть: доставленная запись не
+// имеет права превратиться в отказ.
+//
+// Класс дефекта — ложный отказ при фактической доставке, зеркальный к тесту
+// выше и более дорогой: увидев ошибку, вызывающий повторит отправку и получит
+// дубликат. Идемпотентный продюсер franz-go запись в полёте не отменяет —
+// пакет намеренно не включает AllowIdempotentProduceCancellation, — и
+// SendMessage обязан донести это до вызывающего без искажений.
+//
+// Ассерт проверяет не только nil: nil, за которым в топике ничего нет, был бы
+// тем же дефектом с другой стороны — молчаливой потерей. Поэтому успех
+// подкрепляется вычитанной записью.
+func TestProducerSendMessageCancelAfterWrite(t *testing.T) {
+	t.Parallel()
+
+	const value = "delivered-despite-cancel"
+
+	cluster := prodCluster(t, 1, testTopic)
+	onWire, release := prodHoldProduce(t, cluster)
+
+	p := mustProducer(t, testConfig(t, cluster.ListenAddrs()...))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	sendDone := make(chan error, 1)
+
+	go func() {
+		sendDone <- p.SendMessage(ctx, PublishRequest{Topic: testTopic, Value: []byte(value)})
+	}()
+
+	// Порядок здесь и есть проверяемое условие: отмена строго после того, как
+	// запрос доехал до брокера, и строго до того, как брокер ответил.
+	<-onWire
+	cancel()
+	close(release)
+
+	if err := <-sendDone; err != nil {
+		t.Fatalf("SendMessage(отмена после записи в сеть) = %v, want nil", err)
+	}
+
+	recs := prodFetchRecords(t, cluster.ListenAddrs(), testTopic, 1)
+	if got := string(recs[0].Value); got != value {
+		t.Fatalf("запись топика = %q, want %q — nil без записи означает молчаливую потерю", got, value)
 	}
 }
 
@@ -404,7 +606,7 @@ func TestProducerSendMessageCanceledContext(t *testing.T) {
 // сообщения, а не таймаут отдельного этапа, поэтому худший случай не
 // превышает её значения.
 //
-//nolint:paralleltest // измеряет, что весь путь укладывается в один MessageTimeout
+//nolint:paralleltest // предохранитель по длительности возврата: параллельная нагрузка размывает границу
 func TestProducerSendMessageDeliveryTimeout(t *testing.T) {
 	cfg := testConfig(t)
 	// 1s — минимум, который принимает franz-go для RecordDeliveryTimeout;
@@ -420,10 +622,15 @@ func TestProducerSendMessageDeliveryTimeout(t *testing.T) {
 		t.Fatalf("SendMessage(недоступный брокер) = %v, want ErrDeliveryTimeout", err)
 	}
 
-	// Верхняя граница щедрая, нижняя — точная: смысл проверки в том, что
-	// бюджет один, а не в скорости машины.
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("возврат занял %s при MessageTimeout=%s — бюджет не один", elapsed, cfg.Producer.MessageTimeout)
+	// Предохранитель, а не доказательство единственности бюджета: часы её и не
+	// могут доказать — граница, отделяющая один бюджет от двух, лежит между
+	// 1s и 2s, а такой потолок краснел бы от любой нагрузки. Единственность
+	// доказывает сентинел ниже: сложение бюджетов дало бы не ErrDeliveryTimeout
+	// на первом же круге, а иной исход. Потолок ловит вырожденный случай, когда
+	// бюджета нет вовсе и вызов висит до конца прогона.
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("возврат занял %s при MessageTimeout=%s — бюджет не ограничивает путь отправки",
+			elapsed, cfg.Producer.MessageTimeout)
 	}
 
 	// Таймаут — отдельный класс от «продюсер закрыт»: он означает «запись
