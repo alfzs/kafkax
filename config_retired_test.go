@@ -226,7 +226,7 @@ func TestRetiredYAMLKeyFoundInLegacyMapShape(t *testing.T) {
 			return nil
 		}
 
-		*out = map[any]any{"consumer": map[any]any{"handler_max_retries": 0}}
+		*out = map[any]any{yamlSectionConsumer: map[any]any{"handler_max_retries": 0}}
 
 		return nil
 	}
@@ -369,4 +369,119 @@ func cfgLiveKeys(t *testing.T, typ reflect.Type, prefix []string) (map[string]bo
 	}
 
 	return yamlKeys, envs
+}
+
+// v1YAMLKeys — полный перечень yaml-ключей конфигурации v1.5.0, набранный
+// литералом.
+//
+// Литералом, а не выводом из кода: кода v1 в модуле нет, он живёт только в
+// истории git, и вывести перечень в рантайме неоткуда. Собран один раз обходом
+// тегов `git show v1.5.0:config.go` и с тех пор — снимок, который не меняется:
+// v1 больше не выйдет.
+//
+// Секции без точки — это сами поля-секции («producer», «tls»); они в файле
+// присутствуют и в v3, поэтому в перечне их нет.
+var v1YAMLKeys = []string{
+	// clientid, а не client_id: у поля ClientID в v1 не было тега yaml, и
+	// yaml.v3 берёт имя поля в нижнем регистре, без подчёркиваний.
+	"brokers", "clientid", "graceful_timeout", "security_protocol",
+	"sasl.mechanism",
+	"tls.ca_cert_path", "tls.client_cert_path", "tls.client_key_path",
+	"tls.identification_algorithm", "tls.insecure_skip_verify",
+	"producer.ack_timeout", "producer.batch_bytes", "producer.batch_size",
+	"producer.batch_timeout", "producer.cleanup_worker_interval", "producer.compression_type",
+	"producer.enable_idempotence", "producer.flush_timeout", "producer.inactive_worker_ttl",
+	"producer.linger", "producer.max_inflight", "producer.max_retries",
+	"producer.message_queue_size", "producer.message_timeout", "producer.required_acks",
+	"producer.retry_backoff",
+	"consumer.cleanup_worker_interval", "consumer.enable_auto_commit",
+	"consumer.handler_max_retries", "consumer.handler_retry_delay",
+	"consumer.heartbeat_interval", "consumer.inactive_worker_ttl", "consumer.initial_offset",
+	"consumer.isolation_level", "consumer.max_bytes", "consumer.max_poll_interval",
+	"consumer.max_wait", "consumer.message_queue_size", "consumer.min_bytes",
+	"consumer.read_error_backoff", "consumer.read_timeout", "consumer.session_timeout",
+	"consumer.socket_timeout",
+}
+
+// TestEveryV1KeyIsLiveOrRetired — каждый ключ v1 либо существует в v3, либо
+// назван отставленным. Третьего исхода быть не должно.
+//
+// Это сторож полноты списка, и он важнее любой отдельной записи в нём. Ключ,
+// выпавший из обеих категорий, — ровно тот дефект, ради которого механизм и
+// заведён: перенесённый конфиг проглотит его молча, настройка перестанет
+// действовать, и узнают об этом по поведению в проде, а не по ошибке старта.
+// Без такого теста список пополняется только тогда, когда кто-то споткнётся.
+//
+// Перечень v1 — литерал (см. v1YAMLKeys), живые ключи — обход структуры
+// рефлексией, отставленные — таблица. Сверять две стороны, выведенные из одного
+// источника, смысла не имело бы.
+func TestEveryV1KeyIsLiveOrRetired(t *testing.T) {
+	t.Parallel()
+
+	live, _ := cfgLiveKeys(t, reflect.TypeFor[Config](), nil)
+
+	retired := make(map[string]bool, len(retiredKeys))
+	for _, k := range retiredKeys {
+		retired[strings.Join(k.yamlPath, ".")] = true
+	}
+
+	// Обе стороны непусты: сломавшийся обход или опустевшая таблица иначе
+	// сделали бы тест зелёным по недосмотру, а не по существу.
+	if len(live) < 25 {
+		t.Fatalf("живых ключей собрано %d — обход по структуре сломан", len(live))
+	}
+
+	if len(retired) < 10 {
+		t.Fatalf("отставленных ключей %d — таблица опустела", len(retired))
+	}
+
+	for _, key := range v1YAMLKeys {
+		if live[key] || retired[key] {
+			continue
+		}
+
+		t.Errorf("ключ v1 %q не существует в v3 и не назван отставленным: "+
+			"перенесённый конфиг потеряет его молча. Добавьте запись в retiredKeys "+
+			"с текстом, объясняющим, чем его заменить", key)
+	}
+}
+
+// TestEveryRetiredKeyCoversBothForms — у каждой записи заполнены обе формы
+// записи ключа, кроме единственного оправданного исключения.
+//
+// Задать настройку можно и файлом, и переменной окружения, поэтому запись с
+// пустым env закрывает только половину пути: yaml поймает, окружение пропустит.
+// Отказ молчаливый — тесты остальных записей останутся зелёными, и узнать о
+// дыре будет неоткуда.
+//
+// Исключение перечислено литералом, а не выведено из таблицы: список,
+// сверяемый сам с собой, разрешил бы любую новую запись без env.
+func TestEveryRetiredKeyCoversBothForms(t *testing.T) {
+	t.Parallel()
+
+	// clientid менял имя только в файле: переменная KAFKAX_CLIENT_ID как
+	// называлась, так и называется, и объявлять её отставленной нельзя — она
+	// живая.
+	withoutEnv := map[string]bool{"clientid": true}
+
+	for _, key := range retiredKeys {
+		path := strings.Join(key.yamlPath, ".")
+
+		switch {
+		case key.env != "" && withoutEnv[path]:
+			t.Errorf("%q объявлен исключением, но env у него задан (%s) — уберите его из списка исключений",
+				path, key.env)
+		case key.env == "" && !withoutEnv[path]:
+			t.Errorf("у отставленного ключа %q не задан env: настройку можно передать переменной "+
+				"окружения, и этот путь останется неперехваченным", path)
+		}
+
+		if len(key.yamlPath) == 0 {
+			t.Errorf("у записи с env %q не задан путь в файле", key.env)
+		}
+
+		if key.change == "" {
+			t.Errorf("у отставленного ключа %q пустой текст: отказ без объяснения не лучше молчания", path)
+		}
+	}
 }
