@@ -173,11 +173,13 @@ func (p *Producer) initMetrics(meter metric.Meter) error {
 	p.opts = newOptsCache(producerOptsLimit)
 
 	sent, err := meter.Int64Counter("kafkax.producer.messages.sent",
-		metric.WithDescription("Number of messages successfully delivered to Kafka"))
+		metric.WithDescription("Number of messages successfully delivered to Kafka"),
+		metric.WithUnit("{message}"))
 	p.sent = record(reg, "kafkax.producer.messages.sent", sent, err)
 
 	failed, err := meter.Int64Counter("kafkax.producer.messages.failed",
-		metric.WithDescription("Number of messages that failed to be delivered"))
+		metric.WithDescription("Number of messages that failed to be delivered"),
+		metric.WithUnit("{message}"))
 	p.failed = record(reg, "kafkax.producer.messages.failed", failed, err)
 
 	// Отбраковка на входе считается отдельно от отказов доставки, и атрибута
@@ -186,7 +188,8 @@ func (p *Producer) initMetrics(meter metric.Meter) error {
 	// подставляющее в топик пользовательский ввод, иначе роняло бы backend
 	// метрик ровно теми запросами, которые пакет отверг не глядя.
 	rejected, err := meter.Int64Counter("kafkax.producer.messages.rejected",
-		metric.WithDescription("Messages rejected by input validation, by reason"))
+		metric.WithDescription("Messages rejected by input validation, by reason"),
+		metric.WithUnit("{message}"))
 	p.rejected = record(reg, "kafkax.producer.messages.rejected", rejected, err)
 
 	// Единица — секунды, а не миллисекунды: при записи целыми миллисекундами

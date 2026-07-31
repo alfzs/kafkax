@@ -215,15 +215,20 @@ func TestDocumentationMentionsOnlyRealMetrics(t *testing.T) {
 func TestDomainMetricKindsAndUnitsAreStable(t *testing.T) {
 	t.Parallel()
 
-	// Пустая единица у трёх счётчиков продюсера — снимок сегодняшнего кода, а
-	// не решение: у консьюмера аннотационная единица есть у всех, у продюсера
-	// её нет ни у одного. Ряды Prometheus от аннотационной единицы не меняются,
-	// поэтому выравнивание безопасно, но делать его надо осознанно и вместе с
-	// таблицей README, а не попутной правкой.
+	// Аннотационная единица есть у всех доменных счётчиков обеих ролей: у
+	// продюсера её изначально не было ни у одного, и разошлись роли молча —
+	// заметить это было нечем, пока таблица не встала литералом. Рядов
+	// Prometheus аннотационная единица не меняет, поэтому выравнивание прошло
+	// без миграции дашбордов, но именно поэтому и разъехаться оно могло сколь
+	// угодно долго.
+	// Повтор «{message}» в четырёх строках — не дубликат, который просится в
+	// константу: таблица целиком набрана литералами намеренно, и общая
+	// константа связала бы четыре независимых ожидания в одно, которое правится
+	// разом. Ровно от этого таблица и защищает.
 	want := map[string]instrumentInfo{
-		"kafkax.producer.messages.sent":      {kind: kindCounter, unit: ""},
-		"kafkax.producer.messages.failed":    {kind: kindCounter, unit: ""},
-		"kafkax.producer.messages.rejected":  {kind: kindCounter, unit: ""},
+		"kafkax.producer.messages.sent":      {kind: kindCounter, unit: "{message}"}, //nolint:goconst // литерал здесь — суть теста, см. выше
+		"kafkax.producer.messages.failed":    {kind: kindCounter, unit: "{message}"},
+		"kafkax.producer.messages.rejected":  {kind: kindCounter, unit: "{message}"},
 		"kafkax.producer.message.duration":   {kind: kindHistogram, unit: "s"},
 		"kafkax.consumer.messages.processed": {kind: kindCounter, unit: "{message}"},
 		"kafkax.consumer.message.duration":   {kind: kindHistogram, unit: "s"},
