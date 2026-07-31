@@ -239,7 +239,8 @@
 // Трассировка и транспортные метрики (соединения, байты, ошибки чтения и
 // записи) приходят из kotel по семантическим соглашениям OTel. Доменные метрики
 // пакета — с префиксом kafkax.: producer.messages.sent, producer.messages.failed,
-// producer.message.duration, consumer.messages.processed, consumer.message.duration,
+// producer.messages.rejected, producer.message.duration,
+// consumer.messages.processed, consumer.message.duration,
 // consumer.handler.retries, consumer.fetch.errors, consumer.group.errors,
 // consumer.workers.active, consumer.partitions.paused, consumer.panics,
 // consumer.commit.errors, consumer.partitions.lost, consumer.drain.timeouts.
@@ -258,6 +259,17 @@
 // (Stop, Close), пакет её НЕ логирует: иначе событие удваивалось бы в
 // журнале, — поэтому возвращённое значение нужно читать, а алерты строить по
 // счётчикам.
+//
+// Исключение ровно одно, и оно осознанное: ErrPollLoopStuck пишется в лог и
+// возвращается одновременно. Возврат сообщает вызывающему факт, но не его
+// последствие — открытый клиент, который переживёт Stop и останется в группе.
+// Это состояние процесса, а не результат вызова, и место ему в журнале.
+//
+// producer.messages.rejected считает отбраковку на входе — пустой топик,
+// негодные заголовки — и это единственная доменная метрика без атрибута topic:
+// значение приходит из PublishRequest, то есть снаружи, и серия на каждое
+// уникальное уронила бы backend метрик ровно теми запросами, которые пакет
+// отверг не глядя. Вместо topic у неё замкнутый reason.
 //
 // consumer.fetch.errors и consumer.group.errors считают эпизоды, а не опросы:
 // неретраибельную ошибку franz-go возвращает на каждом опросе заново, поэтому
