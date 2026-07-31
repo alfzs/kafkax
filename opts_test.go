@@ -79,12 +79,75 @@ func TestProducerOptsBuildValidClient(t *testing.T) {
 	if got := cl.OptValue(kgo.DialTLSConfig); got != (*tls.Config)(nil) {
 		t.Errorf("DialTLSConfig = %v, want nil", got)
 	}
+
+	// Остальные скалярные настройки продюсера: каждую из них можно было
+	// выбросить из producerOpts, не уронив ни одного теста (O26, O29 и соседи,
+	// docs/audit/09-mutation-sweep.md). Отказ при этом молчаливый — клиент
+	// берёт умолчание franz-go и работает, а написанное в конфигурации просто
+	// перестаёт значить что-либо: бюджет ответа брокера становится 10s вместо
+	// заданного, число повторов записи — фактически бесконечным.
+	//
+	// Таблицей, а не цепочкой if: два десятка ветвлений подряд упирают функцию
+	// в потолок цикломатической сложности, а проверка у всех одна.
+	checkOptValues(t, cl, []optCheck{
+		{"DialTimeout", kgo.DialTimeout, cfg.DialTimeout},
+		{"ProduceRequestTimeout", kgo.ProduceRequestTimeout, cfg.Producer.AckTimeout},
+		// recordRetries внутри franz-go — int64; умолчание там math.MaxInt64,
+		// то есть «повторять практически вечно».
+		{"RecordRetries", kgo.RecordRetries, int64(cfg.Producer.MaxRetries)},
+		{"ProducerLinger", kgo.ProducerLinger, cfg.Producer.Linger},
+		{"ProducerBatchMaxBytes", kgo.ProducerBatchMaxBytes, cfg.Producer.BatchBytes},
+	})
+
+	// Backoff отдаётся функцией, поэтому сравнивается её результат: сама
+	// constantBackoff проверена отдельно (TestConstantBackoffDoesNotGrow), а
+	// здесь проверяется, что до клиента доехала именно она, а не умолчание
+	// franz-go с экспоненциальным ростом и джиттером.
+	backoff, ok := cl.OptValue(kgo.RetryBackoffFn).(func(int) time.Duration)
+	if !ok {
+		t.Fatalf("RetryBackoffFn = %#v, ожидалась func(int) time.Duration", cl.OptValue(kgo.RetryBackoffFn))
+	}
+
+	if got := backoff(7); got != cfg.Producer.RetryBackoff {
+		t.Errorf("RetryBackoffFn(7) = %v, want %v", got, cfg.Producer.RetryBackoff)
+	}
+}
+
+// optCheck — одна сверка применённой опции клиента с настройкой конфигурации.
+type optCheck struct {
+	name string
+	// opt — сама функция-опция kgo: OptValue ищет значение по её имени.
+	opt any
+	// want — значение из конфигурации, приведённое к типу, которым его хранит
+	// franz-go.
+	want any
+}
+
+// checkOptValues сверяет применённые опции клиента с ожидаемыми значениями.
+func checkOptValues(t *testing.T, cl *kgo.Client, checks []optCheck) {
+	t.Helper()
+
+	for _, c := range checks {
+		if got := cl.OptValue(c.opt); got != c.want {
+			t.Errorf("%s = %#v, want %#v", c.name, got, c.want)
+		}
+	}
 }
 
 func TestConsumerOptsBuildValidClient(t *testing.T) {
 	t.Parallel()
 
 	cfg := testConfig(t)
+
+	// Четыре настройки тестовой конфигурации совпадают с умолчаниями franz-go,
+	// а на совпадении ассерт не значит ничего: выброси опцию из сборки — клиент
+	// вернёт ровно то же значение, и тест останется зелёным (так и выжила
+	// мутация O28, docs/audit/09-mutation-sweep.md). Поэтому здесь они
+	// переопределяются на заведомо другие.
+	cfg.Consumer.MinBytes = 3                  // franz-go: 1
+	cfg.Consumer.MaxPartitionBytes = 512 << 10 // franz-go: 1 MiB
+	cfg.Consumer.InitialOffset = OffsetLatest  // franz-go: с начала лога
+	cfg.Consumer.IsolationLevel = IsolationReadCommitted
 
 	opts, err := cfg.consumerOpts(testLogger(t), []string{testTopic}, optsNoopCallbacks())
 	if err != nil {
@@ -112,6 +175,28 @@ func TestConsumerOptsBuildValidClient(t *testing.T) {
 	if got := cl.OptValue(kgo.BlockRebalanceOnPoll); got != true {
 		t.Errorf("BlockRebalanceOnPoll = %v, want true", got)
 	}
+
+	// Скалярные настройки выборки и членства в группе. Все они переживали
+	// выбрасывание из consumerOpts зелёным набором (O28 и соседи,
+	// docs/audit/09-mutation-sweep.md): клиент подставляет умолчание franz-go и
+	// работает, а конфигурация перестаёт значить написанное — вместо 50 мс
+	// ожидания батча получается 5 с, вместо секундного heartbeat трёхсекундный,
+	// вместо заданного потолка партиции мегабайт.
+	checkOptValues(t, cl, []optCheck{
+		{"FetchMinBytes", kgo.FetchMinBytes, cfg.Consumer.MinBytes},
+		{"FetchMaxBytes", kgo.FetchMaxBytes, cfg.Consumer.MaxBytes},
+		{"FetchMaxPartitionBytes", kgo.FetchMaxPartitionBytes, cfg.Consumer.MaxPartitionBytes},
+		{"FetchMaxWait", kgo.FetchMaxWait, cfg.Consumer.MaxWait},
+		{"HeartbeatInterval", kgo.HeartbeatInterval, cfg.Consumer.HeartbeatInterval},
+		{"RebalanceTimeout", kgo.RebalanceTimeout, cfg.Consumer.RebalanceTimeout},
+		{"AutoCommitInterval", kgo.AutoCommitInterval, cfg.Consumer.CommitInterval},
+		// Маппинг имён проверяют TestInitialOffsetMapping и
+		// TestIsolationLevelMapping; здесь проверяется, что результат маппинга
+		// доехал до клиента. Уровень изоляции franz-go отдаёт сырым int8, а не
+		// kgo.IsolationLevel: 1 — read_committed, 0 — read_uncommitted.
+		{"ConsumeResetOffset", kgo.ConsumeResetOffset, kgo.NewOffset().AtEnd()},
+		{"FetchIsolationLevel", kgo.FetchIsolationLevel, int8(1)},
+	})
 }
 
 func TestCompressionCodecMapping(t *testing.T) {
