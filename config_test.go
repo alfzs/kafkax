@@ -506,9 +506,9 @@ func TestConfigValidateProducerFields(t *testing.T) {
 			want:   cfgLabel("Producer.MaxInflight") + " must be positive",
 		},
 		{
-			name:   "отрицательный max_retries",
-			mutate: func(p *ProducerConfig) { p.MaxRetries = -1 },
-			want:   cfgLabel("Producer.MaxRetries") + " must not be negative",
+			name:   "max_retries меньше -1",
+			mutate: func(p *ProducerConfig) { p.MaxRetries = -2 },
+			want:   cfgLabel("Producer.MaxRetries") + " must be -1 or greater",
 		},
 		{
 			name:   "нулевой batch_bytes",
@@ -531,6 +531,14 @@ func TestConfigValidateProducerFields(t *testing.T) {
 		{
 			name:   "нулевой max_retries допустим",
 			mutate: func(p *ProducerConfig) { p.MaxRetries = 0 },
+		},
+		{
+			// -1 — это умолчание пакета, «повторять без ограничения». Случай
+			// стоит в таблице отдельной строкой, потому что до правки оно же
+			// было единственным отвергаемым значением: перепутать границу
+			// заново дешевле, чем кажется.
+			name:   "max_retries -1 допустим",
+			mutate: func(p *ProducerConfig) { p.MaxRetries = -1 },
 		},
 		{
 			// Верхнюю границу linger franz-go проверяет, нижней у него нет:

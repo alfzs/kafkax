@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strings"
 	"time"
@@ -196,7 +197,7 @@ func (c Config) producerOpts(logger *slog.Logger) ([]kgo.Opt, error) {
 	opts = append(opts,
 		kgo.RequiredAcks(acks(c.Producer.RequiredAcks)),
 		kgo.ProduceRequestTimeout(c.Producer.AckTimeout),
-		kgo.RecordRetries(c.Producer.MaxRetries),
+		kgo.RecordRetries(recordRetries(c.Producer.MaxRetries)),
 		kgo.RecordDeliveryTimeout(c.Producer.MessageTimeout),
 		kgo.ProducerLinger(c.Producer.Linger),
 		kgo.ProducerBatchMaxBytes(c.Producer.BatchBytes),
@@ -283,6 +284,23 @@ func acks(required int) kgo.Acks {
 	default:
 		return kgo.AllISRAcks()
 	}
+}
+
+// recordRetries переводит ProducerConfig.MaxRetries в число попыток для
+// kgo.RecordRetries.
+//
+// Отрицательное значение (у нас это -1, «без ограничения») передавать в
+// kgo.RecordRetries напрямую нельзя, и ошибка была бы тихой в худшем смысле:
+// franz-go сравнивает число попыток с лимитом как batch.tries >= limit, поэтому
+// при -1 условие истинно на первой же попытке — «повторять без конца»
+// превратилось бы в «не повторять вовсе», причём молча. Умолчание самого
+// franz-go здесь — math.MaxInt64, то есть ровно этот потолок.
+func recordRetries(maxRetries int) int {
+	if maxRetries < 0 {
+		return math.MaxInt
+	}
+
+	return maxRetries
 }
 
 func compressionCodec(name string) (kgo.CompressionCodec, error) {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -874,6 +875,63 @@ func TestAcksMapping(t *testing.T) {
 				t.Errorf("acks(%d) = %+v, want %+v", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestUnlimitedRetriesReachClientAsCeiling — умолчание «повторять без
+// ограничения» доезжает до клиента потолком, а не минус единицей.
+//
+// Отказ здесь был бы тихим и обратным по смыслу: franz-go сравнивает число
+// попыток с лимитом как batch.tries >= limit, поэтому -1, переданное как есть,
+// истинно уже на первой попытке — «без конца» стало бы «ни разу», и притом
+// молча, без единой ошибки конфигурации. Умолчание пакета выбрано ради
+// сохранности подтверждённой записи при смене лидера (см. doc.go), так что
+// незамеченная инверсия стоила бы ровно того, ради чего умолчание и менялось.
+//
+// Ожидаемое взято литералом math.MaxInt, а не вызовом recordRetries: сверка с
+// той же функцией, которую проверяем, была бы зелёной при любом её содержимом.
+func TestUnlimitedRetriesReachClientAsCeiling(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		maxRetries int
+		want       int64
+	}{
+		{"без ограничения", -1, math.MaxInt64},
+		{"без повторов", 0, 0},
+		{"конечный лимит", 7, 7},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := testConfig(t, "127.0.0.1:9092")
+			cfg.Producer.MaxRetries = tc.maxRetries
+
+			opts, err := cfg.producerOpts(slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatalf("сборка опций продюсера: %v", err)
+			}
+
+			if got := optsClient(t, opts).OptValue(kgo.RecordRetries); got != tc.want {
+				t.Errorf("RecordRetries = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUnlimitedRetriesIsTheDefault — умолчание именно «без ограничения».
+//
+// Отдельно от таблицы выше: та проверяет перевод значения, эта — что значение
+// вообще такое. Литерал -1, а не DefaultConfig(): сверять умолчание с тем же
+// местом, откуда оно берётся, значит не проверять ничего.
+func TestUnlimitedRetriesIsTheDefault(t *testing.T) {
+	t.Parallel()
+
+	if got := DefaultConfig().Producer.MaxRetries; got != -1 {
+		t.Errorf("умолчание Producer.MaxRetries = %d, want -1 (без ограничения)", got)
 	}
 }
 

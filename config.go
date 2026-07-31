@@ -362,17 +362,35 @@ type ProducerConfig struct {
 	// и пять запросов в полёте безопасны.
 	MaxInflight int `yaml:"max_inflight" env:"KAFKAX_PRODUCER_MAX_INFLIGHT" env-default:"5"`
 	// MaxRetries — сколько раз повторять доставку одной записи при
-	// повторяемой ошибке брокера.
+	// повторяемой ошибке брокера:
 	//
-	// У franz-go умолчание здесь — без ограничения, и ограничение это не
-	// бесплатное. Вместе с включённой идемпотентностью конечный лимит
-	// открывает сценарий, в котором ПОДТВЕРЖДЁННАЯ запись не попадает в тему:
-	// исчерпав повторы за сотни миллисекунд перевыборов, клиент заваливает
-	// батч и отдаёт его sequence number следующей записи, а брокер отвечает на
-	// него успехом, ничего не записав. Механизм ниже kafkax, воспроизведён на
-	// голом franz-go; измерения и ссылки на исходник — в
-	// docs/audit/09-mutation-sweep.md, формулировка контракта — в doc.go.
-	MaxRetries int `yaml:"max_retries" env:"KAFKAX_PRODUCER_MAX_RETRIES" env-default:"3"`
+	//	-1 (умолчание)  повторять без ограничения
+	//	 0              не повторять вовсе
+	//	 N > 0          сделать не более N попыток
+	//
+	// Значения совпадают по смыслу с Consumer.HandlerMaxRetries, где -1 тоже
+	// означает «без конца»: заводить второй язык для той же идеи незачем.
+	//
+	// Умолчание «без ограничения» — не копия franz-go ради копии, а следствие
+	// измерения. Конечный лимит вместе с включённой идемпотентностью открывает
+	// сценарий, в котором ПОДТВЕРЖДЁННАЯ запись не попадает в тему: исчерпав
+	// повторы за сотни миллисекунд перевыборов, клиент заваливает батч и отдаёт
+	// его sequence number следующей записи, а брокер отвечает на него успехом,
+	// ничего не записав. При MaxRetries = 3 это 2 потери на 18 прогонов, при
+	// снятом лимите — 0 на 20.
+	//
+	// Полностью сценарий не закрывается ничем: батч заваливает и
+	// Producer.MessageTimeout, а переиспользование номера следует из обоих
+	// путей одинаково. Снятый лимит переносит окно с ~300 мс на MessageTimeout,
+	// то есть за пределы обычных перевыборов. Цена, ради которой лимит когда-то
+	// ставился, — быстрый отказ отправки в недоступную партицию — оказалась
+	// мнимой: при идемпотентности SendMessage и так не ограничен ни
+	// MessageTimeout, ни дедлайном ctx.
+	//
+	// Механизм лежит ниже kafkax и воспроизведён на голом franz-go; измерения
+	// и ссылки на исходник — в docs/audit/09-mutation-sweep.md, формулировка
+	// контракта — в doc.go.
+	MaxRetries int `yaml:"max_retries" env:"KAFKAX_PRODUCER_MAX_RETRIES" env-default:"-1"`
 	// AckTimeout — таймаут ожидания подтверждения записи на стороне брокера.
 	// Не путать с клиентским MessageTimeout.
 	AckTimeout time.Duration `yaml:"ack_timeout" env:"KAFKAX_PRODUCER_ACK_TIMEOUT" env-default:"5s"`
@@ -521,7 +539,7 @@ func DefaultConfig() Config {
 			RequiredAcks:       -1,
 			EnableIdempotence:  true,
 			MaxInflight:        5,
-			MaxRetries:         3,
+			MaxRetries:         -1,
 			AckTimeout:         5 * time.Second,
 			RetryBackoff:       100 * time.Millisecond,
 			Linger:             0,
@@ -763,8 +781,10 @@ func (c Config) producerErrors() []error {
 			cfgField("Producer.MaxInflight"), c.Producer.MaxInflight))
 	}
 
-	if c.Producer.MaxRetries < 0 {
-		errs = append(errs, fmt.Errorf("%s must not be negative, got %d",
+	// -1 — «без ограничения», как у Consumer.HandlerMaxRetries; всё, что ниже,
+	// смысла не имеет и почти наверняка опечатка.
+	if c.Producer.MaxRetries < -1 {
+		errs = append(errs, fmt.Errorf("%s must be -1 or greater, got %d",
 			cfgField("Producer.MaxRetries"), c.Producer.MaxRetries))
 	}
 
