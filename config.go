@@ -122,11 +122,11 @@ type Config struct {
 	// кончилась бы переполнением стека.
 	//
 	// На панику обработчика вызывается один раз на сообщение, а не на попытку:
-	// при HandlerMaxRetries = -1 второе означало бы вызов без конца.
+	// при HandlerRetries = -1 второе означало бы вызов без конца.
 	OnPanic func(ctx context.Context, site PanicSite, recovered any, stack []byte) `yaml:"-"`
 
 	// OnMessageSkipped решает судьбу сообщения, которое обработчик не осилил
-	// за HandlerMaxRetries попыток. Это единственный выход из «отравленного»
+	// за HandlerRetries попыток. Это единственный выход из «отравленного»
 	// сообщения, кроме остановки партиции.
 	//
 	// Возврат nil означает «я забрал сообщение» (записал в DLQ, в базу, в лог)
@@ -368,7 +368,7 @@ type ProducerConfig struct {
 	//	 0              не повторять вовсе
 	//	 N > 0          сделать не более N попыток
 	//
-	// Значения совпадают по смыслу с Consumer.HandlerMaxRetries, где -1 тоже
+	// Значения совпадают по смыслу с Consumer.HandlerRetries, где -1 тоже
 	// означает «без конца»: заводить второй язык для той же идеи незачем.
 	//
 	// Умолчание «без ограничения» — не копия franz-go ради копии, а следствие
@@ -482,15 +482,23 @@ type ConsumerConfig struct {
 	IsolationLevel string `yaml:"isolation_level" env:"KAFKAX_CONSUMER_ISOLATION_LEVEL" env-default:"read_committed"`
 	// MaxPollRecords — верхняя граница числа записей за один опрос.
 	MaxPollRecords int `yaml:"max_poll_records" env:"KAFKAX_CONSUMER_MAX_POLL_RECORDS" env-default:"500"`
-	// MessageQueueSize — ёмкость канала партиционного воркера в БАТЧАХ (не в
+	// MessageQueueBatches — ёмкость канала партиционного воркера в БАТЧАХ (не в
 	// записях). Определяет, насколько цикл опроса может обгонять обработку.
+	//
+	// Единица измерения вынесена в имя поля намеренно. До v3 то же поле звалось
+	// MessageQueueSize (yaml message_queue_size) и в v1 действительно считало
+	// сообщения: канал был `chan *kafka.Message` с умолчанием 1000. Здесь в
+	// канале лежат батчи целого опроса, и перенесённое из старого конфига 1000
+	// означало бы уже не тысячу сообщений, а тысячу батчей — потолок памяти
+	// вырос бы в MaxPollRecords раз. Прежний ключ отставлен и падает на старте,
+	// см. retiredKeys.
 	//
 	// Это же поле задаёт верхнюю границу памяти под непрочитанные сообщения, и
 	// граница выходит крупнее, чем кажется. Записи не копируются: Key, Value и
 	// Headers у IncomingMessage алиасят буферы franz-go и резидентны, пока батч
 	// лежит в канале. Худший случай на экземпляр —
 	//
-	//	назначенные партиции × MessageQueueSize × MaxPartitionBytes
+	//	назначенные партиции × MessageQueueBatches × MaxPartitionBytes
 	//
 	// то есть на умолчаниях (30 партиций, 100 батчей, 1 MiB) около 3 ГиБ.
 	// Байтового потолка у консьюмера нет — в отличие от продюсера, где ту же
@@ -498,15 +506,22 @@ type ConsumerConfig struct {
 	// тормозит опрос только тогда, когда память уже набрана, поэтому в
 	// развёртывании с жёстким лимитом памяти это поле считают, а не оставляют
 	// по умолчанию.
-	MessageQueueSize int `yaml:"message_queue_size" env:"KAFKAX_CONSUMER_MESSAGE_QUEUE_SIZE" env-default:"100"`
+	MessageQueueBatches int `yaml:"message_queue_batches" env:"KAFKAX_CONSUMER_MESSAGE_QUEUE_BATCHES" env-default:"100"`
 	// CommitInterval — период фоновой отправки отмеченных оффсетов.
 	// Коммитится только отмеченное (MarkCommitRecords после успешной
 	// обработки), поэтому интервал влияет на окно переобработки, но не на
 	// гарантию at-least-once.
 	CommitInterval time.Duration `yaml:"commit_interval" env:"KAFKAX_CONSUMER_COMMIT_INTERVAL" env-default:"5s"`
-	// HandlerMaxRetries — сколько раз повторять обработку сообщения при
-	// ошибке обработчика: 0 — без повторов, N — N повторов сверх первого
-	// вызова, -1 — бесконечно.
+	// HandlerRetries — сколько раз повторять обработку сообщения при ошибке
+	// обработчика: 0 — без повторов, N — N повторов сверх первого вызова,
+	// -1 — бесконечно.
+	//
+	// Смысл нуля обратный тому, что было до v3. В v1 поле звалось
+	// HandlerMaxRetries (yaml handler_max_retries), считало вызовы, а не
+	// повторы, и ноль означал «повторять бесконечно» — условием выхода из
+	// цикла было `maxRetries > 0 && attempt >= maxRetries`. Перенесённый ноль
+	// молча превратил бы вечный повтор в отсутствие повторов, поэтому прежний
+	// ключ отставлен и падает на старте, см. retiredKeys.
 	//
 	// Повторы блокируют партицию: пока сообщение повторяется, следующие
 	// сообщения этой же партиции ждут. Это цена сохранения порядка.
@@ -515,9 +530,9 @@ type ConsumerConfig struct {
 	// умолчание там — остановить партицию, а не пропустить сообщение. Полное
 	// описание политики — в документации пакета, раздел «Политика повторов»;
 	// прочитайте его перед подбором этих значений.
-	HandlerMaxRetries int `yaml:"handler_max_retries" env:"KAFKAX_CONSUMER_HANDLER_MAX_RETRIES" env-default:"0"`
+	HandlerRetries int `yaml:"handler_retries" env:"KAFKAX_CONSUMER_HANDLER_RETRIES" env-default:"0"`
 	// HandlerRetryDelay — пауза между повторами обработки. Обязателен при
-	// HandlerMaxRetries != 0.
+	// HandlerRetries != 0.
 	HandlerRetryDelay time.Duration `yaml:"handler_retry_delay" env:"KAFKAX_CONSUMER_HANDLER_RETRY_DELAY" env-default:"1s"`
 }
 
@@ -563,20 +578,20 @@ func DefaultConfig() Config {
 			FlushTimeout:       time.Minute,
 		},
 		Consumer: ConsumerConfig{
-			InitialOffset:     OffsetEarliest,
-			MinBytes:          1,
-			MaxBytes:          52428800,
-			MaxPartitionBytes: 1048576,
-			MaxWait:           500 * time.Millisecond,
-			SessionTimeout:    45 * time.Second,
-			HeartbeatInterval: 3 * time.Second,
-			RebalanceTimeout:  time.Minute,
-			IsolationLevel:    IsolationReadCommitted,
-			MaxPollRecords:    500,
-			MessageQueueSize:  100,
-			CommitInterval:    5 * time.Second,
-			HandlerMaxRetries: 0,
-			HandlerRetryDelay: time.Second,
+			InitialOffset:       OffsetEarliest,
+			MinBytes:            1,
+			MaxBytes:            52428800,
+			MaxPartitionBytes:   1048576,
+			MaxWait:             500 * time.Millisecond,
+			SessionTimeout:      45 * time.Second,
+			HeartbeatInterval:   3 * time.Second,
+			RebalanceTimeout:    time.Minute,
+			IsolationLevel:      IsolationReadCommitted,
+			MaxPollRecords:      500,
+			MessageQueueBatches: 100,
+			CommitInterval:      5 * time.Second,
+			HandlerRetries:      0,
+			HandlerRetryDelay:   time.Second,
 		},
 	}
 }
@@ -793,7 +808,7 @@ func (c Config) producerErrors() []error {
 			cfgField("Producer.MaxInflight"), c.Producer.MaxInflight))
 	}
 
-	// -1 — «без ограничения», как у Consumer.HandlerMaxRetries; всё, что ниже,
+	// -1 — «без ограничения», как у Consumer.HandlerRetries; всё, что ниже,
 	// смысла не имеет и почти наверняка опечатка.
 	if c.Producer.MaxRetries < -1 {
 		errs = append(errs, fmt.Errorf("%s must be -1 or greater, got %d",
@@ -885,9 +900,9 @@ func (c Config) consumerErrors() []error {
 	// начинает блокироваться на каждом батче, пока его не заберёт воркер.
 	// Молчаливая смена режима работы консьюмера хуже отказа: по логам она
 	// неотличима от медленного обработчика.
-	if c.Consumer.MessageQueueSize <= 0 {
+	if c.Consumer.MessageQueueBatches <= 0 {
 		errs = append(errs, fmt.Errorf("%s must be positive, got %d",
-			cfgField("Consumer.MessageQueueSize"), c.Consumer.MessageQueueSize))
+			cfgField("Consumer.MessageQueueBatches"), c.Consumer.MessageQueueBatches))
 	}
 
 	if c.Consumer.MaxPollRecords <= 0 {
@@ -965,16 +980,16 @@ func (c Config) fetchSizeErrors() []error {
 func (c Config) handlerRetryErrors() []error {
 	var errs []error
 
-	if c.Consumer.HandlerMaxRetries < -1 {
+	if c.Consumer.HandlerRetries < -1 {
 		errs = append(errs, fmt.Errorf(
 			"%s must be -1 (infinite), 0 (no retries) or positive; got %d",
-			cfgField("Consumer.HandlerMaxRetries"), c.Consumer.HandlerMaxRetries))
+			cfgField("Consumer.HandlerRetries"), c.Consumer.HandlerRetries))
 	}
 
 	// «got %v» здесь не для симметрии с соседями: ноль и отрицательная
 	// длительность — разные опечатки (забыли поле против «-1s» из шаблона), а
 	// без значения они выглядят одинаково.
-	if c.Consumer.HandlerMaxRetries != 0 && c.Consumer.HandlerRetryDelay <= 0 {
+	if c.Consumer.HandlerRetries != 0 && c.Consumer.HandlerRetryDelay <= 0 {
 		errs = append(errs, fmt.Errorf("%s must be positive when retries are enabled, got %v",
 			cfgField("Consumer.HandlerRetryDelay"), c.Consumer.HandlerRetryDelay))
 	}

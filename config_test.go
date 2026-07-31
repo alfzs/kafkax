@@ -730,9 +730,9 @@ func consumerTimingFieldCases() []consumerFieldCase {
 		{
 			// Отрицательное значение уронило бы make(chan, n) паникой уже
 			// после того, как конструктор вернул nil-ошибку.
-			name:   "отрицательный message_queue_size",
-			mutate: func(c *ConsumerConfig) { c.MessageQueueSize = -1 },
-			want:   cfgLabel("Consumer.MessageQueueSize") + " must be positive",
+			name:   "отрицательный message_queue_batches",
+			mutate: func(c *ConsumerConfig) { c.MessageQueueBatches = -1 },
+			want:   cfgLabel("Consumer.MessageQueueBatches") + " must be positive",
 		},
 		{
 			// Ноль опаснее минуса именно тем, что не падает: make(chan, 0)
@@ -740,9 +740,9 @@ func consumerTimingFieldCases() []consumerFieldCase {
 			// начинает блокироваться на каждом батче до тех пор, пока его не
 			// заберёт воркер. Это молчаливая смена режима работы консьюмера, а
 			// не отказ, и по логам она неотличима от медленного обработчика.
-			name:   "нулевой message_queue_size",
-			mutate: func(c *ConsumerConfig) { c.MessageQueueSize = 0 },
-			want:   cfgLabel("Consumer.MessageQueueSize") + " must be positive",
+			name:   "нулевой message_queue_batches",
+			mutate: func(c *ConsumerConfig) { c.MessageQueueBatches = 0 },
+			want:   cfgLabel("Consumer.MessageQueueBatches") + " must be positive",
 		},
 		{
 			name:   "нулевой max_poll_records",
@@ -765,16 +765,16 @@ func consumerTimingFieldCases() []consumerFieldCase {
 			want:   cfgLabel("Consumer.IsolationLevel") + " must be",
 		},
 		{
-			name:   "handler_max_retries меньше -1",
-			mutate: func(c *ConsumerConfig) { c.HandlerMaxRetries = -2 },
-			want:   cfgLabel("Consumer.HandlerMaxRetries") + " must be -1",
+			name:   "handler_retries меньше -1",
+			mutate: func(c *ConsumerConfig) { c.HandlerRetries = -2 },
+			want:   cfgLabel("Consumer.HandlerRetries") + " must be -1",
 		},
 		{
 			// Ретраи включены, а паузы между ними нет: партиция закрутилась бы
 			// в busy loop на первом же отравленном сообщении.
 			name: "ретраи без задержки",
 			mutate: func(c *ConsumerConfig) {
-				c.HandlerMaxRetries = 3
+				c.HandlerRetries = 3
 				c.HandlerRetryDelay = 0
 			},
 			want: cfgLabel("Consumer.HandlerRetryDelay") + " must be positive",
@@ -784,14 +784,14 @@ func consumerTimingFieldCases() []consumerFieldCase {
 			// её значило бы отвергать вполне рабочий конфиг.
 			name: "нулевая задержка без ретраев",
 			mutate: func(c *ConsumerConfig) {
-				c.HandlerMaxRetries = 0
+				c.HandlerRetries = 0
 				c.HandlerRetryDelay = 0
 			},
 		},
 		{
 			name: "бесконечные ретраи с задержкой",
 			mutate: func(c *ConsumerConfig) {
-				c.HandlerMaxRetries = -1
+				c.HandlerRetries = -1
 				c.HandlerRetryDelay = time.Second
 			},
 		},

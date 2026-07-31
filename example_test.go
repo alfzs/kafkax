@@ -122,7 +122,7 @@ func ExampleNewConsumer() {
 			HeartbeatInterval: 3 * time.Second,
 			RebalanceTimeout:  time.Minute,
 			CommitInterval:    5 * time.Second,
-			HandlerMaxRetries: 3,
+			HandlerRetries:    3,
 			HandlerRetryDelay: time.Second,
 		},
 	}

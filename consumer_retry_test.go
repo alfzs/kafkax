@@ -56,7 +56,7 @@ func consWaitTerminal(t *testing.T, rec *recordedMetrics, topic, status string, 
 	})
 }
 
-// TestHandlerNotRetriedByDefault — умолчание HandlerMaxRetries: 0 означает один
+// TestHandlerNotRetriedByDefault — умолчание HandlerRetries: 0 означает один
 // вызов, а не «повторять сколько-нибудь».
 //
 // Ноль как «без повторов» неочевиден: во многих клиентах он значит «повторять
@@ -79,7 +79,7 @@ func TestHandlerNotRetriedByDefault(t *testing.T) { //nolint:paralleltest // cap
 	consWaitTerminal(t, rec, testTopic, consumerStatusError, 1)
 
 	if got := h.callCount(); got != 1 {
-		t.Fatalf("обработчик вызван %d раз, want 1 (HandlerMaxRetries=0)", got)
+		t.Fatalf("обработчик вызван %d раз, want 1 (HandlerRetries=0)", got)
 	}
 
 	if got := rec.sum(consMetricRetries, attribute.String("topic", testTopic)); got != 0 {
@@ -96,7 +96,7 @@ func TestHandlerRetriesExhausted(t *testing.T) { //nolint:paralleltest // captur
 
 	brokers := newFakeCluster(t, 1, testTopic)
 	cfg := testConfig(t, brokers...)
-	cfg.Consumer.HandlerMaxRetries = 2
+	cfg.Consumer.HandlerRetries = 2
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, testTopic, 0, "v")
@@ -130,7 +130,7 @@ func TestHandlerSucceedsOnRetryCommitsOffset(t *testing.T) { //nolint:parallelte
 
 	brokers := newFakeCluster(t, 1, testTopic)
 	cfg := testConfig(t, brokers...)
-	cfg.Consumer.HandlerMaxRetries = 2
+	cfg.Consumer.HandlerRetries = 2
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, testTopic, 0, "flaky")
@@ -177,7 +177,7 @@ func TestRetriesBlockOwnPartition(t *testing.T) {
 	cfg := testConfig(t, brokers...)
 	// Бесконечные повторы: сообщение «a» держит партицию ровно столько, сколько
 	// нужно тесту, и не уходит в разрешение отказа само по себе.
-	cfg.Consumer.HandlerMaxRetries = -1
+	cfg.Consumer.HandlerRetries = -1
 	cfg.Consumer.HandlerRetryDelay = 10 * time.Millisecond
 
 	prod := consNewProducer(t, brokers)
@@ -233,7 +233,7 @@ func TestFailureWithoutSkipHookPausesPartition(t *testing.T) { //nolint:parallel
 	rec := captureMetrics(t)
 
 	brokers := newFakeCluster(t, 2, topic)
-	cfg := testConfig(t, brokers...) // HandlerMaxRetries=0, OnMessageSkipped=nil
+	cfg := testConfig(t, brokers...) // HandlerRetries=0, OnMessageSkipped=nil
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, "p0-poison")
@@ -524,7 +524,7 @@ func TestRetryCancelledDuringDelayDoesNotPoison(t *testing.T) { //nolint:paralle
 	// Бесконечные повторы гарантируют, что после каждого отказа обработчика
 	// управление уходит именно в паузу, а не в разрешение отказа: сценарий
 	// становится детерминированным независимо от момента отмены.
-	cfg.Consumer.HandlerMaxRetries = -1
+	cfg.Consumer.HandlerRetries = -1
 	cfg.Consumer.HandlerRetryDelay = 100 * time.Millisecond
 
 	prod := consNewProducer(t, brokers)

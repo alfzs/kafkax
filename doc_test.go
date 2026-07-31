@@ -633,10 +633,10 @@ func TestDocumentationDefaultsMatchDefaultConfig(t *testing.T) {
 	doc := docComment(t)
 
 	// «0 (умолчание) — вызвать обработчик один раз, повторов не делать»
-	// и «HandlerMaxRetries: N, OnMessageSkipped: nil … Это умолчание».
-	if def.Consumer.HandlerMaxRetries != 0 {
-		t.Errorf("HandlerMaxRetries по умолчанию = %d, а doc.go называет умолчанием 0",
-			def.Consumer.HandlerMaxRetries)
+	// и «HandlerRetries: N, OnMessageSkipped: nil … Это умолчание».
+	if def.Consumer.HandlerRetries != 0 {
+		t.Errorf("HandlerRetries по умолчанию = %d, а doc.go называет умолчанием 0",
+			def.Consumer.HandlerRetries)
 	}
 
 	if def.OnMessageSkipped != nil {

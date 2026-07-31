@@ -37,7 +37,7 @@ type workerKey struct {
 // партицию даёт параллелизм между партициями и строгий порядок внутри.
 type partitionWorker struct {
 	// records — батчи из одного опроса. Буфер ёмкостью
-	// Consumer.MessageQueueSize определяет, насколько цикл опроса может
+	// Consumer.MessageQueueBatches определяет, насколько цикл опроса может
 	// обгонять обработку; при переполнении опрос блокируется, и это и есть
 	// backpressure.
 	records chan []*kgo.Record
@@ -212,7 +212,7 @@ func (c *Consumer) worker(client *kgo.Client, key workerKey) *partitionWorker {
 
 	ctx, cancel := context.WithCancel(c.lifeCtx)
 	w := &partitionWorker{
-		records: make(chan []*kgo.Record, c.config.Consumer.MessageQueueSize),
+		records: make(chan []*kgo.Record, c.config.Consumer.MessageQueueBatches),
 		done:    make(chan struct{}),
 		cancel:  cancel,
 	}
@@ -665,7 +665,7 @@ func (c *Consumer) countMessage(ctx context.Context, topic, status string) {
 func (c *Consumer) runHandler(
 	ctx context.Context, handler ConsumerHandler, msg IncomingMessage, span trace.Span, log *recordLogger,
 ) (bool, int, error) {
-	maxRetries := c.config.Consumer.HandlerMaxRetries
+	maxRetries := c.config.Consumer.HandlerRetries
 
 	for attempt := 0; ; attempt++ {
 		err := c.callHandler(ctx, handler, msg, attempt)
@@ -706,11 +706,11 @@ func (c *Consumer) runHandler(
 // Паника превращается в обычную ошибку, чтобы сообщение прошло штатный путь
 // повторов, а воркер остался жив: до этого паника обработчика убивала воркера
 // и осиротевшая очередь целиком перепрыгивалась коммитом следующего воркера.
-// Плата — детерминированная паника повторяется HandlerMaxRetries раз.
+// Плата — детерминированная паника повторяется HandlerRetries раз.
 //
 // attempt нужен ровно для того, чтобы эта плата не стала неограниченной. Полный
 // рапорт — стек в лог, инкремент kafkax.consumer.panics, вызов OnPanic — пишется
-// только на первой попытке. При HandlerMaxRetries=-1 (конфигурация, которую
+// только на первой попытке. При HandlerRetries=-1 (конфигурация, которую
 // doc.go прямо рекомендует) повторы не кончаются никогда, и рапорт на каждой
 // давал бы бесконечный поток Error со стеком и счётчик, растущий линейно во
 // времени: «одно сообщение крутится сутки» стало бы неотличимо от «упало N

@@ -103,7 +103,7 @@ func TestBaggageReachesHandler(t *testing.T) {
 	}
 }
 
-// TestInfiniteRetriesReportPanicOnce — при HandlerMaxRetries=-1 паника
+// TestInfiniteRetriesReportPanicOnce — при HandlerRetries=-1 паника
 // обработчика рапортуется один раз на сообщение, а не один раз на попытку.
 //
 // Класс дефекта: счётчик, растущий по времени, а не по событиям. Конфигурация
@@ -130,7 +130,7 @@ func TestInfiniteRetriesReportPanicOnce(t *testing.T) {
 
 	brokers := newFakeCluster(t, 1, topic)
 	cfg := testConfig(t, brokers...)
-	cfg.Consumer.HandlerMaxRetries = -1
+	cfg.Consumer.HandlerRetries = -1
 	cfg.Consumer.HandlerRetryDelay = time.Millisecond
 	// Воркер сидит в бесконечном цикле повторов и очередь не читает: выйти он
 	// может только по жёсткой отмене, а до неё Stop ждёт весь GracefulTimeout.
@@ -231,7 +231,7 @@ func TestSkipHookSuccessLogsNoError(t *testing.T) {
 		t.Fatalf("записей уровня Error: %d, want 0 — штатный пропуск не событие уровня Error", got)
 	}
 
-	// Warn ровно один: сам пропуск. Повторов нет (HandlerMaxRetries=0), значит
+	// Warn ровно один: сам пропуск. Повторов нет (HandlerRetries=0), значит
 	// и «Handler failed, retrying» быть не должно.
 	if got := levels.of(slog.LevelWarn); got != 1 {
 		t.Fatalf("записей уровня Warn: %d, want 1 (только сам пропуск)", got)
@@ -254,7 +254,7 @@ func TestPoisonLogsSingleError(t *testing.T) {
 	brokers := newFakeCluster(t, 1, topic)
 	cfg := testConfig(t, brokers...)
 	cfg.Logger = slog.New(&levelCountHandler{inner: cfg.Logger.Handler(), count: levels})
-	cfg.Consumer.HandlerMaxRetries = 2
+	cfg.Consumer.HandlerRetries = 2
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, "boom")

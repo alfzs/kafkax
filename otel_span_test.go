@@ -105,7 +105,7 @@ func TestProcessSpanRecordsHandlerFailureOnce(t *testing.T) {
 
 	brokers := newFakeCluster(t, 1, topic)
 	cfg := testConfig(t, brokers...)
-	cfg.Consumer.HandlerMaxRetries = 2
+	cfg.Consumer.HandlerRetries = 2
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, "boom")
@@ -167,7 +167,7 @@ func TestProcessSpanRecordsHandlerPanicOnce(t *testing.T) {
 
 	brokers := newFakeCluster(t, 1, topic)
 	cfg := testConfig(t, brokers...)
-	cfg.Consumer.HandlerMaxRetries = 1
+	cfg.Consumer.HandlerRetries = 1
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, "boom")

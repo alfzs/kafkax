@@ -306,7 +306,7 @@ func TestPoisonStopsFetchingFromPausedPartition(t *testing.T) { //nolint:paralle
 	// воркера до паузы, тем резче разница между «выбросили набранное» и
 	// «вычитали хвост».
 	cfg.Consumer.MaxPollRecords = 1
-	cfg.Consumer.MessageQueueSize = 1
+	cfg.Consumer.MessageQueueBatches = 1
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, consPoisonValue)
