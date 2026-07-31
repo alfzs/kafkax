@@ -391,7 +391,9 @@ var v1YAMLKeys = []string{
 	// clientid, а не client_id: у поля ClientID в v1 не было тега yaml, и
 	// yaml.v3 берёт имя поля в нижнем регистре, без подчёркиваний.
 	"brokers", "clientid", "graceful_timeout", "security_protocol",
-	"sasl.mechanism",
+	// username и password в v1 тегов yaml не имели, как и ClientID; ключами
+	// служили имена полей в нижнем регистре, и с тегами v3 они совпали.
+	"sasl.mechanism", "sasl.username", "sasl.password",
 	"tls.ca_cert_path", "tls.client_cert_path", "tls.client_key_path",
 	"tls.identification_algorithm", "tls.insecure_skip_verify",
 	"producer.ack_timeout", "producer.batch_bytes", "producer.batch_size",
