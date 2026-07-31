@@ -3,6 +3,7 @@ package kafkax
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -233,7 +234,15 @@ func TestFailureWithoutSkipHookPausesPartition(t *testing.T) { //nolint:parallel
 	rec := captureMetrics(t)
 
 	brokers := newFakeCluster(t, 2, topic)
-	cfg := testConfig(t, brokers...) // HandlerRetries=0, OnMessageSkipped=nil
+	cfg := testConfig(t, brokers...) // HandlerRetries=0, хука WithSkipHook нет
+
+	// Значение reason — контракт наблюдаемости, а не украшение записи: по нему
+	// отличают «хук не настроен» от «хук отказался», и алерт на первое строится
+	// именно по нему. Литералом, потому что сверять его с той же строкой из
+	// consumer_worker.go значило бы не проверять ничего: до этого ассерта обе
+	// причины можно было переписать, не уронив ни одного теста.
+	errs := &errorLog{}
+	logger := WithLogger(slog.New(&errorLogHandler{inner: testLogger(t).Handler(), log: errs}))
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, "p0-poison")
@@ -248,7 +257,7 @@ func TestFailureWithoutSkipHookPausesPartition(t *testing.T) { //nolint:parallel
 		return nil
 	}}
 
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, logger)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 
@@ -256,6 +265,8 @@ func TestFailureWithoutSkipHookPausesPartition(t *testing.T) { //nolint:parallel
 	waitFor(t, consWait, "соседняя партиция обработана", func() bool {
 		return consHasValue(h.messages(), "p1-first")
 	})
+
+	consRequireReason(t, errs, "no skip hook is configured")
 
 	// Контрольное сообщение: соседняя партиция обязана продолжать принимать
 	// новое — отравленное сообщение останавливает свою партицию, а не консьюмер
@@ -400,6 +411,11 @@ func TestSkipHookErrorPausesPartition(t *testing.T) { //nolint:paralleltest // c
 		return errors.New("dlq unavailable")
 	})
 
+	// Второе значение той же пары; см. пояснение в
+	// TestFailureWithoutSkipHookPausesPartition.
+	errs := &errorLog{}
+	logger := WithLogger(slog.New(&errorLogHandler{inner: testLogger(t).Handler(), log: errs}))
+
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, consPoisonValue)
 	prod.send(t, topic, 0, "next")
@@ -412,11 +428,12 @@ func TestSkipHookErrorPausesPartition(t *testing.T) { //nolint:paralleltest // c
 		return nil
 	}}
 
-	c := mustConsumer(t, cfg, skipHook)
+	c := mustConsumer(t, cfg, skipHook, logger)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 
 	consWaitTerminal(t, rec, topic, consumerStatusError, 1)
+	consRequireReason(t, errs, "the skip hook refused the message")
 
 	// Контрольное сообщение в здоровую партицию: оно отправлено позже «next» и
 	// доехало, значит у «next» время было.
@@ -578,5 +595,28 @@ func TestRetryCancelledDuringDelayDoesNotPoison(t *testing.T) { //nolint:paralle
 	want := []string{"stuck", consMarkerValue}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("свежий консьюмер получил %v, want %v", got, want)
+	}
+}
+
+// consRequireReason — среди записей уровня Error есть ровно одна с заданной
+// причиной.
+//
+// Отдельным хелпером, потому что проверок таких две и обе про одно: значение
+// reason различает ветки разрешения отказа, и по нему строят алерты. Ожидаемое
+// приходит литералом из теста, а не из consumer_worker.go.
+func consRequireReason(t *testing.T, errs *errorLog, want string) {
+	t.Helper()
+
+	var found int
+
+	entries := errs.snapshot()
+	for _, entry := range entries {
+		if entry.attrs["reason"] == want {
+			found++
+		}
+	}
+
+	if found != 1 {
+		t.Fatalf("записей с reason=%q: %d, want 1; все записи Error: %v", want, found, entries)
 	}
 }

@@ -48,12 +48,12 @@ var (
 	ErrDeliveryFailed = errors.New("kafkax: delivery failed")
 
 	// ErrHandlerPanic — запаниковал чужой код на пути сообщения:
-	// ConsumerHandler.ProcessMessage либо хук Config.OnMessageSkipped. Паника
+	// ConsumerHandler.ProcessMessage либо хук WithSkipHook. Паника
 	// перехватывается и превращается в обычную ошибку, чтобы сообщение прошло
 	// штатный путь ретраев и коммита, а воркер партиции остался жив; паника
 	// хука при этом означает отказ забрать сообщение, то есть отравление
 	// партиции. Значение recover() развёрнуто в тексте ошибки, у хука — за
-	// префиксом «calling OnMessageSkipped».
+	// префиксом «calling the skip hook».
 	ErrHandlerPanic = errors.New("kafkax: handler panic")
 
 	// ErrConsumerClosed — консьюмер остановлен навсегда: Stop вызван или идёт

@@ -88,7 +88,7 @@ var retiredKeys = []retiredKey{
 		yamlPath: []string{"security_protocol"},
 		env:      "KAFKAX_SECURITY_PROTOCOL",
 		change: "retired without a replacement: v3 derives the protocol from the settings themselves " +
-			"instead of naming it, so TLS is on when the tls section (or Config.TLSConfig) is filled " +
+			"instead of naming it, so TLS is on when the tls section (or the WithTLSConfig option) is filled " +
 			"and SASL is on when sasl.mechanism is set. Carrying this key over is the dangerous case: " +
 			"a config that said SASL_SSL but has no tls section connects in PLAINTEXT, and nothing " +
 			"reports it. Fill the tls and sasl sections to state the same intent",

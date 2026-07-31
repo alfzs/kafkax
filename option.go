@@ -36,7 +36,7 @@ import (
 type PanicHook func(ctx context.Context, site PanicSite, recovered any, stack []byte)
 
 // SkipHook решает судьбу сообщения, которое обработчик не осилил за
-// Consumer.HandlerMaxRetries попыток. Это единственный выход из «отравленного»
+// Consumer.HandlerRetries попыток. Это единственный выход из «отравленного»
 // сообщения, кроме остановки партиции.
 //
 // Возврат nil означает «я забрал сообщение» (записал в DLQ, в базу, в лог) —
@@ -308,7 +308,7 @@ func WithPanicHook(hook PanicHook) Option {
 }
 
 // WithSkipHook задаёт SkipHook — судьбу сообщения, которое обработчик не осилил
-// за Consumer.HandlerMaxRetries попыток.
+// за Consumer.HandlerRetries попыток.
 //
 // Только для консьюмера: у продюсера нет ни обработчиков, ни повторов, ни
 // отравленных сообщений. NewProducer с этой опцией возвращает ошибку

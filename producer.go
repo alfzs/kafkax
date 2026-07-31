@@ -184,7 +184,7 @@ func NewProducer(config Config, opts ...Option) (*Producer, error) {
 // kafkax.producer.message.duration меряет SendMessage целиком, а не запрос.
 //
 // Счётчика kafkax.producer.panics здесь нет: собственных горутин у продюсера
-// не заведено, восстанавливать паники негде и не из чего. Config.OnPanic
+// не заведено, восстанавливать паники негде и не из чего. хук WithPanicHook
 // вызывается только консьюмером.
 func (p *Producer) initMetrics(meter metric.Meter) error {
 	reg := &instrumentRegistry{}

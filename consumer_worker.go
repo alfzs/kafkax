@@ -51,7 +51,7 @@ type partitionWorker struct {
 	stopOnce sync.Once
 
 	// poisoned означает, что запись в этой партиции не удалось ни обработать,
-	// ни отдать в OnMessageSkipped, и её оффсет не отмечен.
+	// ни отдать хуку WithSkipHook, и её оффсет не отмечен.
 	//
 	// Флаг обязателен, а не декоративен: MarkCommitRecords отмечает оффсет, а
 	// не сообщение, поэтому отметка любой ПОСЛЕДУЮЩЕЙ записи сдвинула бы
@@ -490,7 +490,7 @@ func (c *Consumer) resolveFailure(
 	if c.behavior.skipHook == nil {
 		c.poison(client, key, w, log, cause,
 			slog.Int("attempts", attempts),
-			slog.String("reason", "no OnMessageSkipped hook is configured"))
+			slog.String("reason", "no skip hook is configured"))
 
 		return consumerStatusError
 	}
@@ -498,7 +498,7 @@ func (c *Consumer) resolveFailure(
 	if hookErr := c.callSkipHook(ctx, msg, cause); hookErr != nil {
 		c.poison(client, key, w, log, cause,
 			slog.Int("attempts", attempts),
-			slog.String("reason", "OnMessageSkipped refused the message"),
+			slog.String("reason", "the skip hook refused the message"),
 			slog.Any("hook_error", hookErr))
 
 		return consumerStatusError
@@ -530,7 +530,7 @@ func (c *Consumer) callSkipHook(ctx context.Context, msg IncomingMessage, cause 
 			// уходит в отдельную запись репортера, а в hook_error, который
 			// resolveFailure кладёт рядом с решением отравить партицию,
 			// приезжает голый сентинел, одинаковый на любую причину.
-			err = fmt.Errorf("calling OnMessageSkipped: %w: %v", ErrHandlerPanic, r)
+			err = fmt.Errorf("calling the skip hook: %w: %v", ErrHandlerPanic, r)
 		}
 	}()
 
