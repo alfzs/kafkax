@@ -21,11 +21,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -246,11 +246,17 @@ func requireRoundTrip(t *testing.T, cfg kafkax.Config, topic, value string) {
 //   - запись НЕ доставлена — это и есть свойство безопасности; положительный
 //     контроль («свой корень доставляет») стоит в соседнем подтесте, иначе
 //     зелёный отказ был бы неотличим от неработающего сценария;
-//   - причина названа в самой ошибке. franz-go доносит последнюю ошибку
-//     попытки внутрь таймаута доставки («last err: unable to dial: tls: …»),
-//     поэтому вызывающий по-прежнему узнаёт про сертификат, а не только про
-//     истёкший бюджет. Без этой проверки тест зеленел бы и на брокере, который
-//     просто молчит.
+//
+//   - причина названа в журнале клиента. Свидетель именно журнал, а не текст
+//     ошибки, и выбран он не сразу: сначала проверялась ошибка, и тест замигал
+//     — один отказ на несколько прогонов. franz-go вкладывает последнюю ошибку
+//     попытки внутрь таймаута доставки («last err: unable to dial: tls: …») не
+//     всегда, иногда возвращая голый «context deadline exceeded». В журнал же
+//     причина попадает каждый раз, записью WARN на каждую попытку соединения.
+//     Ищется она при этом методом mentions, а не contains: franz-go держит её
+//     в атрибуте err, а сообщение записи неизменно.
+//
+//     Без этой проверки тест зеленел бы и на брокере, который просто молчит.
 //
 // Бюджет доставки берётся скромный: ждать здесь нечего, весь смысл в том, что
 // он исчерпается.
@@ -259,7 +265,11 @@ func requireNeverDelivered(t *testing.T, cfg kafkax.Config, topic, wantReason st
 
 	cfg.Producer.MessageTimeout = rejectBudget
 
-	producer, err := kafkax.NewProducer(cfg, testOptions(t)...)
+	// Логгер подменяется соглядатаем, а не берётся из testOptions: причина
+	// отказа проверяется именно по журналу, см. выше.
+	spy := newLogSpy(t)
+
+	producer, err := kafkax.NewProducer(cfg, kafkax.WithLogger(slog.New(spy)))
 	if err != nil {
 		t.Fatalf("NewProducer: %v", err)
 	}
@@ -282,8 +292,9 @@ func requireNeverDelivered(t *testing.T, cfg kafkax.Config, topic, wantReason st
 
 	t.Logf("отказ за %s: %v", elapsed, err)
 
-	if !strings.Contains(err.Error(), wantReason) {
-		t.Fatalf("в ошибке нет %q, по ней причину не установить: %v", wantReason, err)
+	if !spy.mentions(wantReason) {
+		t.Fatalf("в журнале клиента нет %q, причину отказа по нему не установить; ошибка отправки: %v",
+			wantReason, err)
 	}
 }
 

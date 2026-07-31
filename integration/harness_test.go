@@ -566,6 +566,29 @@ func (h *logSpy) snapshot() []logSpyEntry {
 	return append([]logSpyEntry(nil), h.store.entries...)
 }
 
+// mentions сообщает, встречалась ли подстрока в тексте записи ИЛИ в значении
+// любого её атрибута.
+//
+// Отдельно от contains, потому что искать причину только в тексте недостаточно:
+// franz-go кладёт её в атрибут err, а в самом сообщении держит неизменное
+// «unable to open connection to broker». Проверка по тексту такую запись не
+// увидит и объявит журнал молчащим, хотя причина в нём есть.
+func (h *logSpy) mentions(substring string) bool {
+	for _, entry := range h.snapshot() {
+		if strings.Contains(entry.message, substring) {
+			return true
+		}
+
+		for _, value := range entry.attrs {
+			if strings.Contains(value, substring) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // contains сообщает, встречалась ли запись с подстрокой в тексте.
 func (h *logSpy) contains(substring string) bool {
 	for _, entry := range h.snapshot() {
