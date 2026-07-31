@@ -2,6 +2,7 @@ package kafkax
 
 import (
 	"context"
+	"maps"
 	"sync"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -33,6 +34,25 @@ type histogramRecord struct {
 	attrs attribute.Set
 }
 
+// instrumentInfo — вид инструмента и его единица измерения, снятые в момент
+// регистрации.
+//
+// И то и другое — часть контракта наблюдаемости наравне с именем: гейдж,
+// ставший счётчиком, ломает алерт «стоит хотя бы одна партиция», а
+// длительность, объявленная не в секундах, разъезжается с границами бакетов.
+// Ни того ни другого не видно по вызовам Add/Record, поэтому снимается здесь.
+type instrumentInfo struct {
+	kind string
+	unit string
+}
+
+// Виды инструментов OTel, которые заводит пакет.
+const (
+	kindCounter       = "Int64Counter"
+	kindUpDownCounter = "Int64UpDownCounter"
+	kindHistogram     = "Float64Histogram"
+)
+
 // recordedMetrics — потокобезопасный журнал вызовов Add/Record: инструменты
 // дёргаются из горутин воркеров, а проверяет их тест из своей.
 type recordedMetrics struct {
@@ -44,6 +64,29 @@ type recordedMetrics struct {
 	// Опции инструмента иначе нигде не видны: значения Record о разметке
 	// ничего не говорят, а до реального SDK они не доезжают вовсе.
 	buckets map[string][]float64
+
+	// instruments — все зарегистрированные инструменты по именам.
+	instruments map[string]instrumentInfo
+}
+
+// noteInstrument запоминает факт регистрации инструмента.
+func (r *recordedMetrics) noteInstrument(name, kind, unit string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.instruments == nil {
+		r.instruments = make(map[string]instrumentInfo)
+	}
+
+	r.instruments[name] = instrumentInfo{kind: kind, unit: unit}
+}
+
+// registered возвращает снимок зарегистрированных инструментов.
+func (r *recordedMetrics) registered() map[string]instrumentInfo {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return maps.Clone(r.instruments)
 }
 
 func (r *recordedMetrics) recordAdd(name string, value int64, attrs attribute.Set) {
@@ -127,7 +170,11 @@ type recordingMeter struct {
 	rec *recordedMetrics
 }
 
-func (m recordingMeter) Int64Counter(name string, _ ...metric.Int64CounterOption) (metric.Int64Counter, error) {
+func (m recordingMeter) Int64Counter(
+	name string, opts ...metric.Int64CounterOption,
+) (metric.Int64Counter, error) {
+	m.rec.noteInstrument(name, kindCounter, metric.NewInt64CounterConfig(opts...).Unit())
+
 	return recordingCounter{rec: m.rec, name: name}, nil
 }
 
@@ -137,14 +184,20 @@ func (m recordingMeter) Int64Counter(name string, _ ...metric.Int64CounterOption
 // дельт, которую sum и считает; отрицательные дельты складываются наравне с
 // положительными.
 func (m recordingMeter) Int64UpDownCounter(
-	name string, _ ...metric.Int64UpDownCounterOption,
+	name string, opts ...metric.Int64UpDownCounterOption,
 ) (metric.Int64UpDownCounter, error) {
+	m.rec.noteInstrument(name, kindUpDownCounter, metric.NewInt64UpDownCounterConfig(opts...).Unit())
+
 	return recordingUpDownCounter{rec: m.rec, name: name}, nil
 }
 
 func (m recordingMeter) Float64Histogram(
 	name string, opts ...metric.Float64HistogramOption,
 ) (metric.Float64Histogram, error) {
+	cfg := metric.NewFloat64HistogramConfig(opts...)
+
+	m.rec.noteInstrument(name, kindHistogram, cfg.Unit())
+
 	m.rec.mu.Lock()
 	defer m.rec.mu.Unlock()
 
@@ -152,7 +205,7 @@ func (m recordingMeter) Float64Histogram(
 		m.rec.buckets = make(map[string][]float64)
 	}
 
-	m.rec.buckets[name] = metric.NewFloat64HistogramConfig(opts...).ExplicitBucketBoundaries()
+	m.rec.buckets[name] = cfg.ExplicitBucketBoundaries()
 
 	return recordingHistogram{rec: m.rec, name: name}, nil
 }
