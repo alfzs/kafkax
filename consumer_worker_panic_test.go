@@ -160,7 +160,7 @@ func TestDeadPartitionWorkerDoesNotStallPollLoop(t *testing.T) {
 	// Одна ячейка очереди: с умолчанием в шестнадцать батчей переполнить её
 	// двумя записями нельзя, и dispatch до выбора между полной очередью и
 	// мёртвым воркером просто не дошёл бы.
-	cfg.Consumer.MessageQueueSize = 1
+	cfg.Consumer.MessageQueueBatches = 1
 
 	sites := &consTrace{}
 	cfg.OnPanic = func(_ context.Context, site PanicSite, _ any, _ []byte) {
@@ -270,7 +270,7 @@ func TestShutdownUnblocksDispatchStuckOnFullQueue(t *testing.T) {
 	// своей очереди уже внутри воркера, и жёсткая отмена обязана оборвать разбор
 	// на ней — иначе Stop по истечении бюджета всё равно ждал бы обработки.
 	cfg.Consumer.MaxPollRecords = 2
-	cfg.Consumer.MessageQueueSize = 1
+	cfg.Consumer.MessageQueueBatches = 1
 	// Воркер висит в обработчике до жёсткой отмены, и ровно GracefulTimeout
 	// занимает его ожидание внутри Stop. Умолчание теста растянуло бы остановку
 	// на пять секунд без всякой пользы для сценария.
@@ -321,7 +321,7 @@ func TestShutdownUnblocksDispatchStuckOnFullQueue(t *testing.T) {
 //
 // Различие не косметическое. Паника обвязки отравляет партицию немедленно и
 // рапортуется как site=process_message; паника из цепочки middleware проходит
-// политику повторов, повторяется HandlerMaxRetries+1 раз и рапортуется как
+// политику повторов, повторяется HandlerRetries+1 раз и рапортуется как
 // site=handler. Причина — в AddHandler: Chain сворачивает цепочку в один
 // обработчик ещё при регистрации, и вся она исполняется под recover'ом
 // callHandler, где бы внутри неё паника ни случилась — до вызова next или после.
@@ -332,7 +332,7 @@ func TestShutdownUnblocksDispatchStuckOnFullQueue(t *testing.T) {
 //
 // Второй закрепляемый здесь контракт — счёт. Попыток две, рапорт один: полный
 // рапорт о панике (стек, инкремент panics, вызов OnPanic) пишется только на
-// первой попытке. Иначе при HandlerMaxRetries=-1 счётчик рос бы линейно во
+// первой попытке. Иначе при HandlerRetries=-1 счётчик рос бы линейно во
 // времени и «одно сообщение крутится сутки» стало бы неотличимо от «упало N
 // разных сообщений». Что повтор всё-таки был, видно по метрике handler.retries
 // и по записи Warn — они и проверяются ниже вместе со счётчиком паник.
@@ -345,7 +345,7 @@ func TestMiddlewarePanicIsReportedAsHandlerPanic(t *testing.T) {
 
 	brokers := newFakeCluster(t, 1, topic)
 	cfg := testConfig(t, brokers...)
-	cfg.Consumer.HandlerMaxRetries = 1
+	cfg.Consumer.HandlerRetries = 1
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, consPoisonValue)

@@ -65,7 +65,7 @@ func TestMessageBuffersOutliveHandlerAndAreShared(t *testing.T) {
 
 	// Один повтор: сравнивать адреса между попытками имеет смысл только если
 	// попыток больше одной.
-	cfg.Consumer.HandlerMaxRetries = 1
+	cfg.Consumer.HandlerRetries = 1
 
 	hook := &sliceRecorder{}
 	cfg.OnMessageSkipped = func(_ context.Context, msg IncomingMessage, _ error) error {

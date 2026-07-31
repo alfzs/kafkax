@@ -44,7 +44,7 @@ import (
 //     случиться, но его держит поллер». Он и есть доказательство, что гейт в
 //     руках у застрявшего dispatch, а не гипотеза о нём.
 //
-// MessageQueueSize здесь рабочий параметр, а не строка конфига: одна ячейка при
+// MessageQueueBatches здесь рабочий параметр, а не строка конфига: одна ячейка при
 // одном батче в опросе — минимальная конструкция, в которой третья запись
 // упирается в полную очередь (первая у воркера, вторая в ячейке). С умолчанием
 // в шестнадцать батчей все три улеглись бы в очередь, dispatch не встал бы, и
@@ -72,7 +72,7 @@ func TestBackpressureOnLiveWorkerKeepsConsumerInGroup(t *testing.T) {
 	// ячейку очереди, и второй отправки — той самой, что упирается в занятого
 	// воркера, — не случилось бы вовсе.
 	cfg.Consumer.MaxPollRecords = 1
-	cfg.Consumer.MessageQueueSize = 1
+	cfg.Consumer.MessageQueueBatches = 1
 	cfg.ExtraOpts = []kgo.Opt{
 		kgo.WithHooks(watch),
 		kgo.OnPartitionsCallbackBlocked(func(context.Context, *kgo.Client) { blocked.Add(1) }),

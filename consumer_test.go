@@ -171,7 +171,7 @@ func consDrainFresh(t *testing.T, cfg Config, prod *consProducer, topic string, 
 	fresh := cfg
 	fresh.OnMessageSkipped = nil
 	fresh.OnPanic = nil
-	fresh.Consumer.HandlerMaxRetries = 0
+	fresh.Consumer.HandlerRetries = 0
 
 	h := &mockHandler{}
 	c := mustConsumer(t, fresh)
