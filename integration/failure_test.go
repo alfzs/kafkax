@@ -15,8 +15,6 @@ package integration
 import (
 	"context"
 	"errors"
-	"fmt"
-	"net"
 	"os"
 	"strconv"
 	"sync"
@@ -512,42 +510,6 @@ func dedicatedBroker(t *testing.T) (*tckafka.KafkaContainer, []string) {
 	return broker, []string{"127.0.0.1:" + port}
 }
 
-// freeHostPort отдаёт заведомо свободный номер порта.
-//
-// Окно между освобождением порта и привязкой его контейнером открыто, и
-// закрывается оно только вместе с возможностью закрепить порт вообще: docker
-// умеет принимать номер, но не умеет принимать уже открытый сокет. Константа в
-// исходнике сталкивалась бы с чужим процессом несравнимо чаще.
-//
-// Окно шире, чем кажется, и это стоит помнить при разборе отказа. Оно
-// открывается не один раз, а на каждом `docker start`, в том числе на том, что
-// делает сам сценарий; номер приходит из эфемерного диапазона ядра, из которого
-// одновременно раздаются и исходящие порты — а во время аварии клиенты под
-// тестом переподключаются к localhost непрерывно. Отказ этого рода приходит
-// внятной ошибкой docker'а («port is already allocated») из dedicatedBroker или
-// startBroker и на утверждения теста не влияет.
-func freeHostPort(t *testing.T) int {
-	t.Helper()
-
-	var lc net.ListenConfig
-
-	listener, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("выбор свободного порта: %v", err)
-	}
-
-	addr, ok := listener.Addr().(*net.TCPAddr)
-	if !ok {
-		t.Fatalf("неожиданный тип адреса %T", listener.Addr())
-	}
-
-	if err := listener.Close(); err != nil {
-		t.Fatalf("освобождение порта: %v", err)
-	}
-
-	return addr.Port
-}
-
 func stopBroker(t *testing.T, broker *tckafka.KafkaContainer) {
 	t.Helper()
 
@@ -596,114 +558,6 @@ func brokerReachable(t *testing.T, admin *kadm.Client) bool {
 	_, err := admin.Metadata(ctx)
 
 	return err == nil
-}
-
-// loadRunner — фоновая отправка, идущая через всю аварию.
-//
-// Нужна ровно за тем, чтобы перезапуск случился под нагрузкой, а не на
-// простаивающем клиенте: продюсер с непустым буфером и консьюмер с непустой
-// очередью переживают обрыв иначе, чем бездействующие.
-type loadRunner struct {
-	stopOnce sync.Once
-	stopCh   chan struct{}
-	done     chan struct{}
-
-	// acked — число подтверждённых брокером отправок. Пишется горутиной
-	// нагрузки, читается после закрытия done, поэтому без синхронизации.
-	acked int
-}
-
-// stop останавливает нагрузку и дожидается её выхода, возвращая число
-// подтверждённых отправок. Идемпотентен: зовётся и из теста, и из Cleanup.
-func (l *loadRunner) stop() int {
-	l.stopOnce.Do(func() { close(l.stopCh) })
-	<-l.done
-
-	return l.acked
-}
-
-func startLoad(t *testing.T, producer *kafkax.Producer, topic string) *loadRunner {
-	t.Helper()
-
-	load := &loadRunner{stopCh: make(chan struct{}), done: make(chan struct{})}
-
-	go func() {
-		defer close(load.done)
-
-		// Пауза между отправками — регулятор темпа, а не часть доказательства:
-		// на исправном брокере нагрузка иначе наливает десятки тысяч записей
-		// за время подъёма контейнера, и вычитывание темы в конце теста
-		// становится дороже самого сценария.
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-
-		for n := 0; ; n++ {
-			select {
-			case <-load.stopCh:
-				return
-			case <-ticker.C:
-			}
-
-			// Отказ отправки здесь штатен: часть попыток приходится ровно на
-			// то время, когда брокера нет. Учитываются только подтверждённые.
-			err := producer.SendMessage(t.Context(), kafkax.PublishRequest{
-				Topic: topic,
-				Value: []byte(fmt.Sprintf("load-%d", n)),
-			})
-			if err == nil {
-				load.acked++
-			}
-		}
-	}()
-
-	t.Cleanup(func() { load.stop() })
-
-	return load
-}
-
-// readTopic вычитывает тему целиком мимо групп: это список того, что брокер
-// действительно сохранил, в отличие от списка того, что тест пытался отправить.
-func readTopic(t *testing.T, seeds []string, topic string) []string {
-	t.Helper()
-
-	ctx, cancel := context.WithTimeout(context.Background(), waitFor)
-	defer cancel()
-
-	ends, err := newAdminAt(t, seeds).ListEndOffsets(ctx, topic)
-	if err != nil {
-		t.Fatalf("границы темы %s: %v", topic, err)
-	}
-
-	if err := ends.Error(); err != nil {
-		t.Fatalf("границы темы %s: %v", topic, err)
-	}
-
-	var total int64
-
-	ends.Each(func(offset kadm.ListedOffset) { total += offset.Offset })
-
-	if total == 0 {
-		return nil
-	}
-
-	client := rawClient(t, seeds,
-		kgo.ConsumeTopics(topic),
-		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))
-
-	values := make([]string, 0, total)
-
-	for int64(len(values)) < total {
-		fetches := client.PollFetches(ctx)
-		if err := fetches.Err(); err != nil {
-			t.Fatalf("чтение темы %s: %v", topic, err)
-		}
-
-		fetches.EachRecord(func(rec *kgo.Record) {
-			values = append(values, string(rec.Value))
-		})
-	}
-
-	return values
 }
 
 // produceToPartition кладёт значения в ЗАДАННУЮ партицию.

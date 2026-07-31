@@ -52,7 +52,7 @@ func TestAcksZeroDoesNotWaitForBroker(t *testing.T) {
 
 		// Тема требует двух реплик в ISR, а реплика одна: acks=-1 здесь
 		// невыполним, а acks=0 брокера ни о чём не спрашивает.
-		topic := newTopicWith(t, 1, minISRConfig())
+		topic := newTopicWith(t, 1, minISRConfig(2))
 		producer := openProducer(t, roleConfig(t, cfg))
 
 		publishValues(t, producer, topic, "a0-first", "a0-second")
@@ -99,7 +99,7 @@ func TestAcksLeaderWaitsForLeaderOnly(t *testing.T) {
 
 		// Та же тема с недостижимым min.insync.replicas: acks=1 обязан
 		// пройти по ней, acks=-1 — нет.
-		topic := newTopicWith(t, 1, minISRConfig())
+		topic := newTopicWith(t, 1, minISRConfig(2))
 		roundTrip := roleConfig(t, cfg)
 		producer := openProducer(t, roundTrip)
 
@@ -154,12 +154,6 @@ func roleConfig(t *testing.T, cfg kafkax.Config) kafkax.Config {
 	cfg.Consumer.Group = newGroup(t)
 
 	return cfg
-}
-
-// minISRConfig — тема, на которой acks=-1 невыполним: две реплики в ISR при
-// одной существующей.
-func minISRConfig() map[string]*string {
-	return map[string]*string{"min.insync.replicas": new("2")}
 }
 
 // oversizeConfig — тема, которая отвергает запись размером с oversizedValue.
