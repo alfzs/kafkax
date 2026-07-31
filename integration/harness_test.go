@@ -145,6 +145,22 @@ func newTopic(t *testing.T, partitions int32) string {
 	return topic
 }
 
+// newTopicWith — то же, но с настройками уровня темы.
+//
+// Настройки темы — единственный способ заставить одиночного брокера повести
+// себя как кластер под нагрузкой: min.insync.replicas=2 при RF=1 делает
+// acks=-1 невыполнимым, не поднимая второй брокер, а max.message.bytes даёт
+// отказ, который acks=0 обязан не заметить. Оба сценария проверяют настройку
+// продюсера, а не брокера, поэтому и живут на общем брокере набора.
+func newTopicWith(t *testing.T, partitions int32, configs map[string]*string) string {
+	t.Helper()
+
+	topic := topicName(t)
+	createTopicWith(t, newAdmin(t), topic, partitions, 1, configs)
+
+	return topic
+}
+
 // topicName отдаёт имя темы, уникальное для теста. Отдельно от newTopic ради
 // сценариев со своим брокером: имя им нужно раньше, чем появляется админ, через
 // которого тему можно создать.
@@ -158,7 +174,25 @@ func topicName(t *testing.T) string {
 func createTopic(t *testing.T, admin *kadm.Client, topic string, partitions int32) {
 	t.Helper()
 
-	resp, err := admin.CreateTopics(t.Context(), partitions, 1, nil, topic)
+	createTopicWith(t, admin, topic, partitions, 1, nil)
+}
+
+// createTopicWith — то же с фактором репликации и настройками уровня темы.
+//
+// Отдельной функцией, а не двумя лишними аргументами у createTopic: RF=1 без
+// настроек — умолчание всего набора, и таскать его по трём десяткам вызовов
+// значило бы прятать редкий случай среди частого.
+func createTopicWith(
+	t *testing.T,
+	admin *kadm.Client,
+	topic string,
+	partitions int32,
+	replication int16,
+	configs map[string]*string,
+) {
+	t.Helper()
+
+	resp, err := admin.CreateTopics(t.Context(), partitions, replication, configs, topic)
 	if err != nil {
 		t.Fatalf("создание темы %s: %v", topic, err)
 	}
