@@ -29,7 +29,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alfzs/kafkax/v2"
+	"github.com/alfzs/kafkax/v3"
 	"github.com/testcontainers/testcontainers-go"
 	tckafka "github.com/testcontainers/testcontainers-go/modules/kafka"
 	"github.com/twmb/franz-go/pkg/kadm"

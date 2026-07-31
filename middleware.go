@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/alfzs/kafkax/v2/encoding"
+	"github.com/alfzs/kafkax/v3/encoding"
 )
 
 // ConsumerMiddleware оборачивает ConsumerHandler.

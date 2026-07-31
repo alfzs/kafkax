@@ -29,7 +29,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/alfzs/kafkax/v2"
+	"github.com/alfzs/kafkax/v3"
 )
 
 // oversizedValue заведомо не влезает в maxMessageBytes. Сжатие у продюсера в

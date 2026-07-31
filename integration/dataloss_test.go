@@ -5,7 +5,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/alfzs/kafkax/v2"
+	"github.com/alfzs/kafkax/v3"
 	"github.com/twmb/franz-go/pkg/kadm"
 )
 

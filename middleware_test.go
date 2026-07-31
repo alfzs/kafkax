@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/alfzs/kafkax/v2/encoding"
+	"github.com/alfzs/kafkax/v3/encoding"
 	"github.com/google/uuid"
 )
 

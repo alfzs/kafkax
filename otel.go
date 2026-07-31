@@ -23,11 +23,11 @@ import (
 // Спаны сюда не относятся: их создаёт kotel под собственным scope
 // github.com/twmb/franz-go/plugin/kotel, и подменить его пакет не может.
 // Транспортные метрики kotel — там же.
-const instrumentationName = "github.com/alfzs/kafkax/v2"
+const instrumentationName = "github.com/alfzs/kafkax/v3"
 
 // instrumentationModule — путь модуля, по которому в build info ищется версия
 // пакета для scope метрик.
-const instrumentationModule = "github.com/alfzs/kafkax/v2"
+const instrumentationModule = "github.com/alfzs/kafkax/v3"
 
 // meterOptions собирает опции scope доменных метрик.
 //

@@ -3,7 +3,7 @@ package integration
 import (
 	"testing"
 
-	"github.com/alfzs/kafkax/v2"
+	"github.com/alfzs/kafkax/v3"
 )
 
 // TestRoundTrip — базовый круг против настоящего брокера: отправили, приняли,

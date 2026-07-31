@@ -31,7 +31,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alfzs/kafkax/v2"
+	"github.com/alfzs/kafkax/v3"
 	"github.com/moby/moby/api/types/container"
 	mobynet "github.com/moby/moby/api/types/network"
 	"github.com/testcontainers/testcontainers-go"

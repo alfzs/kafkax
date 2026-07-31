@@ -1,4 +1,4 @@
-module github.com/alfzs/kafkax/v2
+module github.com/alfzs/kafkax/v3
 
 go 1.26.0
 

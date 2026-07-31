@@ -16,7 +16,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/alfzs/kafkax/v2"
+	"github.com/alfzs/kafkax/v3"
 )
 
 // ExampleNewProducer — быстрый старт продюсера из README.

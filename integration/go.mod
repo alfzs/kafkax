@@ -8,7 +8,7 @@ module github.com/alfzs/kafkax/integration
 go 1.26.4
 
 require (
-	github.com/alfzs/kafkax/v2 v2.0.0
+	github.com/alfzs/kafkax/v3 v3.0.0
 	github.com/moby/moby/api v1.54.2
 	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/kafka v0.43.0
@@ -73,4 +73,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/alfzs/kafkax/v2 => ../
+replace github.com/alfzs/kafkax/v3 => ../

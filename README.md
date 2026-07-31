@@ -11,11 +11,11 @@ Go-клиент Kafka: продюсер и консьюмер с изоляци�
 ## Установка
 
 ```bash
-go get github.com/alfzs/kafkax/v2
+go get github.com/alfzs/kafkax/v3
 ```
 
 ```go
-import "github.com/alfzs/kafkax/v2"
+import "github.com/alfzs/kafkax/v3"
 ```
 
 Требуется Go 1.26+.
@@ -448,7 +448,7 @@ consumer.AddHandler("events", &orderHandler{},
 Неподдерживаемое значение не компилируется, а не падает в рантайме.
 
 ```go
-import "github.com/alfzs/kafkax/v2/encoding"
+import "github.com/alfzs/kafkax/v3/encoding"
 
 // Продюсер
 key, err := encoding.EncodeKey(encoding.UUID(tenantID), encoding.Str(externalBotID))
