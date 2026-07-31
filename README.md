@@ -159,7 +159,7 @@ cfg.Consumer = kafkax.ConsumerConfig{
     HeartbeatInterval: 3 * time.Second,
     RebalanceTimeout:  time.Minute,
     CommitInterval:    5 * time.Second,
-    HandlerMaxRetries: 3,
+    HandlerRetries:    3,
     HandlerRetryDelay: time.Second,
 }
 
@@ -216,9 +216,9 @@ defer consumer.Stop()
 
 ### Этап 1 — повторы
 
-Управляется `Consumer.HandlerMaxRetries` и `Consumer.HandlerRetryDelay`:
+Управляется `Consumer.HandlerRetries` и `Consumer.HandlerRetryDelay`:
 
-| `HandlerMaxRetries` | Поведение |
+| `HandlerRetries` | Поведение |
 |---|---|
 | `0` (по умолчанию) | вызвать обработчик один раз, повторов не делать |
 | `N > 0` | сделать `N` повторов сверх первого вызова — всего `N+1` вызовов |
@@ -302,9 +302,9 @@ cfg.OnMessageSkipped = func(ctx context.Context, msg kafkax.IncomingMessage, cau
 
 | Задача | Настройки |
 |---|---|
-| Порядок важнее прогресса, потеря недопустима | `HandlerMaxRetries: -1` — партиция ждёт столько, сколько нужно |
-| Потеря недопустима, но зависать в обработчике нельзя | `HandlerMaxRetries: N`, `OnMessageSkipped: nil` — партиция встаёт на паузу, инцидент разбирает дежурный. **Это умолчание** |
-| Прогресс важнее отдельного сообщения | `HandlerMaxRetries: N` + `OnMessageSkipped` с записью в DLQ и возвратом `nil` — единственный вариант, в котором конвейер не останавливается никогда |
+| Порядок важнее прогресса, потеря недопустима | `HandlerRetries: -1` — партиция ждёт столько, сколько нужно |
+| Потеря недопустима, но зависать в обработчике нельзя | `HandlerRetries: N`, `OnMessageSkipped: nil` — партиция встаёт на паузу, инцидент разбирает дежурный. **Это умолчание** |
+| Прогресс важнее отдельного сообщения | `HandlerRetries: N` + `OnMessageSkipped` с записью в DLQ и возвратом `nil` — единственный вариант, в котором конвейер не останавливается никогда |
 
 Отдельный случай: если контекст отменён во время паузы между повторами (идёт
 остановка консьюмера), сообщение не отмечается и партицию не травит — оно
@@ -515,8 +515,9 @@ poll ──┬─► partition 0 ──► ProcessMessage (последоват�
 ```
 
 Пропускная способность настраивается числом партиций топика, а не параметрами
-библиотеки. `Consumer.MessageQueueSize` задаёт, насколько цикл опроса может
-обгонять обработку — в **батчах**, не в записях.
+библиотеки. `Consumer.MessageQueueBatches` задаёт, насколько цикл опроса может
+обгонять обработку — в **батчах**, не в записях; единица измерения вынесена в
+имя поля.
 
 Это же поле задаёт верхнюю границу памяти под непрочитанные сообщения, и
 граница выходит крупнее, чем кажется: записи не копируются, `Key`/`Value`/
@@ -524,7 +525,7 @@ poll ──┬─► partition 0 ──► ProcessMessage (последоват�
 Худший случай на экземпляр —
 
 ```
-назначенные партиции × MessageQueueSize × MaxPartitionBytes
+назначенные партиции × MessageQueueBatches × MaxPartitionBytes
 ```
 
 то есть на умолчаниях (30 партиций, 100 батчей, 1 MiB) около **3 ГиБ**.
@@ -745,10 +746,10 @@ produce/fetch) регистрирует kotel под своими именами
 | `RebalanceTimeout` | `REBALANCE_TIMEOUT` | `1m` | Сколько координатор ждёт отдачи партиций. Должен превышать максимальное время обработки батча |
 | `IsolationLevel` | `ISOLATION_LEVEL` | `read_committed` | `read_committed` или `read_uncommitted` |
 | `MaxPollRecords` | `MAX_POLL_RECORDS` | `500` | Верхняя граница числа записей за один опрос |
-| `MessageQueueSize` | `MESSAGE_QUEUE_SIZE` | `100` | Ёмкость канала партиционного воркера в батчах. Задаёт и потолок памяти: `партиции × MessageQueueSize × MaxPartitionBytes` |
+| `MessageQueueBatches` | `MESSAGE_QUEUE_BATCHES` | `100` | Ёмкость канала партиционного воркера в батчах. Задаёт и потолок памяти: `партиции × MessageQueueBatches × MaxPartitionBytes` |
 | `CommitInterval` | `COMMIT_INTERVAL` | `5s` | Период фоновой отправки отмеченных оффсетов. Влияет на окно переобработки, но не на гарантию at-least-once |
-| `HandlerMaxRetries` | `HANDLER_MAX_RETRIES` | `0` | `0` без повторов, `N` — `N` повторов, `-1` бесконечно. См. «Политика повторов» |
-| `HandlerRetryDelay` | `HANDLER_RETRY_DELAY` | `1s` | Пауза между повторами. Обязателен при `HandlerMaxRetries != 0` |
+| `HandlerRetries` | `HANDLER_RETRIES` | `0` | `0` без повторов, `N` — `N` повторов, `-1` бесконечно. См. «Политика повторов» |
+| `HandlerRetryDelay` | `HANDLER_RETRY_DELAY` | `1s` | Пауза между повторами. Обязателен при `HandlerRetries != 0` |
 
 ### Умолчания в коде
 
