@@ -669,8 +669,15 @@ func (e *configError) Is(target error) bool {
 	return target == ErrInvalidConfig
 }
 
+// commonErrors — проверки, общие для обеих ролей.
+//
+// Здесь же живёт поиск отставленных ключей в окружении, и место выбрано именно
+// за то, что через эту функцию проходят все три входа в валидацию, а через них
+// — оба конструктора. Претензии к окружению идут первыми: конфиг, собранный из
+// отставленного ключа, чинится не подгонкой значений, а переносом настройки, и
+// прочитать об этом надо до двух десятков строк про поля.
 func (c Config) commonErrors() []error {
-	var errs []error
+	errs := retiredEnvErrors()
 
 	if len(c.Brokers) == 0 {
 		errs = append(errs, fmt.Errorf("%s must not be empty", cfgField("Brokers")))

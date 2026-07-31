@@ -1,0 +1,372 @@
+package kafkax
+
+import (
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Тесты обнаружения отставленных ключей.
+//
+// Ожидаемые тексты здесь набраны литералами, а не собраны из retiredKeys.
+// Сверять сообщение с той же таблицей, из которой оно построено, — значит не
+// проверять ничего: переписать change на «key is retired» можно было бы, не
+// уронив ни одного теста, и вся ценность механизма (назвать замену и суть
+// изменения) утекла бы молча. Литерал стоит правки при каждом изменении
+// формулировки, и это ровно та цена, которую хочется платить.
+
+// TestRetiredEnvKeyFailsEveryValidationEntry — отставленная переменная
+// окружения роняет все три входа в валидацию.
+//
+// Три, а не один: конструктор продюсера и конструктор консьюмера проверяют
+// каждый свою роль, и проверка, поставленная в консьюмерскую секцию, оставила
+// бы продюсеру молчаливый обход. Общий вход Validate проверяется заодно — им
+// пользуется приложение, создающее из одного Config и то, и другое.
+func TestRetiredEnvKeyFailsEveryValidationEntry(t *testing.T) {
+	envs := []string{
+		"KAFKAX_CONSUMER_MESSAGE_QUEUE_SIZE",
+		"KAFKAX_CONSUMER_HANDLER_MAX_RETRIES",
+	}
+
+	for _, env := range envs {
+		t.Run(env, func(t *testing.T) {
+			// Значение намеренно правдоподобное: именно перенесённая из v1
+			// тысяча и есть тот случай, ради которого всё затевалось.
+			t.Setenv(env, "1000")
+
+			cfg := testConfig(t)
+
+			entries := map[string]error{
+				"Validate":         cfg.Validate(),
+				"validateProducer": cfg.validateProducer(),
+				"validateConsumer": cfg.validateConsumer(),
+			}
+
+			for name, err := range entries {
+				if err == nil {
+					t.Errorf("%s принял конфигурацию с %s в окружении", name, env)
+
+					continue
+				}
+
+				if !strings.Contains(err.Error(), env) {
+					t.Errorf("%s: ошибка не называет %s:\n%v", name, env, err)
+				}
+
+				if !errors.Is(err, ErrInvalidConfig) {
+					t.Errorf("%s: ошибка не опознаётся как ErrInvalidConfig: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+// TestRetiredEnvKeyReachesConstructors — отставленный ключ виден там, где его
+// увидит потребитель: на конструкторе, а не на внутренней функции.
+//
+// Конструкторы вызывают валидацию до первого сетевого действия, поэтому брокер
+// не нужен.
+func TestRetiredEnvKeyReachesConstructors(t *testing.T) {
+	t.Setenv("KAFKAX_CONSUMER_HANDLER_MAX_RETRIES", "0")
+
+	cfg := testConfig(t)
+
+	if _, err := NewProducer(cfg); err == nil {
+		t.Error("NewProducer принял конфигурацию с отставленной переменной окружения")
+	}
+
+	if _, err := NewConsumer(cfg); err == nil {
+		t.Error("NewConsumer принял конфигурацию с отставленной переменной окружения")
+	}
+}
+
+// TestRetiredEnvKeyReportedWhenEmpty — пустое значение переменной считается
+// заявлением о настройке наравне с заполненным.
+//
+// KAFKAX_CONSUMER_MESSAGE_QUEUE_SIZE= в манифесте — это перенесённая строка
+// конфигурации, а не её отсутствие; отличать её от заполненной значило бы
+// пропускать ровно тот конфиг, который перенесли не глядя.
+func TestRetiredEnvKeyReportedWhenEmpty(t *testing.T) {
+	t.Setenv("KAFKAX_CONSUMER_MESSAGE_QUEUE_SIZE", "")
+
+	if err := testConfig(t).Validate(); err == nil {
+		t.Error("пустая KAFKAX_CONSUMER_MESSAGE_QUEUE_SIZE прошла валидацию")
+	}
+}
+
+// TestRetiredEnvErrorNamesReplacementAndChange — текст ошибки объясняет, что
+// изменилось, а не сообщает об устаревании.
+//
+// «Ключ устарел» оставляет читателя ровно там, откуда он пришёл: значение у
+// него уже есть, и он перенесёт его под новым именем. Сообщение обязано
+// назвать замену в обеих формах записи и сказать, почему прежнее значение
+// нельзя перенести как есть.
+func TestRetiredEnvErrorNamesReplacementAndChange(t *testing.T) {
+	tests := []struct {
+		env  string
+		want []string
+	}{
+		{
+			env: "KAFKAX_CONSUMER_MESSAGE_QUEUE_SIZE",
+			want: []string{
+				"KAFKAX_CONSUMER_MESSAGE_QUEUE_SIZE is retired",
+				"consumer.message_queue_batches",
+				"KAFKAX_CONSUMER_MESSAGE_QUEUE_BATCHES",
+				"the unit changed from messages to batches",
+				"raises the memory ceiling",
+			},
+		},
+		{
+			env: "KAFKAX_CONSUMER_HANDLER_MAX_RETRIES",
+			want: []string{
+				"KAFKAX_CONSUMER_HANDLER_MAX_RETRIES is retired",
+				"consumer.handler_retries",
+				"KAFKAX_CONSUMER_HANDLER_RETRIES",
+				"the meaning of 0 is inverted",
+				"in v1 zero meant retry forever",
+				"in v3 zero means no retries at all",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.env, func(t *testing.T) {
+			t.Setenv(tt.env, "3")
+
+			cfgWantErr(t, testConfig(t).Validate(), tt.want...)
+		})
+	}
+}
+
+// TestRetiredYAMLKeyFailsDecode — отставленный ключ в файле роняет разбор.
+//
+// Проверяется настоящим декодером, а не вызовом UnmarshalYAML напрямую: весь
+// расчёт механизма в том, что yaml.v3 сам зовёт метод устаревшей формы
+// (unmarshal-функция вместо *yaml.Node). Ручной вызов подтвердил бы только
+// нашу же арифметику по карте и оставил бы главное допущение непроверенным.
+func TestRetiredYAMLKeyFailsDecode(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		src  string
+		want []string
+	}{
+		{
+			name: "message_queue_size",
+			src: "brokers: [kafka:9092]\n" +
+				"consumer:\n" +
+				"  group: billing\n" +
+				"  message_queue_size: 1000\n",
+			want: []string{
+				"consumer.message_queue_size is retired",
+				"consumer.message_queue_batches",
+				"the unit changed from messages to batches",
+			},
+		},
+		{
+			name: "handler_max_retries",
+			src: "consumer:\n" +
+				"  handler_max_retries: 0\n",
+			want: []string{
+				"consumer.handler_max_retries is retired",
+				"consumer.handler_retries",
+				"the meaning of 0 is inverted",
+			},
+		},
+		{
+			// Регистр ключей файла декодер игнорирует, сопоставляя их с
+			// полями структуры. Отставленный ключ обязан ловиться так же,
+			// иначе обход сводится к смене регистра одной буквы.
+			name: "регистр ключей не важен",
+			src: "Consumer:\n" +
+				"  Message_Queue_Size: 1000\n",
+			want: []string{"consumer.message_queue_size is retired"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var cfg Config
+
+			err := yaml.Unmarshal([]byte(tt.src), &cfg)
+
+			cfgWantErr(t, err, tt.want...)
+
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Errorf("ошибка разбора файла не опознаётся как ErrInvalidConfig: %v", err)
+			}
+		})
+	}
+}
+
+// TestRetiredYAMLKeyFoundInLegacyMapShape — ключ находится и в отображении
+// старой формы.
+//
+// Сигнатура метода — та самая, что была основной в yaml.v2, поэтому позвать
+// его может и v2-декодер, а тот отдаёт вложенные отображения как map[any]any
+// вместо map[string]any. Промах на такой карте выглядел бы как «отставленных
+// ключей в файле нет», то есть как молчаливый обход всего механизма.
+//
+// Здесь стоит двойник декодера, а не сам yaml.v2: тащить в зависимости
+// библиотеку ради одной ветки дороже, чем подставить карту руками. Ожидаемое
+// при этом взято литералом, а не у проверяемого кода.
+func TestRetiredYAMLKeyFoundInLegacyMapShape(t *testing.T) {
+	t.Parallel()
+
+	unmarshal := func(v any) error {
+		out, ok := v.(*any)
+		if !ok {
+			// Второй проход, в структуру: до него дело не дойдёт.
+			return nil
+		}
+
+		*out = map[any]any{"consumer": map[any]any{"handler_max_retries": 0}}
+
+		return nil
+	}
+
+	var cfg Config
+
+	cfgWantErr(t, cfg.UnmarshalYAML(unmarshal), "consumer.handler_max_retries is retired")
+}
+
+// TestYAMLDecodeAppliesLiveKeys — перехват разбора не сломал сам разбор.
+//
+// UnmarshalYAML читает узел дважды: сначала картой ради имён ключей, потом
+// структурой. Забыть второй проход или подменить приёмник нулевым значением —
+// и конфигурация из файла молча перестанет применяться, а падать на этом
+// нечему: валидация примет умолчания.
+func TestYAMLDecodeAppliesLiveKeys(t *testing.T) {
+	t.Parallel()
+
+	src := "brokers:\n" +
+		"  - kafka:9092\n" +
+		"client_id: billing\n" +
+		"consumer:\n" +
+		"  group: billing.workers\n" +
+		"  message_queue_batches: 7\n" +
+		"  handler_retries: 5\n"
+
+	// Логгер выставлен до разбора: файл его задать не может (yaml:"-"), и
+	// метод обязан достраивать переданное значение, а не подменять нулевым.
+	cfg := Config{Logger: testLogger(t)}
+	if err := yaml.Unmarshal([]byte(src), &cfg); err != nil {
+		t.Fatalf("разбор валидного файла провалился: %v", err)
+	}
+
+	if got := cfg.Consumer.MessageQueueBatches; got != 7 {
+		t.Errorf("Consumer.MessageQueueBatches = %d, в файле 7", got)
+	}
+
+	if got := cfg.Consumer.HandlerRetries; got != 5 {
+		t.Errorf("Consumer.HandlerRetries = %d, в файле 5", got)
+	}
+
+	if got := cfg.ClientID; got != "billing" {
+		t.Errorf("ClientID = %q, в файле billing", got)
+	}
+
+	if !reflect.DeepEqual(cfg.Brokers, []string{"kafka:9092"}) {
+		t.Errorf("Brokers = %v, в файле [kafka:9092]", cfg.Brokers)
+	}
+
+	if cfg.Logger == nil {
+		t.Error("Logger, выставленный до разбора, потерян")
+	}
+}
+
+// TestYAMLDecodeReportsMalformedFile — на испорченном файле остаётся жалоба
+// декодера.
+//
+// Первый проход по узлу разбирается в карту и на скаляре обязан промолчать:
+// если бы его ошибка возвращалась наружу, вместо «cannot unmarshal !!str into
+// int» пользователь получил бы претензию к типу карты, к его файлу отношения
+// не имеющую.
+func TestYAMLDecodeReportsMalformedFile(t *testing.T) {
+	t.Parallel()
+
+	var cfg Config
+
+	err := yaml.Unmarshal([]byte("consumer:\n  max_poll_records: сто\n"), &cfg)
+	if err == nil {
+		t.Fatal("разбор нечислового max_poll_records прошёл без ошибки")
+	}
+
+	if !strings.Contains(err.Error(), "cannot unmarshal") {
+		t.Errorf("жалоба декодера на тип значения подменена:\n%v", err)
+	}
+
+	if strings.Contains(err.Error(), "is retired") {
+		t.Errorf("испорченный файл принят за конфигурацию с отставленным ключом:\n%v", err)
+	}
+}
+
+// TestRetiredKeysDoNotShadowLiveFields — отставленный ключ не совпадает ни с
+// одним действующим.
+//
+// Сторож против обратного переименования и против записи, добавленной с
+// опечаткой: ключ, который одновременно и отставлен, и обслуживается полем,
+// сделал бы рабочую конфигурацию незапускаемой, причём без всякого способа её
+// починить.
+func TestRetiredKeysDoNotShadowLiveFields(t *testing.T) {
+	t.Parallel()
+
+	yamlKeys, envs := cfgLiveKeys(t, reflect.TypeFor[Config](), nil)
+
+	if len(yamlKeys) < 25 || len(envs) < 25 {
+		t.Fatalf("собрано ключей: yaml %d, env %d — обход по структуре сломан", len(yamlKeys), len(envs))
+	}
+
+	for _, key := range retiredKeys {
+		if yamlKeys[key.yamlKey()] {
+			t.Errorf("отставленный ключ %s обслуживается полем структуры", key.yamlKey())
+		}
+
+		if envs[key.env] {
+			t.Errorf("отставленная переменная %s обслуживается полем структуры", key.env)
+		}
+	}
+}
+
+// cfgLiveKeys собирает действующие yaml-пути и имена переменных окружения из
+// тегов структуры.
+func cfgLiveKeys(t *testing.T, typ reflect.Type, prefix []string) (map[string]bool, map[string]bool) {
+	t.Helper()
+
+	yamlKeys := make(map[string]bool)
+	envs := make(map[string]bool)
+
+	for field := range typ.Fields() {
+		tag, ok := field.Tag.Lookup("yaml")
+		if !ok || tag == "-" {
+			continue
+		}
+
+		path := append(append([]string{}, prefix...), tag)
+
+		if env, ok := field.Tag.Lookup("env"); ok {
+			envs[env] = true
+		}
+
+		if field.Type.Kind() == reflect.Struct && field.Type != reflect.TypeFor[Config]() {
+			nestedYAML, nestedEnv := cfgLiveKeys(t, field.Type, path)
+			for k := range nestedYAML {
+				yamlKeys[k] = true
+			}
+
+			for k := range nestedEnv {
+				envs[k] = true
+			}
+		}
+
+		yamlKeys[strings.Join(path, ".")] = true
+	}
+
+	return yamlKeys, envs
+}
