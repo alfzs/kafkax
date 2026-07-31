@@ -454,6 +454,59 @@ func TestDocumentationValidationExampleIsReproducible(t *testing.T) {
 	}
 }
 
+// TestYamlKeysAreSnakeCaseOfGoPath — yaml-ключи выводятся из Go-пути поля тем
+// же правилом, что и имена переменных окружения.
+//
+// Это обещание doc.go, на котором держится решение называть поле в претензии
+// валидации Go-путём, а не yaml-ключом: «yaml-ключ при этом остаётся выводимым
+// — это тот же путь в snake_case». Разойдись хоть один тег, и обещание станет
+// ложным для того, кто настраивает пакет файлом: претензия называет поле,
+// которого в его yaml нет.
+//
+// Правило берётся из envName, а тег — из структуры: это два независимых
+// источника. Само правило сторожит TestEnvNamesMatchStructTags.
+func TestYamlKeysAreSnakeCaseOfGoPath(t *testing.T) {
+	t.Parallel()
+
+	checked := 0
+	walkYamlTags(t, reflect.TypeFor[Config](), &checked)
+
+	// Иначе разъехавшийся обход прошёл бы за успех: ноль проверенных полей —
+	// зелёный тест.
+	if checked < 30 {
+		t.Errorf("проверено полей: %d — обход структуры разъехался", checked)
+	}
+}
+
+// walkYamlTags сверяет yaml-теги структуры с snake_case имён полей.
+func walkYamlTags(t *testing.T, typ reflect.Type, checked *int) {
+	t.Helper()
+
+	for f := range typ.Fields() {
+		tag, ok := f.Tag.Lookup("yaml")
+		if !ok {
+			continue
+		}
+
+		// «-» — поле, которого в yaml не бывает вовсе: Logger, TLSConfig,
+		// ExtraOpts и оба хука задаются только кодом. Обещание doc.go про
+		// выводимый yaml-ключ их и не касается.
+		if tag == "-" {
+			continue
+		}
+
+		*checked++
+
+		if want := strings.ToLower(strings.TrimPrefix(envName(f.Name), envPrefix)); tag != want {
+			t.Errorf("yaml-тег поля %s = %q, а из Go-имени выводится %q", f.Name, tag, want)
+		}
+
+		if f.Type.Kind() == reflect.Struct {
+			walkYamlTags(t, f.Type, checked)
+		}
+	}
+}
+
 // sentinelRe находит объявление сентинела в блоке var файла errors.go.
 var sentinelRe = regexp.MustCompile(`(?m)^\t(Err[A-Za-z0-9]+)\s+=`)
 
