@@ -155,7 +155,12 @@ func (s consumerState) lifecycleErr() error {
 // партиций идёт параллельно, внутри одной партиции — строго по порядку
 // оффсетов. Методы безопасны для вызова из разных горутин.
 type Consumer struct {
-	config    Config
+	config Config
+	// behavior — разобранные опции конструктора: логгер, готовый *tls.Config,
+	// добавочные опции franz-go и оба хука. Хранится целиком, а не разобранным
+	// на поля, потому что часть его нужна только в Start (клиент создаётся
+	// там), а часть — на пути сообщения.
+	behavior  behavior
 	logger    *slog.Logger
 	telemetry telemetry
 	metrics   consumerMetrics
@@ -266,17 +271,27 @@ type Consumer struct {
 // известен только после AddHandler, а franz-go требует его при создании
 // клиента, поэтому сам клиент создаётся в Start. Конструктор проверяет
 // конфигурацию, готовит логгер, метрики и репортер паник.
-func NewConsumer(config Config) (*Consumer, error) {
+//
+// config — сериализуемые настройки, opts — поведение: WithLogger,
+// WithTLSConfig, WithExtraOpts, WithPanicHook, WithSkipHook. Консьюмеру
+// применимы все пять.
+func NewConsumer(config Config, opts ...Option) (*Consumer, error) {
 	const op = "creating consumer"
+
+	b, err := newBehavior(roleConsumer, opts...)
+	if err != nil {
+		return nil, err
+	}
 
 	// Не оборачивается: у агрегата валидации Unwrap() []error, и fmt.Errorf
 	// подменил бы его на Unwrap() error — документированный разбор списка
 	// перестал бы работать ровно там, где он нужен.
-	if err := config.validateConsumer(); err != nil {
+	if err := config.validateConsumer(b); err != nil {
 		return nil, err
 	}
 
-	logger := config.logger("kafka_consumer").With(slog.String("group", config.Consumer.Group))
+	logger := componentLogger(b.logger, "kafka_consumer").With(slog.String("group", config.Consumer.Group))
+	b.logger = logger
 
 	metrics, err := newConsumerMetrics(otel.Meter(instrumentationName, meterOptions()...))
 	if err != nil {
@@ -285,12 +300,18 @@ func NewConsumer(config Config) (*Consumer, error) {
 
 	lifeCtx, lifeCancel := context.WithCancel(context.Background())
 
+	// Сводка опций — на месте признаков, ушедших из Config.LogValue вместе с
+	// полями поведения. Наличие SkipHook объясняет, почему отравленное
+	// сообщение пропускается, а не встаёт партицией, и не видно больше нигде.
+	logger.Info("Kafka consumer created", slog.Any("options", b))
+
 	return &Consumer{
 		config:       config,
+		behavior:     b,
 		logger:       logger,
 		telemetry:    newTelemetry(config.ClientID, config.Consumer.Group),
 		metrics:      metrics,
-		panics:       panicReporter{logger: logger, panics: metrics.panics, onPanic: config.OnPanic},
+		panics:       panicReporter{logger: logger, panics: metrics.panics, onPanic: b.panicHook},
 		opts:         newOptsCache(0),
 		workers:      make(map[workerKey]*partitionWorker),
 		paused:       make(map[workerKey]struct{}),
@@ -431,7 +452,7 @@ func (c *Consumer) Start(ctx context.Context) error {
 		return ErrConsumerClosed
 	}
 
-	opts, err := c.config.consumerOpts(c.logger, topics, rebalanceCallbacks{
+	opts, err := c.config.consumerOpts(c.behavior, topics, rebalanceCallbacks{
 		assigned: c.onPartitionsAssigned,
 		revoked:  c.onPartitionsRevoked,
 		lost:     c.onPartitionsLost,

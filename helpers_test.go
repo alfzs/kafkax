@@ -93,7 +93,6 @@ func testConfig(t *testing.T, brokers ...string) Config {
 		ClientID:        testClientID,
 		GracefulTimeout: 5 * time.Second,
 		DialTimeout:     2 * time.Second,
-		Logger:          testLogger(t),
 		Producer: ProducerConfig{
 			RequiredAcks:       -1,
 			EnableIdempotence:  true,
@@ -146,10 +145,14 @@ func captureMetrics(t *testing.T) *recordedMetrics {
 }
 
 // mustProducer создаёт продюсер и закрывает его по завершении теста.
-func mustProducer(t *testing.T, cfg Config) *Producer {
+//
+// Логгер теста подставляется первой опцией: он был в testConfig, пока Logger
+// жил в Config, и без него журнал теста уходил бы в slog.Default(). Первой
+// — чтобы тест мог заменить его своим, передав WithLogger следом.
+func mustProducer(t *testing.T, cfg Config, opts ...Option) *Producer {
 	t.Helper()
 
-	p, err := NewProducer(cfg)
+	p, err := NewProducer(cfg, testOptions(t, opts...)...)
 	if err != nil {
 		t.Fatalf("NewProducer: %v", err)
 	}
@@ -170,10 +173,10 @@ func mustProducer(t *testing.T, cfg Config) *Producer {
 // mustConsumer создаёт консьюмер и останавливает его по завершении теста.
 // Повторный Stop идемпотентен, поэтому Cleanup не мешает тесту остановить
 // консьюмер самому.
-func mustConsumer(t *testing.T, cfg Config) *Consumer {
+func mustConsumer(t *testing.T, cfg Config, opts ...Option) *Consumer {
 	t.Helper()
 
-	c, err := NewConsumer(cfg)
+	c, err := NewConsumer(cfg, testOptions(t, opts...)...)
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
 	}
@@ -185,6 +188,26 @@ func mustConsumer(t *testing.T, cfg Config) *Consumer {
 	})
 
 	return c
+}
+
+// testOptions ставит логгер теста перед опциями вызывающего.
+func testOptions(t *testing.T, opts ...Option) []Option {
+	t.Helper()
+
+	return append([]Option{WithLogger(testLogger(t))}, opts...)
+}
+
+// testBehavior — разобранный набор опций с логгером теста. Для тестов, которые
+// зовут сборку опций franz-go напрямую, минуя конструкторы.
+func testBehavior(t *testing.T, opts ...Option) behavior {
+	t.Helper()
+
+	b, err := newBehavior(roleAny, testOptions(t, opts...)...)
+	if err != nil {
+		t.Fatalf("newBehavior: %v", err)
+	}
+
+	return b
 }
 
 // mustAddHandler регистрирует обработчик и валит тест при отказе: AddHandler

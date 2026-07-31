@@ -507,9 +507,9 @@ func TestProducerSendMessageCanceledInFlight(t *testing.T) {
 	// Буфер на одну запись: пока удержанная отправка ждёт ответа брокера,
 	// следующая физически не может в него попасть.
 	cfg.Producer.MaxBufferedRecords = 1
-	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
+	bufferedHook := WithExtraOpts(kgo.WithHooks(hook))
 
-	p := mustProducer(t, cfg)
+	p := mustProducer(t, cfg, bufferedHook)
 
 	heldDone := make(chan error, 1)
 

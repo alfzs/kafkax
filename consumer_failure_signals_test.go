@@ -137,9 +137,9 @@ func TestInfiniteRetriesReportPanicOnce(t *testing.T) {
 	cfg.GracefulTimeout = 200 * time.Millisecond
 
 	sites := &consTrace{}
-	cfg.OnPanic = func(_ context.Context, site PanicSite, _ any, _ []byte) {
+	panicHook := WithPanicHook(func(_ context.Context, site PanicSite, _ any, _ []byte) {
 		sites.add(string(site))
-	}
+	})
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, "boom")
@@ -148,7 +148,7 @@ func TestInfiniteRetriesReportPanicOnce(t *testing.T) {
 		panic("handler exploded")
 	}}
 
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, panicHook)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 
@@ -194,24 +194,24 @@ func TestSkipHookSuccessLogsNoError(t *testing.T) {
 
 	brokers := newFakeCluster(t, 1, topic)
 	cfg := testConfig(t, brokers...)
-	cfg.Logger = slog.New(&levelCountHandler{inner: cfg.Logger.Handler(), count: levels})
+	logger := WithLogger(slog.New(&levelCountHandler{inner: testLogger(t).Handler(), count: levels}))
 
 	skipped := make(chan struct{}, 1)
-	cfg.OnMessageSkipped = func(context.Context, IncomingMessage, error) error {
+	skipHook := WithSkipHook(func(context.Context, IncomingMessage, error) error {
 		select {
 		case skipped <- struct{}{}:
 		default:
 		}
 
 		return nil
-	}
+	})
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, "boom")
 
 	h := &mockHandler{returnErr: errConsBoom}
 
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, logger, skipHook)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 
@@ -253,7 +253,7 @@ func TestPoisonLogsSingleError(t *testing.T) {
 
 	brokers := newFakeCluster(t, 1, topic)
 	cfg := testConfig(t, brokers...)
-	cfg.Logger = slog.New(&levelCountHandler{inner: cfg.Logger.Handler(), count: levels})
+	logger := WithLogger(slog.New(&levelCountHandler{inner: testLogger(t).Handler(), count: levels}))
 	cfg.Consumer.HandlerMaxRetries = 2
 
 	prod := consNewProducer(t, brokers)
@@ -261,7 +261,7 @@ func TestPoisonLogsSingleError(t *testing.T) {
 
 	h := &mockHandler{returnErr: errConsBoom}
 
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, logger)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 

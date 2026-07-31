@@ -3,7 +3,6 @@ package kafkax
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -260,58 +259,32 @@ func TestSASLJSONMarshalRedactsPassword(t *testing.T) {
 }
 
 // TestConfigJSONMarshalDoesNotDependOnFuncFields — пароль не утекает через
-// json.Marshal(Config), и держится это больше не на случайности.
+// json.Marshal(Config), и держится это только на SASL.MarshalJSON.
 //
-// Раньше тест назывался ...FailsOnFuncFields и проверял ровно причину:
-// UnsupportedTypeError на типе поля-функции. Причина верна и сегодня —
-// encoding/json по-прежнему спотыкается об OnPanic, OnMessageSkipped и
-// TLSConfig.Time, и ошибка возникает из ТИПА поля, а не из значения, так что
-// нулевые хуки не помогают. Но вывод «это единственное, что защищает пароль»
-// после появления SASL.MarshalJSON неверен, и тест переписан под новый вывод.
+// История ассерта в трёх шагах. Сперва тест назывался ...FailsOnFuncFields и
+// проверял причину: UnsupportedTypeError на типе поля-функции — Marshal падал,
+// пароль не печатался, и провал считался защитой. Потом появился
+// SASL.MarshalJSON, вывод «это единственное, что защищает пароль» стал неверен,
+// и рядом завели структуру-двойник без полей-функций: то, чем Config станет,
+// если хуки однажды уедут.
 //
-// Отсюда вторая половина: Config без полей-функций собрать нельзя, поэтому
-// сценарий «хуки переехали в интерфейс, Marshal начал проходить» проверяется на
-// структуре-двойнике с тем же вложенным SASL. Ассерт на саму ошибку сохранён —
-// но теперь как констатация, а не как гарантия.
+// Они уехали. Поля поведения теперь задаются опциями конструктора, в Config не
+// осталось ни функций, ни *tls.Config, encoding/json больше ни обо что не
+// спотыкается — и Marshal проходит целиком. Двойник и есть Config, поэтому
+// проверяется он сам: между паролем и выводом отладочной ручки стоит ровно
+// один метод.
 func TestConfigJSONMarshalDoesNotDependOnFuncFields(t *testing.T) {
 	t.Parallel()
 
 	cfg := testConfig(t)
 	cfg.SASL = redactionSASL()
 
-	//nolint:staticcheck // SA1026 сообщает, что этот Marshal заведомо провалится на поле-функции.
-	// Это и есть проверяемое утверждение; молчание staticcheck здесь означало бы, что тест устарел.
 	got, err := json.Marshal(cfg)
-
-	if strings.Contains(string(got), redactionCanary) {
-		t.Fatalf("json.Marshal(Config) вернул пароль:\n%s", got)
-	}
-
-	// Ошибка ожидается, но её отсутствие само по себе больше не дефект: если
-	// хуки однажды уедут в интерфейс, Marshal пройдёт — и обязан отдать
-	// отредактированный SASL. Ровно это проверяет двойник ниже, поэтому здесь
-	// достаточно зафиксировать, на чём именно спотыкается encoding/json сейчас.
-	if unsupported, ok := errors.AsType[*json.UnsupportedTypeError](err); ok {
-		if !strings.HasPrefix(unsupported.Type.String(), "func(") {
-			t.Errorf("Marshal провалился не на поле-функции, а на %s — причина изменилась",
-				unsupported.Type)
-		}
-	}
-
-	// Двойник Config без полей-функций: то, чем Config станет, если хуки
-	// когда-нибудь перестанут блокировать сериализацию. Пароль обязан остаться
-	// отредактированным и в этом случае.
-	twin := struct {
-		ClientID string `json:"client_id"`
-		SASL     SASL   `json:"sasl"`
-	}{cfg.ClientID, cfg.SASL}
-
-	marshalled, err := json.Marshal(twin)
 	if err != nil {
-		t.Fatalf("json.Marshal(двойник Config): %v", err)
+		t.Fatalf("json.Marshal(Config): %v — сериализация конфигурации больше не должна падать", err)
 	}
 
-	redactionWantSafe(t, "json.Marshal(двойник Config без полей-функций)", string(marshalled))
+	redactionWantSafe(t, "json.Marshal(Config)", string(got))
 }
 
 // TestConfigLoggedWholeRedactsPassword — обещание godoc у LogValue

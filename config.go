@@ -2,7 +2,6 @@ package kafkax
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,8 +10,6 @@ import (
 	"strings"
 	"time"
 	"unicode"
-
-	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 // Допустимые значения SASL.Mechanism. Сравнение регистронезависимое.
@@ -55,7 +52,10 @@ const (
 	CompressionZstd   = "zstd"
 )
 
-// Config — конфигурация клиента Kafka.
+// Config — конфигурация клиента Kafka: только данные, которые читаются из
+// yaml-файла или окружения. Ни одного поля с yaml:"-" здесь нет и быть не
+// должно — живые значения (логгер, готовый *tls.Config, опции franz-go, хуки)
+// задаются опциями конструктора, см. Option.
 //
 // Отдельного поля с протоколом безопасности здесь нет: протокол не задаётся
 // строкой, а выводится из самих настроек — TLS включается наличием
@@ -80,101 +80,16 @@ type Config struct {
 	// KafkaLogLevel — порог логов самого franz-go: debug, info, warn, error
 	// или none. Умолчание — info.
 	//
-	// Отдельно от уровня Logger'а, потому что это разные вопросы. kslog
-	// отображает уровни один в один, и приложение, поднятое с LevelDebug на
-	// время разбора инцидента, получало бы запись franz-go на каждый
+	// Отдельно от уровня логгера из WithLogger, потому что это разные вопросы.
+	// kslog отображает уровни один в один, и приложение, поднятое с LevelDebug
+	// на время разбора инцидента, получало бы запись franz-go на каждый
 	// produce/fetch/metadata — включая «fetch stripped partitions» на каждом
 	// цикле опроса. Порог, объявленный здесь, отвязывает второе от первого.
 	//
-	// Работает только в сторону ужесточения: уровень Logger'а остаётся
+	// Работает только в сторону ужесточения: уровень самого логгера остаётся
 	// внешним фильтром, и debug здесь не включит отладку у логгера,
 	// настроенного на Warn. Действующий порог — строгий из двух.
 	KafkaLogLevel string `yaml:"kafka_log_level" env:"KAFKAX_KAFKA_LOG_LEVEL" env-default:"info"`
-
-	// Logger — логгер библиотеки. При nil используется slog.Default().
-	// Логи самого franz-go пишутся в него же, но не ниже KafkaLogLevel.
-	Logger *slog.Logger `yaml:"-"`
-
-	// TLSConfig — готовый *tls.Config. Задан — имеет приоритет над секцией
-	// TLS целиком: сборка конфигурации из путей к файлам покрывает типовой
-	// случай, но не покрывает mTLS с ротацией, кастомный VerifyPeerCertificate
-	// или сертификаты из памяти.
-	TLSConfig *tls.Config `yaml:"-"`
-
-	// ExtraOpts добавляются к опциям клиента последними и потому побеждают
-	// всё, что вывела библиотека. Аварийный выход для настроек, которые
-	// kafkax не покрывает, — не замена конфигурации.
-	//
-	// kgo.WithPools здесь не поддерживается: пулинг требует вызова
-	// Record.Recycle, которого пакет не делает, поэтому включённый через
-	// ExtraOpts пул просто перестанет возвращать память. См. IncomingMessage,
-	// раздел «Владение памятью».
-	ExtraOpts []kgo.Opt `yaml:"-"`
-
-	// OnPanic вызывается после восстановления паники в горутине библиотеки.
-	// site — точка восстановления (см. PanicSite и константы PanicSite*),
-	// recovered — значение из recover(), stack — стек на момент паники.
-	//
-	// Вызывается синхронно из той горутины, где произошла паника: не должен
-	// блокироваться надолго. Собственная паника хука перехватывается — с
-	// записью в лог и инкрементом kafkax.consumer.panics{site="on_panic"}, но
-	// без повторного вызова самого хука: рекурсия в обработчике паник
-	// кончилась бы переполнением стека.
-	//
-	// На панику обработчика вызывается один раз на сообщение, а не на попытку:
-	// при HandlerMaxRetries = -1 второе означало бы вызов без конца.
-	OnPanic func(ctx context.Context, site PanicSite, recovered any, stack []byte) `yaml:"-"`
-
-	// OnMessageSkipped решает судьбу сообщения, которое обработчик не осилил
-	// за HandlerMaxRetries попыток. Это единственный выход из «отравленного»
-	// сообщения, кроме остановки партиции.
-	//
-	// Возврат nil означает «я забрал сообщение» (записал в DLQ, в базу, в лог)
-	// — оффсет двигается дальше, сообщение считается skipped. Любая другая
-	// ошибка, как и отсутствие хука, означает «не забрал»: оффсет не двигается,
-	// партиция ставится на паузу, и после ребаланса или перезапуска сообщение
-	// приедет снова.
-	//
-	// Пауза, а не молчаливый пропуск, выбрана по умолчанию намеренно: коммит
-	// проваленного сообщения как skipped без хука означал бы потерю данных
-	// молча. Застрявшая партиция видна по лагу и по логу уровня Error, потеря
-	// — ничем.
-	//
-	// # Как вызывается
-	//
-	// Синхронно, из горутины партиционного воркера, и на всё время вызова
-	// партиция стоит: следующие сообщения не обрабатываются, а ребаланс,
-	// пришедший в этот момент, ждёт возврата из хука. Хук, живущий дольше
-	// Consumer.RebalanceTimeout, стоит группе исключения участника — то есть
-	// онLost вместо управляемого отзыва партиций.
-	//
-	// Паника внутри хука перехватывается и трактуется как «не забрал»: оффсет
-	// не двигается, партиция травится. Обратное — считать упавший хук
-	// забравшим — означало бы терять сообщение ровно тогда, когда его пытались
-	// спасти.
-	//
-	// # Контекст
-	//
-	// ctx — контекст обработки сообщения. Он отменяется при жёсткой остановке
-	// консьюмера и по истечении бюджета ожидания воркеров, то есть ровно во
-	// время shutdown, когда спасать сообщение и надо. Запись в DLQ с этим
-	// контекстом в такой момент провалится гарантированно.
-	//
-	// Поэтому внутри хука его следует отвязывать от отмены, оставляя себе
-	// собственный бюджет:
-	//
-	//	dlqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	//	defer cancel()
-	//
-	// Спан и trace-контекст при этом сохраняются: WithoutCancel снимает только
-	// отмену и дедлайн.
-	//
-	// # Владение памятью
-	//
-	// msg.Key и msg.Value — те же самые срезы, что видел обработчик, а не
-	// копии; см. IncomingMessage, раздел «Владение памятью». Читать их здесь
-	// безопасно, мутировать — нельзя.
-	OnMessageSkipped func(ctx context.Context, msg IncomingMessage, cause error) error `yaml:"-"`
 }
 
 // LogValue реализует slog.LogValuer для всей конфигурации: типовой способ
@@ -186,16 +101,15 @@ type Config struct {
 // вместо конфигурации. Пароль при этом не утекал, но и пользы от записи не
 // было — а исчезни поля-функции, не стало бы и защиты.
 //
-// Поля, которые в лог не помещаются (логгер, готовый *tls.Config, ExtraOpts,
-// хуки), заменены признаком наличия: их значение всё равно нечитаемо, а вот
-// факт, что хук задан, объясняет поведение, которого не видно в остальных
-// полях.
+// Признаков наличия логгера, готового *tls.Config, ExtraOpts и хуков здесь
+// больше нет: этих полей нет и в самом Config. Сведения не пропали — их
+// печатают NewProducer и NewConsumer записью «options» при создании клиента,
+// см. behavior.LogValue.
 //
 // Список полей здесь ручной, и разъехаться с самой структурой он может молча —
 // пропавшее поле не ломает ни компиляцию, ни чтение лога, оно просто перестаёт
 // в нём быть. Сторожит соответствие TestConfigLogValueCoversEveryField: он
-// обходит Config рефлексией и требует ключ на каждое поле, кроме тех, что
-// помечены yaml:"-" и разобраны в списке исключений поимённо.
+// обходит Config рефлексией и требует ключ на каждое поле.
 func (c Config) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.Any("brokers", c.Brokers),
@@ -207,10 +121,6 @@ func (c Config) LogValue() slog.Value {
 		slog.Any("producer", c.Producer),
 		slog.Any("consumer", c.Consumer),
 		slog.String("kafka_log_level", c.KafkaLogLevel),
-		slog.Bool("tls_config_set", c.TLSConfig != nil),
-		slog.Int("extra_opts", len(c.ExtraOpts)),
-		slog.Bool("on_panic_set", c.OnPanic != nil),
-		slog.Bool("on_message_skipped_set", c.OnMessageSkipped != nil),
 	)
 }
 
@@ -329,12 +239,14 @@ func (t TLS) enabled() bool { return t.Enabled }
 
 // transportEncrypted сообщает, будет ли соединение с брокером зашифровано.
 //
-// Порядок условий повторяет tlsConfig: готовый TLSConfig побеждает секцию TLS,
-// поэтому «TLS.Enabled=false, но TLSConfig задан» — это TLS, а не его
+// Порядок условий повторяет tlsConfig: готовый WithTLSConfig побеждает секцию
+// TLS, поэтому «TLS.Enabled=false, но WithTLSConfig задан» — это TLS, а не его
 // отсутствие. Расхождение этих двух мест означало бы, что валидация судит об
-// одном соединении, а собирается другое.
-func (c Config) transportEncrypted() bool {
-	return c.TLSConfig != nil || c.TLS.enabled()
+// одном соединении, а собирается другое. Именно поэтому набор опций доезжает
+// до валидации: без него Config.Validate судила бы о секции TLS, а клиент
+// собирался бы с чужим *tls.Config.
+func (c Config) transportEncrypted(b behavior) bool {
+	return b.tlsConfig != nil || c.TLS.enabled()
 }
 
 // ProducerConfig содержит параметры Kafka-продюсера.
@@ -598,8 +510,24 @@ func DefaultConfig() Config {
 // Конструкторы возвращают эту ошибку как есть, не оборачивая: обёртка через
 // fmt.Errorf дала бы Unwrap() error вместо Unwrap() []error и сломала бы
 // описанный выше разбор.
-func (c Config) Validate() error {
-	errs := c.commonErrors()
+//
+// Опции принимаются те же, что и конструкторами, и по той же причине, по
+// которой их принимает transportEncrypted: WithTLSConfig — часть ответа на
+// вопрос «будет ли соединение зашифровано», и без него проверка SASL PLAIN
+// отвергала бы полностью рабочую конфигурацию с mTLS из памяти. Роль здесь
+// обе сразу, поэтому WithPanicHook и WithSkipHook Validate принимает, хотя
+// NewProducer их и отвергнет.
+//
+// Ошибка разбора самих опций (ErrInapplicableOption, ErrNilOption) возвращается
+// до всякой проверки полей и в агрегат не входит: это ошибка вызова, а не
+// конфигурации.
+func (c Config) Validate(opts ...Option) error {
+	b, err := newBehavior(roleAny, opts...)
+	if err != nil {
+		return err
+	}
+
+	errs := c.commonErrors(b)
 	errs = append(errs, c.producerErrors()...)
 	errs = append(errs, c.consumerErrors()...)
 
@@ -607,13 +535,13 @@ func (c Config) Validate() error {
 }
 
 // validateProducer — проверка для NewProducer: общие поля и секция Producer.
-func (c Config) validateProducer() error {
-	return newConfigError("producer config", append(c.commonErrors(), c.producerErrors()...))
+func (c Config) validateProducer(b behavior) error {
+	return newConfigError("producer config", append(c.commonErrors(b), c.producerErrors()...))
 }
 
 // validateConsumer — проверка для NewConsumer: общие поля и секция Consumer.
-func (c Config) validateConsumer() error {
-	return newConfigError("consumer config", append(c.commonErrors(), c.consumerErrors()...))
+func (c Config) validateConsumer(b behavior) error {
+	return newConfigError("consumer config", append(c.commonErrors(b), c.consumerErrors()...))
 }
 
 // configError — агрегат ошибок валидации.
@@ -654,7 +582,7 @@ func (e *configError) Is(target error) bool {
 	return target == ErrInvalidConfig
 }
 
-func (c Config) commonErrors() []error {
+func (c Config) commonErrors(b behavior) []error {
 	var errs []error
 
 	if len(c.Brokers) == 0 {
@@ -677,13 +605,13 @@ func (c Config) commonErrors() []error {
 			c.KafkaLogLevel))
 	}
 
-	errs = append(errs, c.saslErrors()...)
+	errs = append(errs, c.saslErrors(b)...)
 	errs = append(errs, c.tlsErrors()...)
 
 	return errs
 }
 
-func (c Config) saslErrors() []error {
+func (c Config) saslErrors(b behavior) []error {
 	if !c.SASL.enabled() {
 		return nil
 	}
@@ -692,7 +620,7 @@ func (c Config) saslErrors() []error {
 
 	switch strings.ToUpper(c.SASL.Mechanism) {
 	case SASLMechanismPlain:
-		errs = append(errs, c.plaintextPasswordErrors()...)
+		errs = append(errs, c.plaintextPasswordErrors(b)...)
 	case SASLMechanismScramSHA256, SASLMechanismScramSHA512:
 	default:
 		errs = append(errs, fmt.Errorf(
@@ -733,14 +661,14 @@ func (c Config) saslErrors() []error {
 // шифрования законны (kfake в тестах, брокер в том же поде, TLS на сайдкаре), и
 // требуется от них ровно одно — чтобы решение было записано в конфигурации, а
 // не осталось следствием невыставленной переменной окружения.
-func (c Config) plaintextPasswordErrors() []error {
-	if c.transportEncrypted() || c.SASL.AllowPlaintext {
+func (c Config) plaintextPasswordErrors(b behavior) []error {
+	if c.transportEncrypted(b) || c.SASL.AllowPlaintext {
 		return nil
 	}
 
 	return []error{fmt.Errorf(
 		"SASL.Mechanism=%s without TLS sends the password to the broker in cleartext;"+
-			" set TLS.Enabled=true (or Config.TLSConfig), or switch to %s/%s,"+
+			" set TLS.Enabled=true (or pass WithTLSConfig), or switch to %s/%s,"+
 			" or set SASL.AllowPlaintext=true (env %s) to state that the plaintext"+
 			" connection is intended",
 		SASLMechanismPlain, SASLMechanismScramSHA256, SASLMechanismScramSHA512,
@@ -1106,9 +1034,12 @@ func appendBelowMinimum(errs []error, ds ...boundedDuration) []error {
 	return errs
 }
 
-// logger возвращает логгер библиотеки с проставленным component.
-func (c Config) logger(component string) *slog.Logger {
-	base := c.Logger
+// componentLogger возвращает логгер библиотеки с проставленным component.
+//
+// base — логгер из WithLogger; при nil берётся slog.Default(). Функция, а не
+// метод Config: с уходом поля Logger из структуры конфигурация к выбору логгера
+// отношения не имеет.
+func componentLogger(base *slog.Logger, component string) *slog.Logger {
 	if base == nil {
 		base = slog.Default()
 	}

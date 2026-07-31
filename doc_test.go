@@ -639,9 +639,10 @@ func TestDocumentationDefaultsMatchDefaultConfig(t *testing.T) {
 			def.Consumer.HandlerMaxRetries)
 	}
 
-	if def.OnMessageSkipped != nil {
-		t.Error("OnMessageSkipped по умолчанию задан, а doc.go называет умолчанием отравление партиции")
-	}
+	// Проверки «OnMessageSkipped по умолчанию nil» здесь больше нет: хук уехал
+	// из Config в опции конструктора, и умолчание теперь выражено самим их
+	// отсутствием — консьюмер без WithSkipHook травит партицию. Сторожит это
+	// TestFailureWithoutSkipHookPausesPartition в consumer_retry_test.go.
 
 	// «при Producer.EnableIdempotence = true (умолчание)».
 	if !def.Producer.EnableIdempotence {

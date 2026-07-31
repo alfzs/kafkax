@@ -146,13 +146,12 @@ func (b *syncBuffer) messages(t *testing.T) []string {
 // регулярками по тексту значило бы проверять форматирование slog. Журнал
 // клиента выключен потому, что проверка утверждает отсутствие строк, а чужая
 // строка сделала бы её бессмысленной.
-func captureLog(cfg *Config) *syncBuffer {
+func captureLog(cfg *Config) (*syncBuffer, Option) {
 	logs := &syncBuffer{}
 
-	cfg.Logger = slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	cfg.KafkaLogLevel = KafkaLogNone
 
-	return logs
+	return logs, WithLogger(slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 }
 
 // assertLogMessages сверяет журнал целиком, а не ищет в нём подстроку.
@@ -257,9 +256,9 @@ func TestProducerCloseWaitsForAcceptedSends(t *testing.T) {
 
 	hook := &prodBufferedHook{}
 	cfg := testConfig(t, brokers...)
-	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
+	bufferedHook := WithExtraOpts(kgo.WithHooks(hook))
 
-	p, err := NewProducer(cfg)
+	p, err := NewProducer(cfg, WithLogger(testLogger(t)), bufferedHook)
 	if err != nil {
 		t.Fatalf("NewProducer: %v", err)
 	}
@@ -355,9 +354,9 @@ func TestProducerCloseWaitsForSendNotYetInClient(t *testing.T) {
 	// Бюджет заведомо больше сценария: Close обязан дождаться отправки, а не
 	// уйти по таймеру — иначе тест не отличит ожидание от терпеливого отказа.
 	cfg.GracefulTimeout = 10 * time.Second
-	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
+	bufferedHook := WithExtraOpts(kgo.WithHooks(hook))
 
-	p := mustProducer(t, cfg)
+	p := mustProducer(t, cfg, bufferedHook)
 
 	if err := p.SendMessage(t.Context(), PublishRequest{Topic: testTopic, Value: []byte(deliveredValue)}); err != nil {
 		t.Fatalf("SendMessage до закрытия: %v", err)
@@ -421,9 +420,9 @@ func TestProducerCloseRaceWithSends(t *testing.T) {
 
 	hook := &prodBufferedHook{}
 	cfg := testConfig(t, brokers...)
-	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
+	bufferedHook := WithExtraOpts(kgo.WithHooks(hook))
 
-	p, err := NewProducer(cfg)
+	p, err := NewProducer(cfg, WithLogger(testLogger(t)), bufferedHook)
 	if err != nil {
 		t.Fatalf("NewProducer: %v", err)
 	}
@@ -531,7 +530,7 @@ func TestProducerCloseFlushBudgetExhausted(t *testing.T) {
 	t.Parallel()
 
 	cfg := testConfig(t)
-	logs := captureLog(&cfg)
+	logs, logOpt := captureLog(&cfg)
 	cfg.Producer.MessageTimeout = 30 * time.Second
 	cfg.GracefulTimeout = 200 * time.Millisecond
 	// Потолок flush заведомо больше остатка бюджета: min() обязан выбрать
@@ -539,9 +538,9 @@ func TestProducerCloseFlushBudgetExhausted(t *testing.T) {
 	cfg.Producer.FlushTimeout = 5 * time.Second
 
 	hook := &prodBufferedHook{}
-	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
+	bufferedHook := WithExtraOpts(kgo.WithHooks(hook))
 
-	p, err := NewProducer(cfg)
+	p, err := NewProducer(cfg, logOpt, bufferedHook)
 	if err != nil {
 		t.Fatalf("NewProducer: %v", err)
 	}
@@ -577,11 +576,13 @@ func TestProducerCloseFlushBudgetExhausted(t *testing.T) {
 		t.Errorf("FlushError.Err = %v, ожидался nil: flush не начинался", flushErr.Err)
 	}
 
-	// Журнал закрытия сверяется целиком: flush обязан не добавить к нему ни
-	// строки — ни числа записей, ни причины отказа. Событие едет одним каналом,
-	// и вызывающий, который логирует ошибку Close сам, не должен получать его
-	// дважды.
+	// Журнал сверяется целиком: flush обязан не добавить к нему ни строки — ни
+	// числа записей, ни причины отказа. Событие едет одним каналом, и
+	// вызывающий, который логирует ошибку Close сам, не должен получать его
+	// дважды. Первой строкой стоит сводка опций конструктора: она пишется на
+	// каждое успешное создание продюсера, и закрытый список её тоже сторожит.
 	assertLogMessages(t, logs,
+		"Kafka producer created",
 		"Starting kafka producer shutdown",
 		"Timed out waiting for in-flight sends, proceeding to flush",
 		"Kafka producer shutdown completed",
@@ -632,9 +633,9 @@ func TestProducerCloseLeavesNoGoroutines(t *testing.T) {
 	cfg.Producer.FlushTimeout = 200 * time.Millisecond
 
 	hook := newProdBlockHook(t)
-	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
+	bufferedHook := WithExtraOpts(kgo.WithHooks(hook))
 
-	p, err := NewProducer(cfg)
+	p, err := NewProducer(cfg, WithLogger(testLogger(t)), bufferedHook)
 	if err != nil {
 		t.Fatalf("NewProducer: %v", err)
 	}
@@ -901,9 +902,9 @@ func TestProducerCloseBoundedByGracefulTimeout(t *testing.T) {
 	cfg.Producer.FlushTimeout = 30 * time.Second
 
 	hook := &prodBufferedHook{}
-	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(hook)}
+	bufferedHook := WithExtraOpts(kgo.WithHooks(hook))
 
-	p, err := NewProducer(cfg)
+	p, err := NewProducer(cfg, WithLogger(testLogger(t)), bufferedHook)
 	if err != nil {
 		t.Fatalf("NewProducer: %v", err)
 	}
@@ -998,13 +999,13 @@ func TestProducerCloseFlushTimesOut(t *testing.T) {
 	// Без брокеров: testConfig подставит адрес, на котором никто не слушает,
 	// поэтому записи остаются в буфере клиента, пока их оттуда не выбросят.
 	cfg := testConfig(t)
-	logs := captureLog(&cfg)
+	logs, logOpt := captureLog(&cfg)
 	// Заведомо больше FlushTimeout: бюджет обязан достаться flush, а не
 	// кончиться раньше, иначе тест попадёт в соседнюю ветку.
 	cfg.GracefulTimeout = 10 * time.Second
 	cfg.Producer.FlushTimeout = 300 * time.Millisecond
 
-	p := mustProducer(t, cfg)
+	p := mustProducer(t, cfg, logOpt)
 
 	// Асинхронно и мимо SendMessage: счётчик отправок в полёте не трогается,
 	// поэтому awaitInflight пройдёт мгновенно и бюджет достанется flush
@@ -1041,8 +1042,9 @@ func TestProducerCloseFlushTimesOut(t *testing.T) {
 
 	// Вторая ветка отказа flush молчит так же, как первая: ожидания отправок
 	// здесь нет вовсе, поэтому в журнале обязаны остаться только две строки
-	// самого Close.
+	// самого Close — и сводка опций, записанная при создании.
 	assertLogMessages(t, logs,
+		"Kafka producer created",
 		"Starting kafka producer shutdown",
 		"Kafka producer shutdown completed",
 	)

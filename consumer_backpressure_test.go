@@ -73,10 +73,10 @@ func TestBackpressureOnLiveWorkerKeepsConsumerInGroup(t *testing.T) {
 	// воркера, — не случилось бы вовсе.
 	cfg.Consumer.MaxPollRecords = 1
 	cfg.Consumer.MessageQueueSize = 1
-	cfg.ExtraOpts = []kgo.Opt{
+	extra := WithExtraOpts(
 		kgo.WithHooks(watch),
 		kgo.OnPartitionsCallbackBlocked(func(context.Context, *kgo.Client) { blocked.Add(1) }),
-	}
+	)
 
 	prod := consNewProducer(t, brokers)
 
@@ -86,7 +86,7 @@ func TestBackpressureOnLiveWorkerKeepsConsumerInGroup(t *testing.T) {
 	}
 
 	h := &queueGate{open: make(chan struct{})}
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, extra)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 

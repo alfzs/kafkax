@@ -55,11 +55,11 @@ func TestPartitionWorkerPanicIsReportedAndPartitionGoesSilent(t *testing.T) {
 	watch := &pollWatch{}
 
 	cfg := testConfig(t, brokers...)
-	cfg.Logger = newWedgeLogger(t, topic)
-	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(watch)}
+	wedgeLogger := WithLogger(newWedgeLogger(t, topic))
+	pollHooks := WithExtraOpts(kgo.WithHooks(watch))
 
 	sites := &consTrace{}
-	cfg.OnPanic = func(_ context.Context, site PanicSite, _ any, stack []byte) {
+	panicHook := WithPanicHook(func(_ context.Context, site PanicSite, _ any, stack []byte) {
 		if len(stack) == 0 {
 			sites.add("empty-stack")
 
@@ -67,13 +67,13 @@ func TestPartitionWorkerPanicIsReportedAndPartitionGoesSilent(t *testing.T) {
 		}
 
 		sites.add(string(site))
-	}
+	})
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, "unread")
 
 	h := &mockHandler{}
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, wedgeLogger, pollHooks, panicHook)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 
@@ -107,11 +107,10 @@ func TestPartitionWorkerPanicIsReportedAndPartitionGoesSilent(t *testing.T) {
 
 	// Партиция замолчала, но ничего не потеряла: оффсет не отмечен, и запись
 	// приедет следующему владельцу. Свежему консьюмеру логгер-убийца не нужен —
-	// иначе он положил бы и его воркера, а тест проверял бы собственную оснастку.
-	clean := cfg
-	clean.Logger = testLogger(t)
-
-	got := consDrainFresh(t, clean, prod, topic, 0)
+	// иначе он положил бы и его воркера, а тест проверял бы собственную
+	// оснастку; теперь это следует из формы вызова: логгер приезжал опцией, и
+	// в consDrainFresh его нечего передавать.
+	got := consDrainFresh(t, cfg, prod, topic, 0)
 	if len(got) != 2 || got[0] != "unread" || got[1] != consMarkerValue {
 		t.Fatalf("свежий консьюмер получил %v, want [unread %s]: запись потеряна вместе с воркером",
 			got, consMarkerValue)
@@ -155,23 +154,23 @@ func TestDeadPartitionWorkerDoesNotStallPollLoop(t *testing.T) {
 	watch := &pollWatch{}
 
 	cfg := testConfig(t, brokers...)
-	cfg.Logger = newWedgeLogger(t, wedgeTopic)
-	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(watch)}
+	wedgeLogger := WithLogger(newWedgeLogger(t, wedgeTopic))
+	pollHooks := WithExtraOpts(kgo.WithHooks(watch))
 	// Одна ячейка очереди: с умолчанием в шестнадцать батчей переполнить её
 	// двумя записями нельзя, и dispatch до выбора между полной очередью и
 	// мёртвым воркером просто не дошёл бы.
 	cfg.Consumer.MessageQueueSize = 1
 
 	sites := &consTrace{}
-	cfg.OnPanic = func(_ context.Context, site PanicSite, _ any, _ []byte) {
+	panicHook := WithPanicHook(func(_ context.Context, site PanicSite, _ any, _ []byte) {
 		sites.add(string(site))
-	}
+	})
 
 	prod := consNewProducer(t, brokers)
 
 	wedge := &mockHandler{}
 	live := &mockHandler{}
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, wedgeLogger, pollHooks, panicHook)
 	mustAddHandler(t, c, wedgeTopic, wedge)
 	mustAddHandler(t, c, liveTopic, live)
 	consStart(t, c)
@@ -229,11 +228,9 @@ func TestDeadPartitionWorkerDoesNotStallPollLoop(t *testing.T) {
 
 	// Ни одна запись не потеряна: оффсет не отмечен ни за одну из них.
 	// Свежему консьюмеру логгер-убийца не нужен — иначе он положил бы и его
-	// воркера, а тест проверял бы собственную оснастку.
-	clean := cfg
-	clean.Logger = testLogger(t)
-
-	got := consDrainFresh(t, clean, prod, wedgeTopic, 0)
+	// воркера, а тест проверял бы собственную оснастку; теперь это следует из
+	// формы вызова: логгер приезжал опцией.
+	got := consDrainFresh(t, cfg, prod, wedgeTopic, 0)
 	if len(got) != 3 || got[0] != "first" || got[1] != "second" || got[2] != consMarkerValue {
 		t.Fatalf("свежий консьюмер получил %v, want [first second %s]: записи потеряны вместе с воркером",
 			got, consMarkerValue)
@@ -263,7 +260,7 @@ func TestShutdownUnblocksDispatchStuckOnFullQueue(t *testing.T) {
 	watch := &pollWatch{}
 
 	cfg := testConfig(t, brokers...)
-	cfg.ExtraOpts = []kgo.Opt{kgo.WithHooks(watch)}
+	pollHooks := WithExtraOpts(kgo.WithHooks(watch))
 	// Три батча по две записи на одну ячейку очереди: первый достаётся воркеру,
 	// второй занимает очередь, третий обязан остановить цикл опроса. Батч именно
 	// парный, а не одиночный: пока воркер висит на первой записи, вторая ждёт
@@ -284,7 +281,7 @@ func TestShutdownUnblocksDispatchStuckOnFullQueue(t *testing.T) {
 	}
 
 	h := &blockOnCancel{}
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, pollHooks)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 

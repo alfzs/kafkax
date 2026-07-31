@@ -260,10 +260,14 @@ func rawClient(t *testing.T, seeds []string, opts ...kgo.Opt) *kgo.Client {
 
 // openProducer создаёт продюсера по конфигурации теста и закрывает его по его
 // окончании.
-func openProducer(t *testing.T, cfg kafkax.Config) *kafkax.Producer {
+//
+// Логгер теста подставляется первой опцией: он был в configFor, пока Logger жил
+// в Config. Первой — чтобы тест мог заменить его своим, передав WithLogger
+// следом.
+func openProducer(t *testing.T, cfg kafkax.Config, opts ...kafkax.Option) *kafkax.Producer {
 	t.Helper()
 
-	producer, err := kafkax.NewProducer(cfg)
+	producer, err := kafkax.NewProducer(cfg, testOptions(t, opts...)...)
 	if err != nil {
 		t.Fatalf("NewProducer: %v", err)
 	}
@@ -382,13 +386,19 @@ func testConfig(t *testing.T) kafkax.Config {
 // configFor — та же конфигурация, но для произвольного адреса: тесты со своими
 // настройками брокера поднимают отдельный контейнер и общий harness им не
 // подходит.
+// testOptions ставит логгер теста перед опциями вызывающего.
+func testOptions(t *testing.T, opts ...kafkax.Option) []kafkax.Option {
+	t.Helper()
+
+	return append([]kafkax.Option{kafkax.WithLogger(testLogger(t))}, opts...)
+}
+
 func configFor(t *testing.T, addrs []string) kafkax.Config {
 	t.Helper()
 
 	cfg := kafkax.DefaultConfig()
 	cfg.Brokers = addrs
 	cfg.ClientID = "kafkax-integration"
-	cfg.Logger = testLogger(t)
 	cfg.GracefulTimeout = 20 * time.Second
 	cfg.DialTimeout = 10 * time.Second
 	// Логи franz-go на Warn: на Info настоящий брокер комментирует каждый
@@ -477,7 +487,7 @@ func (c *collector) has(value string) bool {
 	return slices.Contains(c.values, value)
 }
 
-// logSpy — slog.Handler, запоминающий записи, которые в cfg.Logger пишут и сам
+// logSpy — slog.Handler, запоминающий записи, которые в логгер библиотеки пишут и сам
 // пакет, и franz-go через kslog.
 //
 // Логгер, а не подменённый otel.SetMeterProvider: причина эпизода уезжает в оба

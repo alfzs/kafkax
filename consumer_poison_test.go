@@ -39,7 +39,7 @@ func TestConsumerPoisonedPartitionResumesOnReassignment(t *testing.T) {
 	// вернулась» на нём не воспроизводится. RoundRobin отзывает всё и раздаёт
 	// заново, поэтому уход второго участника гарантированно оборачивается
 	// назначением p0 первому.
-	cfg.ExtraOpts = []kgo.Opt{kgo.Balancers(kgo.RoundRobinBalancer())}
+	roundRobin := WithExtraOpts(kgo.Balancers(kgo.RoundRobinBalancer()))
 
 	p := mustProducer(t, cfg)
 	if err := p.SendMessage(t.Context(), PublishRequest{
@@ -52,7 +52,7 @@ func TestConsumerPoisonedPartitionResumesOnReassignment(t *testing.T) {
 	failing := errors.New("обработчик падает всегда")
 
 	handlerA := &mockHandler{returnErr: failing}
-	consumerA := mustConsumer(t, cfg)
+	consumerA := mustConsumer(t, cfg, roundRobin)
 	mustAddHandler(t, consumerA, testTopic, handlerA)
 	consStart(t, consumerA)
 
@@ -63,7 +63,7 @@ func TestConsumerPoisonedPartitionResumesOnReassignment(t *testing.T) {
 	// Второй участник запускает ребаланс. Кому именно достанется p0, тест не
 	// загадывает: важно только, что после ухода второго она вернётся первому.
 	handlerB := &mockHandler{returnErr: failing}
-	consumerB := mustConsumer(t, cfg)
+	consumerB := mustConsumer(t, cfg, roundRobin)
 	mustAddHandler(t, consumerB, testTopic, handlerB)
 	consStart(t, consumerB)
 

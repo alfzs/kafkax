@@ -68,11 +68,11 @@ func TestMessageBuffersOutliveHandlerAndAreShared(t *testing.T) {
 	cfg.Consumer.HandlerMaxRetries = 1
 
 	hook := &sliceRecorder{}
-	cfg.OnMessageSkipped = func(_ context.Context, msg IncomingMessage, _ error) error {
+	skipHook := WithSkipHook(func(_ context.Context, msg IncomingMessage, _ error) error {
 		hook.add(msg.Value)
 
 		return nil
-	}
+	})
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, consPoisonValue)
@@ -84,7 +84,7 @@ func TestMessageBuffersOutliveHandlerAndAreShared(t *testing.T) {
 		return errConsBoom
 	}}
 
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, skipHook)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 

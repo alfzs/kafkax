@@ -464,7 +464,7 @@ func (c *Consumer) processRecord(
 }
 
 // resolveFailure решает судьбу сообщения, которое обработчик не осилил за все
-// попытки: отдать его OnMessageSkipped или остановить партицию.
+// попытки: отдать его SkipHook (см. WithSkipHook) или остановить партицию.
 //
 // Возвращает статус для метрик. consumerStatusError означает, что оффсет
 // отмечать нельзя и партиция отравлена; consumerStatusSkipped — что хук забрал
@@ -472,7 +472,7 @@ func (c *Consumer) processRecord(
 //
 // Уровень лога выбирается здесь и только здесь — это и есть причина, по которой
 // runHandler на исчерпании повторов молчит. Исход знает лишь resolveFailure: при
-// работающем OnMessageSkipped отказ обработчика — штатное событие с Warn, и
+// работающем SkipHook отказ обработчика — штатное событие с Warn, и
 // Error из глубины стека давал бы постоянный фон Error на исправной работе,
 // то есть ровно ту причину, по которой на Error перестают реагировать.
 // Отравление партиции, наоборот, всегда Error — но одной записью, а не тремя на
@@ -487,7 +487,7 @@ func (c *Consumer) resolveFailure(
 	attempts int,
 	log *recordLogger,
 ) string {
-	if c.config.OnMessageSkipped == nil {
+	if c.behavior.skipHook == nil {
 		c.poison(client, key, w, log, cause,
 			slog.Int("attempts", attempts),
 			slog.String("reason", "no OnMessageSkipped hook is configured"))
@@ -511,7 +511,7 @@ func (c *Consumer) resolveFailure(
 	return consumerStatusSkipped
 }
 
-// callSkipHook вызывает OnMessageSkipped под собственным recover.
+// callSkipHook вызывает SkipHook под собственным recover.
 //
 // Хук — чужой код, исполняемый в горутине воркера уже после того, как recover
 // вокруг обработчика отработал: его собственная паника прошла бы мимо и уронила
@@ -534,7 +534,7 @@ func (c *Consumer) callSkipHook(ctx context.Context, msg IncomingMessage, cause 
 		}
 	}()
 
-	return c.config.OnMessageSkipped(ctx, msg, cause)
+	return c.behavior.skipHook(ctx, msg, cause)
 }
 
 // poison останавливает партицию на неотмеченном оффсете.

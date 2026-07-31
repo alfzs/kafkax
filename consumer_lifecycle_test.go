@@ -87,7 +87,7 @@ func TestStopReportsFailedFinalCommit(t *testing.T) {
 	levels := &levelCount{}
 
 	cfg := testConfig(t, brokers...)
-	cfg.Logger = slog.New(&levelCountHandler{inner: cfg.Logger.Handler(), count: levels})
+	logger := WithLogger(slog.New(&levelCountHandler{inner: testLogger(t).Handler(), count: levels}))
 	// Логи franz-go выключены целиком: мёртвый кластер он комментирует своими
 	// записями уровня Error («group manage loop errored»), и без порога тест
 	// считал бы их наравне с записями пакета. Заодно это единственный сценарий,
@@ -104,7 +104,7 @@ func TestStopReportsFailedFinalCommit(t *testing.T) {
 	prod.send(t, testTopic, 0, "processed")
 
 	h := &mockHandler{}
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, logger)
 	mustAddHandler(t, c, testTopic, h)
 	consStart(t, c)
 
@@ -408,7 +408,7 @@ func TestHandlerPanicRecovered(t *testing.T) {
 	cfg := testConfig(t, brokers...)
 
 	sites := &consTrace{}
-	cfg.OnPanic = func(_ context.Context, site PanicSite, recovered any, stack []byte) {
+	panicHook := WithPanicHook(func(_ context.Context, site PanicSite, recovered any, stack []byte) {
 		if len(stack) == 0 {
 			sites.add("empty-stack")
 
@@ -416,7 +416,7 @@ func TestHandlerPanicRecovered(t *testing.T) {
 		}
 
 		sites.add(fmt.Sprintf("%s:%v", site, recovered))
-	}
+	})
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, "boom")
@@ -430,7 +430,7 @@ func TestHandlerPanicRecovered(t *testing.T) {
 		return nil
 	}}
 
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, panicHook)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 
@@ -486,9 +486,9 @@ func TestOnPanicHookPanicDoesNotCrashConsumer(t *testing.T) {
 
 	brokers := newFakeCluster(t, 2, topic)
 	cfg := testConfig(t, brokers...)
-	cfg.OnPanic = func(context.Context, PanicSite, any, []byte) {
+	panicHook := WithPanicHook(func(context.Context, PanicSite, any, []byte) {
 		panic("hook exploded too")
-	}
+	})
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, "boom")
@@ -502,7 +502,7 @@ func TestOnPanicHookPanicDoesNotCrashConsumer(t *testing.T) {
 		return nil
 	}}
 
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, panicHook)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 

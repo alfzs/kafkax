@@ -25,10 +25,7 @@ func TestRoundTrip(t *testing.T) {
 	topic := newTopic(t, 1)
 	cfg := testConfig(t)
 
-	producer, err := kafkax.NewProducer(cfg)
-	if err != nil {
-		t.Fatalf("NewProducer: %v", err)
-	}
+	producer := openProducer(t, cfg)
 
 	closeProducer(t, producer)
 
@@ -77,12 +74,15 @@ func TestRoundTrip(t *testing.T) {
 }
 
 // startConsumer создаёт консьюмера, регистрирует обработчик и запускает его.
+//
+// Логгер теста, как и в openProducer, подставляется первой опцией.
 func startConsumer(
 	t *testing.T, cfg kafkax.Config, topic string, handler kafkax.ConsumerHandler,
+	opts ...kafkax.Option,
 ) *kafkax.Consumer {
 	t.Helper()
 
-	consumer, err := kafkax.NewConsumer(cfg)
+	consumer, err := kafkax.NewConsumer(cfg, testOptions(t, opts...)...)
 	if err != nil {
 		t.Fatalf("NewConsumer: %v", err)
 	}

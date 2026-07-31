@@ -331,11 +331,11 @@ func TestSkipHookNilCommitsAndContinues(t *testing.T) { //nolint:paralleltest //
 	cfg := testConfig(t, brokers...)
 
 	skipped := &consTrace{}
-	cfg.OnMessageSkipped = func(_ context.Context, msg IncomingMessage, _ error) error {
+	skipHook := WithSkipHook(func(_ context.Context, msg IncomingMessage, _ error) error {
 		skipped.add(string(msg.Value))
 
 		return nil
-	}
+	})
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, consPoisonValue)
@@ -349,7 +349,7 @@ func TestSkipHookNilCommitsAndContinues(t *testing.T) { //nolint:paralleltest //
 		return nil
 	}}
 
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, skipHook)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 
@@ -396,9 +396,9 @@ func TestSkipHookErrorPausesPartition(t *testing.T) { //nolint:paralleltest // c
 
 	brokers := newFakeCluster(t, 2, topic)
 	cfg := testConfig(t, brokers...)
-	cfg.OnMessageSkipped = func(context.Context, IncomingMessage, error) error {
+	skipHook := WithSkipHook(func(context.Context, IncomingMessage, error) error {
 		return errors.New("dlq unavailable")
-	}
+	})
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, consPoisonValue)
@@ -412,7 +412,7 @@ func TestSkipHookErrorPausesPartition(t *testing.T) { //nolint:paralleltest // c
 		return nil
 	}}
 
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, skipHook)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 
@@ -456,14 +456,14 @@ func TestSkipHookPanicPausesPartition(t *testing.T) { //nolint:paralleltest // c
 
 	brokers := newFakeCluster(t, 2, topic)
 	cfg := testConfig(t, brokers...)
-	cfg.OnMessageSkipped = func(context.Context, IncomingMessage, error) error {
+	skipHook := WithSkipHook(func(context.Context, IncomingMessage, error) error {
 		panic("hook exploded")
-	}
+	})
 
 	sites := &consTrace{}
-	cfg.OnPanic = func(_ context.Context, site PanicSite, _ any, _ []byte) {
+	panicHook := WithPanicHook(func(_ context.Context, site PanicSite, _ any, _ []byte) {
 		sites.add(string(site))
-	}
+	})
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, topic, 0, consPoisonValue)
@@ -477,7 +477,7 @@ func TestSkipHookPanicPausesPartition(t *testing.T) { //nolint:paralleltest // c
 		return nil
 	}}
 
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, skipHook, panicHook)
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 
