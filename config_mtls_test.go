@@ -115,7 +115,7 @@ func TestTLSConfigLoadsClientKeyPair(t *testing.T) {
 		ClientKeyPath:  keyPath,
 	}
 
-	got, err := cfg.tlsConfig(testLogger(t))
+	got, err := cfg.tlsConfig(testBehavior(t))
 	if err != nil {
 		t.Fatalf("tlsConfig: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestTLSConfigLoadsClientKeyPair(t *testing.T) {
 		t.Error("приватный ключ не загружен: сертификат нечем подтвердить")
 	}
 
-	opts, err := cfg.producerOpts(testLogger(t))
+	opts, err := cfg.producerOpts(testBehavior(t))
 	if err != nil {
 		t.Fatalf("producerOpts: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestTLSConfigLoadsCACertificate(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.TLS = TLS{Enabled: true, CACertPath: certPath}
 
-	got, err := cfg.tlsConfig(testLogger(t))
+	got, err := cfg.tlsConfig(testBehavior(t))
 	if err != nil {
 		t.Fatalf("tlsConfig: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestTLSConfigRejectsBrokenClientKeyPair(t *testing.T) {
 			cfg := testConfig(t)
 			cfg.TLS = TLS{Enabled: true, ClientCertPath: tt.cert, ClientKeyPath: tt.key}
 
-			got, err := cfg.tlsConfig(testLogger(t))
+			got, err := cfg.tlsConfig(testBehavior(t))
 			// Общий префикс называет секцию конфигурации; частный текст —
 			// причину. Проверяются оба: без префикса ошибка ОС о файле не
 			// подсказывает, при чём тут Kafka, а без причины непонятно, что

@@ -117,23 +117,34 @@ var _ MessageProducer = (*Producer)(nil)
 // NewProducer создаёт продюсер и подключается к брокерам лениво:
 // franz-go не ходит в сеть при создании клиента, так что ошибка здесь —
 // всегда ошибка конфигурации, а не доступности кластера.
-func NewProducer(config Config) (*Producer, error) {
-	// Не оборачивается: у агрегата валидации Unwrap() []error, и fmt.Errorf
-	// подменил бы его на Unwrap() error — документированный разбор списка
-	// перестал бы работать ровно там, где он нужен.
-	if err := config.validateProducer(); err != nil {
+//
+// config — сериализуемые настройки, opts — поведение: WithLogger,
+// WithTLSConfig, WithExtraOpts. Консьюмерские WithPanicHook и WithSkipHook
+// отвергаются с ErrInapplicableOption, а не игнорируются молча: у продюсера нет
+// ни собственных горутин, ни обработчиков, и применить их не к чему.
+func NewProducer(config Config, opts ...Option) (*Producer, error) {
+	b, err := newBehavior(roleProducer, opts...)
+	if err != nil {
 		return nil, err
 	}
 
-	logger := config.logger("kafka_producer")
+	// Не оборачивается: у агрегата валидации Unwrap() []error, и fmt.Errorf
+	// подменил бы его на Unwrap() error — документированный разбор списка
+	// перестал бы работать ровно там, где он нужен.
+	if err := config.validateProducer(b); err != nil {
+		return nil, err
+	}
 
-	opts, err := config.producerOpts(logger)
+	logger := componentLogger(b.logger, "kafka_producer")
+	b.logger = logger
+
+	kopts, err := config.producerOpts(b)
 	if err != nil {
 		return nil, fmt.Errorf("building producer options: %w", err)
 	}
 
 	tel := newTelemetry(config.ClientID, "")
-	opts = append(opts, kgo.WithHooks(tel.hooks...))
+	kopts = append(kopts, kgo.WithHooks(tel.hooks...))
 
 	p := &Producer{
 		logger:          logger,
@@ -147,12 +158,19 @@ func NewProducer(config Config) (*Producer, error) {
 		return nil, err
 	}
 
-	client, err := kgo.NewClient(opts...)
+	client, err := kgo.NewClient(kopts...)
 	if err != nil {
 		return nil, fmt.Errorf("creating kafka client: %w", err)
 	}
 
 	p.client = client
+
+	// Сводка опций пишется здесь, а не остаётся признаками в Config.LogValue:
+	// поведение больше не часть конфигурации, и приложение, логирующее Config
+	// на старте, о нём бы уже не узнало. Запись одна на продюсер и только на
+	// успешное создание — отказавший конструктор о своих опциях не
+	// рассказывает, о нём рассказывает ошибка.
+	logger.Info("Kafka producer created", slog.Any("options", b))
 
 	return p, nil
 }

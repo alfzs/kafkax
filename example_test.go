@@ -153,3 +153,40 @@ func ExampleNewConsumer() {
 		kafkax.ErrNoHandlers,
 	}
 }
+
+// ExampleWithSkipHook — единственный выход из «отравленного» сообщения, кроме
+// остановки партиции.
+//
+// Хук задаётся опцией конструктора, а не полем Config: он живое значение, и в
+// yaml-файле его не бывает. Возврат nil означает «я забрал сообщение» — оффсет
+// двигается дальше; любая ошибка означает «не забрал» — партиция встаёт.
+func ExampleWithSkipHook() {
+	cfg := kafkax.Config{
+		Brokers:  []string{"kafka-1:9092", "kafka-2:9092"},
+		ClientID: "orders-service",
+		Consumer: kafkax.ConsumerConfig{
+			Group: "orders-service.group",
+			// Хук зовётся, когда исчерпаны все попытки обработчика.
+			HandlerRetries: 2,
+		},
+	}
+
+	consumer, err := kafkax.NewConsumer(cfg, kafkax.WithSkipHook(
+		func(ctx context.Context, msg kafkax.IncomingMessage, cause error) error {
+			// Контекст отвязывается от отмены: хук зовут и во время shutdown,
+			// когда исходный ctx уже отменён, — а спасать сообщение надо
+			// именно тогда.
+			dlqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+
+			return writeToDLQ(dlqCtx, msg, cause)
+		}))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer consumer.Stop() //nolint:errcheck // пример из README
+}
+
+// writeToDLQ — место прикладной записи в очередь недоставленных сообщений.
+func writeToDLQ(context.Context, kafkax.IncomingMessage, error) error { return nil }

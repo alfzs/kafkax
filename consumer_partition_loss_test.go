@@ -165,7 +165,6 @@ func TestPartitionsLostDoesNotCommit(t *testing.T) {
 
 	logger, logged := spyLogger(t)
 	cfg := testConfig(t, brokers...)
-	cfg.Logger = logger
 	// Автокоммит обязан не успеть: тикер закоммитил бы отмеченный оффсет
 	// раньше потери партиций, и тест выродился бы в проверку автокоммита.
 	cfg.Consumer.CommitInterval = time.Hour
@@ -188,7 +187,7 @@ func TestPartitionsLostDoesNotCommit(t *testing.T) {
 		return errConsBoom
 	}}
 
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, WithLogger(logger))
 	mustAddHandler(t, c, topic, h)
 	consStart(t, c)
 

@@ -87,7 +87,7 @@ func TestTruncationBelowCommittedOffset(t *testing.T) {
 		topic := primeTruncatedTopic(t, cfg)
 
 		spy := newLogSpy(t)
-		cfg.Logger = slog.New(spy)
+		logOpt := kafkax.WithLogger(slog.New(spy))
 		cfg.Consumer.InitialOffset = kafkax.OffsetEarliest
 		// Порог поднят с Warn до Info на один этот сценарий: о сбросе franz-go
 		// сообщает сам, и его запись — единственное прямое свидетельство того,
@@ -96,7 +96,7 @@ func TestTruncationBelowCommittedOffset(t *testing.T) {
 		cfg.KafkaLogLevel = kafkax.KafkaLogInfo
 
 		resumed := &collector{}
-		startConsumer(t, cfg, topic, resumed)
+		startConsumer(t, cfg, topic, resumed, logOpt)
 
 		await(t, "консьюмер вычитал хвост, переживший усечение", func() bool {
 			return resumed.has(keptValues[len(keptValues)-1])
@@ -136,19 +136,14 @@ func TestTruncationBelowCommittedOffset(t *testing.T) {
 		topic := primeTruncatedTopic(t, cfg)
 
 		spy := newLogSpy(t)
-		cfg.Logger = slog.New(spy)
+		logOpt := kafkax.WithLogger(slog.New(spy))
 		cfg.Consumer.InitialOffset = kafkax.OffsetLatest
 		cfg.KafkaLogLevel = kafkax.KafkaLogInfo
 
-		producer, err := kafkax.NewProducer(cfg)
-		if err != nil {
-			t.Fatalf("NewProducer: %v", err)
-		}
-
-		closeProducer(t, producer)
+		producer := openProducer(t, cfg)
 
 		resumed := &collector{}
-		startConsumer(t, cfg, topic, resumed)
+		startConsumer(t, cfg, topic, resumed, logOpt)
 
 		// Маркер отправляется на каждой попытке, а не однажды: «конец лога»
 		// вычисляется в момент сброса, и единственный маркер, посланный до
@@ -199,12 +194,7 @@ func primeTruncatedTopic(t *testing.T, cfg kafkax.Config) string {
 
 	topic := newTopic(t, 1)
 
-	producer, err := kafkax.NewProducer(cfg)
-	if err != nil {
-		t.Fatalf("NewProducer: %v", err)
-	}
-
-	closeProducer(t, producer)
+	producer := openProducer(t, cfg)
 
 	send := func(values []string) {
 		t.Helper()

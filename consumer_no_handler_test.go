@@ -76,16 +76,16 @@ func TestRecordWithoutHandlerPausesPartitionAtUncommittedOffset(t *testing.T) {
 
 	brokers := newFakeCluster(t, 1, handledTopic, unhandledTopic)
 	cfg := testConfig(t, brokers...)
-	cfg.Logger = slog.New(&errorLogHandler{inner: cfg.Logger.Handler(), log: errs})
+	logger := WithLogger(slog.New(&errorLogHandler{inner: testLogger(t).Handler(), log: errs}))
 	// Подписка шире карты обработчиков: ровно то состояние, в котором
 	// processRecord не находит обработчика для приехавшей записи.
-	cfg.ExtraOpts = []kgo.Opt{kgo.ConsumeTopics(handledTopic, unhandledTopic)}
+	wideSubscription := WithExtraOpts(kgo.ConsumeTopics(handledTopic, unhandledTopic))
 
 	prod := consNewProducer(t, brokers)
 	prod.send(t, unhandledTopic, 0, orphanValue)
 
 	h := &mockHandler{}
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, logger, wideSubscription)
 	mustAddHandler(t, c, handledTopic, h)
 	consStart(t, c)
 
@@ -128,12 +128,10 @@ func TestRecordWithoutHandlerPausesPartitionAtUncommittedOffset(t *testing.T) {
 	// Оффсет не отмечен: запись приедет следующему владельцу партиции.
 	// Свежему консьюмеру расширенная подписка не нужна — обработчик у него
 	// как раз для этого топика и есть, а лишний топик заставил бы его
-	// отравиться на ровном месте.
-	clean := cfg
-	clean.Logger = testLogger(t)
-	clean.ExtraOpts = nil
-
-	got := consDrainFresh(t, clean, prod, unhandledTopic, 0)
+	// отравиться на ровном месте. Теперь это следует из самой формы вызова:
+	// подписка и логгер приезжали опциями, а не конфигурацией, и в
+	// consDrainFresh их просто нечего передавать.
+	got := consDrainFresh(t, cfg, prod, unhandledTopic, 0)
 	if len(got) != 2 || got[0] != orphanValue || got[1] != consMarkerValue {
 		t.Fatalf("свежий консьюмер получил %v, want [%s %s]: оффсет отмечен за необработанной записью",
 			got, orphanValue, consMarkerValue)

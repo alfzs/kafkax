@@ -83,8 +83,8 @@ func TestConfigValidateAcceptsValidConfig(t *testing.T) {
 	// testConfig — база для остальных тестов пакета, и её протухание
 	// проявилось бы падениями в чужих файлах без внятной причины.
 	cfgWantNoErr(t, cfg.Validate())
-	cfgWantNoErr(t, cfg.validateProducer())
-	cfgWantNoErr(t, cfg.validateConsumer())
+	cfgWantNoErr(t, cfg.validateProducer(behavior{}))
+	cfgWantNoErr(t, cfg.validateConsumer(behavior{}))
 }
 
 func TestConfigValidateCommonFields(t *testing.T) {
@@ -137,8 +137,8 @@ func TestConfigValidateCommonFields(t *testing.T) {
 			// Общие поля обязаны проверяться обеими ролевыми проверками:
 			// продюсер без brokers так же нежизнеспособен, как консьюмер.
 			cfgWantErr(t, cfg.Validate(), tt.want)
-			cfgWantErr(t, cfg.validateProducer(), tt.want)
-			cfgWantErr(t, cfg.validateConsumer(), tt.want)
+			cfgWantErr(t, cfg.validateProducer(behavior{}), tt.want)
+			cfgWantErr(t, cfg.validateConsumer(behavior{}), tt.want)
 		})
 	}
 }
@@ -152,7 +152,7 @@ func TestConfigValidateCollectsAllErrors(t *testing.T) {
 	cfg.GracefulTimeout = 0
 	cfg.DialTimeout = -time.Second
 
-	errs := cfgUnwrapJoined(t, cfg.validateProducer())
+	errs := cfgUnwrapJoined(t, cfg.validateProducer(behavior{}))
 
 	// Ровно четыре дефекта — ровно четыре ошибки. Проверяется не текст, а
 	// количество: возврат по первой ошибке дал бы единицу.
@@ -160,7 +160,7 @@ func TestConfigValidateCollectsAllErrors(t *testing.T) {
 		t.Fatalf("получено %d ошибок, ожидалось 4: %v", len(errs), errs)
 	}
 
-	cfgWantErr(t, cfg.validateProducer(),
+	cfgWantErr(t, cfg.validateProducer(behavior{}),
 		cfgLabel("Brokers")+" must not be empty",
 		cfgLabel("ClientID")+" must not be empty",
 		cfgLabel("GracefulTimeout")+" must be positive",
@@ -199,8 +199,8 @@ func TestConfigValidateSectionsAreIndependent(t *testing.T) {
 		cfg.Consumer.MaxPollRecords = 0
 		cfg.Consumer.InitialOffset = "sideways"
 
-		cfgWantNoErr(t, cfg.validateProducer())
-		cfgWantErr(t, cfg.validateConsumer(), cfgLabel("Consumer.Group")+" must not be empty")
+		cfgWantNoErr(t, cfg.validateProducer(behavior{}))
+		cfgWantErr(t, cfg.validateConsumer(behavior{}), cfgLabel("Consumer.Group")+" must not be empty")
 		cfgWantErr(t, cfg.Validate(), cfgLabel("Consumer.Group")+" must not be empty")
 	})
 
@@ -212,8 +212,8 @@ func TestConfigValidateSectionsAreIndependent(t *testing.T) {
 		cfg.Producer.CompressionType = "brotli"
 		cfg.Producer.MaxInflight = 0
 
-		cfgWantNoErr(t, cfg.validateConsumer())
-		cfgWantErr(t, cfg.validateProducer(), cfgLabel("Producer.MessageTimeout")+" must be positive")
+		cfgWantNoErr(t, cfg.validateConsumer(behavior{}))
+		cfgWantErr(t, cfg.validateProducer(behavior{}), cfgLabel("Producer.MessageTimeout")+" must be positive")
 		cfgWantErr(t, cfg.Validate(), cfgLabel("Producer.MessageTimeout")+" must be positive")
 	})
 }
@@ -294,7 +294,7 @@ func TestConfigValidateSASL(t *testing.T) {
 			cfg.SASL = tt.sasl
 			cfg.TLS = tt.tls
 
-			err := cfg.validateProducer()
+			err := cfg.validateProducer(behavior{})
 			if tt.wantErrs == 0 {
 				cfgWantNoErr(t, err)
 
@@ -327,6 +327,7 @@ func TestConfigValidateSASLPlaintext(t *testing.T) {
 	tests := []struct {
 		name    string
 		mutate  func(*Config)
+		opts    []Option
 		wantErr bool
 	}{
 		{
@@ -346,12 +347,14 @@ func TestConfigValidateSASLPlaintext(t *testing.T) {
 			mutate: func(c *Config) { c.TLS = TLS{Enabled: true} },
 		},
 		{
-			// Готовый TLSConfig побеждает секцию TLS целиком (см. tlsConfig), и
-			// валидация обязана судить о том же соединении, которое соберётся:
-			// иначе mTLS из памяти — полностью поддерживаемый путь — упирался бы
-			// в требование выставить ещё и tls.enabled.
-			name:   "PLAIN с готовым TLSConfig",
-			mutate: func(c *Config) { c.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13} },
+			// Готовый *tls.Config побеждает секцию TLS целиком (см. tlsConfig),
+			// и валидация обязана судить о том же соединении, которое
+			// соберётся: иначе mTLS из памяти — полностью поддерживаемый путь —
+			// упирался бы в требование выставить ещё и tls.enabled. Опция
+			// доезжает до валидации ровно за этим.
+			name:   "PLAIN с готовым WithTLSConfig",
+			mutate: func(*Config) {},
+			opts:   []Option{WithTLSConfig(&tls.Config{MinVersion: tls.VersionTLS13})},
 		},
 		{
 			name:   "PLAIN без TLS с явным опт-аутом",
@@ -377,18 +380,20 @@ func TestConfigValidateSASLPlaintext(t *testing.T) {
 			cfg.SASL = SASL{Mechanism: SASLMechanismPlain, Username: "u", Password: redactionCanary}
 			tt.mutate(&cfg)
 
+			b := testBehavior(t, tt.opts...)
+
 			if !tt.wantErr {
-				cfgWantNoErr(t, cfg.validateProducer())
-				cfgWantNoErr(t, cfg.validateConsumer())
+				cfgWantNoErr(t, cfg.validateProducer(b))
+				cfgWantNoErr(t, cfg.validateConsumer(b))
 
 				return
 			}
 
 			// Проверка общая, а не продюсерская: пароль уходит в сеть с любой
 			// стороны, и консьюмер обязан отвергать ту же конфигурацию.
-			err := cfg.validateProducer()
+			err := cfg.validateProducer(b)
 			cfgWantErr(t, err, plaintextErr, "SASL.AllowPlaintext=true")
-			cfgWantErr(t, cfg.validateConsumer(), plaintextErr)
+			cfgWantErr(t, cfg.validateConsumer(b), plaintextErr)
 
 			if strings.Contains(err.Error(), redactionCanary) {
 				t.Errorf("пароль попал в текст ошибки валидации:\n%v", err)
@@ -457,7 +462,7 @@ func TestConfigValidateTLS(t *testing.T) {
 			cfg := testConfig(t)
 			cfg.TLS = tt.tls
 
-			err := cfg.validateProducer()
+			err := cfg.validateProducer(behavior{})
 			if tt.want == "" {
 				cfgWantNoErr(t, err)
 
@@ -572,7 +577,7 @@ func TestConfigValidateProducerFields(t *testing.T) {
 			cfg := testConfig(t)
 			tt.mutate(&cfg.Producer)
 
-			err := cfg.validateProducer()
+			err := cfg.validateProducer(behavior{})
 			if tt.want == "" {
 				cfgWantNoErr(t, err)
 
@@ -581,7 +586,7 @@ func TestConfigValidateProducerFields(t *testing.T) {
 
 			cfgWantErr(t, err, tt.want)
 			// Та же претензия не должна возникать у консьюмера.
-			cfgWantNoErr(t, cfg.validateConsumer())
+			cfgWantNoErr(t, cfg.validateConsumer(behavior{}))
 		})
 	}
 }
@@ -637,7 +642,7 @@ func TestConfigValidateAcksAndIdempotence(t *testing.T) {
 			cfg.Producer.RequiredAcks = tt.acks
 			cfg.Producer.EnableIdempotence = tt.idempotence
 
-			err := cfg.validateProducer()
+			err := cfg.validateProducer(behavior{})
 			if tt.want == "" {
 				cfgWantNoErr(t, err)
 
@@ -866,7 +871,7 @@ func TestConfigValidateFetchSizesReportSeparately(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Consumer.MaxBytes = 0
 
-	errs := cfgUnwrapJoined(t, cfg.validateConsumer())
+	errs := cfgUnwrapJoined(t, cfg.validateConsumer(behavior{}))
 	if len(errs) != 1 {
 		t.Fatalf("получено %d ошибок, ожидалась одна: %v", len(errs), errs)
 	}
@@ -891,7 +896,7 @@ func TestConfigValidateSessionTimeoutReportsOnce(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Consumer.SessionTimeout = 0
 
-	err := cfg.validateConsumer()
+	err := cfg.validateConsumer(behavior{})
 	cfgWantErr(t, err, cfgLabel("Consumer.SessionTimeout")+" must be positive")
 
 	if strings.Contains(err.Error(), "third of Consumer.SessionTimeout") {
@@ -966,7 +971,7 @@ func TestConfigValidateConsumerFields(t *testing.T) {
 			cfg := testConfig(t)
 			tt.mutate(&cfg.Consumer)
 
-			err := cfg.validateConsumer()
+			err := cfg.validateConsumer(behavior{})
 			if tt.want == "" {
 				cfgWantNoErr(t, err)
 
@@ -975,7 +980,7 @@ func TestConfigValidateConsumerFields(t *testing.T) {
 
 			cfgWantErr(t, err, tt.want)
 			// Секция Consumer не должна волновать продюсер.
-			cfgWantNoErr(t, cfg.validateProducer())
+			cfgWantNoErr(t, cfg.validateProducer(behavior{}))
 		})
 	}
 }
@@ -1055,11 +1060,11 @@ func TestConfigValidateDurationLimitsMatchFranzGo(t *testing.T) {
 			tt.mutate(&cfg)
 
 			if tt.consumer {
-				cfgWantErr(t, cfg.validateConsumer(), tt.want)
-				cfgWantNoErr(t, cfg.validateProducer())
+				cfgWantErr(t, cfg.validateConsumer(behavior{}), tt.want)
+				cfgWantNoErr(t, cfg.validateProducer(behavior{}))
 			} else {
-				cfgWantErr(t, cfg.validateProducer(), tt.want)
-				cfgWantNoErr(t, cfg.validateConsumer())
+				cfgWantErr(t, cfg.validateProducer(behavior{}), tt.want)
+				cfgWantNoErr(t, cfg.validateConsumer(behavior{}))
 			}
 
 			cfgWantErr(t, cfgClientError(t, cfg, tt.consumer), tt.kgoWant)
@@ -1078,9 +1083,9 @@ func cfgClientError(t *testing.T, cfg Config, consumer bool) error {
 	)
 
 	if consumer {
-		opts, err = cfg.consumerOpts(testLogger(t), []string{testTopic}, rebalanceCallbacks{})
+		opts, err = cfg.consumerOpts(testBehavior(t), []string{testTopic}, rebalanceCallbacks{})
 	} else {
-		opts, err = cfg.producerOpts(testLogger(t))
+		opts, err = cfg.producerOpts(testBehavior(t))
 	}
 
 	if err != nil {
@@ -1103,7 +1108,7 @@ func TestConfigValidateReturnsJoinedErrors(t *testing.T) {
 	cfg.Consumer.Group = ""
 	cfg.Consumer.MaxPollRecords = 0
 
-	err := cfg.validateConsumer()
+	err := cfg.validateConsumer(behavior{})
 
 	// errors.Is по каждому элементу списка: клиентский код вправе искать в
 	// объединённой ошибке конкретную, а не разбирать текст.

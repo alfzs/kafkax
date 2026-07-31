@@ -24,15 +24,15 @@ import (
 // Опции собираются типизированными конструкторами, а не строковыми ключами:
 // опечатку в имени настройки или несовпадение типа значения ловит компилятор,
 // а не рантайм при создании клиента.
-func (c Config) commonOpts(logger *slog.Logger) ([]kgo.Opt, error) {
+func (c Config) commonOpts(b behavior) ([]kgo.Opt, error) {
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(c.Brokers...),
 		kgo.ClientID(c.ClientID),
 		kgo.DialTimeout(c.DialTimeout),
-		kgo.WithLogger(kslog.New(c.kafkaLogger(logger))),
+		kgo.WithLogger(kslog.New(c.kafkaLogger(b.logger))),
 	}
 
-	tlsCfg, err := c.tlsConfig(logger)
+	tlsCfg, err := c.tlsConfig(b)
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +51,7 @@ func (c Config) commonOpts(logger *slog.Logger) ([]kgo.Opt, error) {
 		// известно, поедет ли в клиента DialTLSConfig, и никакое расхождение с
 		// валидацией невозможно.
 		if tlsCfg == nil {
-			warnPlaintextSASL(logger, c.SASL.Mechanism)
+			warnPlaintextSASL(b.logger, c.SASL.Mechanism)
 		}
 
 		opts = append(opts, kgo.SASL(mech))
@@ -62,16 +62,16 @@ func (c Config) commonOpts(logger *slog.Logger) ([]kgo.Opt, error) {
 
 // tlsConfig строит *tls.Config или возвращает nil, если TLS не нужен.
 //
-// Порядок приоритета: явный Config.TLSConfig побеждает секцию TLS целиком.
+// Порядок приоритета: явный WithTLSConfig побеждает секцию TLS целиком.
 // Смешивать их нельзя — иначе непонятно, чей ServerName и чей RootCAs
 // оказываются в итоге.
-func (c Config) tlsConfig(logger *slog.Logger) (*tls.Config, error) {
-	if c.TLSConfig != nil {
-		if c.TLSConfig.InsecureSkipVerify {
-			warnInsecureTLS(logger)
+func (c Config) tlsConfig(b behavior) (*tls.Config, error) {
+	if b.tlsConfig != nil {
+		if b.tlsConfig.InsecureSkipVerify {
+			warnInsecureTLS(b.logger)
 		}
 
-		return c.TLSConfig, nil
+		return b.tlsConfig, nil
 	}
 
 	if !c.TLS.enabled() {
@@ -88,7 +88,7 @@ func (c Config) tlsConfig(logger *slog.Logger) (*tls.Config, error) {
 	}
 
 	if c.TLS.InsecureSkipVerify {
-		warnInsecureTLS(logger)
+		warnInsecureTLS(b.logger)
 	}
 
 	if c.TLS.CACertPath != "" {
@@ -183,8 +183,8 @@ func (c Config) saslMechanism() (sasl.Mechanism, error) {
 }
 
 // producerOpts собирает опции продюсера поверх общих.
-func (c Config) producerOpts(logger *slog.Logger) ([]kgo.Opt, error) {
-	opts, err := c.commonOpts(logger)
+func (c Config) producerOpts(b behavior) ([]kgo.Opt, error) {
+	opts, err := c.commonOpts(b)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +224,7 @@ func (c Config) producerOpts(logger *slog.Logger) ([]kgo.Opt, error) {
 		)
 	}
 
-	return append(opts, c.ExtraOpts...), nil
+	return append(opts, b.extraOpts...), nil
 }
 
 // consumerOpts собирает опции консьюмера поверх общих.
@@ -233,8 +233,8 @@ func (c Config) producerOpts(logger *slog.Logger) ([]kgo.Opt, error) {
 // явно отмечено через MarkCommitRecords после успешной обработки. Обычный
 // автокоммит двигал бы оффсет по факту чтения, а не обработки, и превращал бы
 // at-least-once в at-most-once при падении воркера.
-func (c Config) consumerOpts(logger *slog.Logger, topics []string, cb rebalanceCallbacks) ([]kgo.Opt, error) {
-	opts, err := c.commonOpts(logger)
+func (c Config) consumerOpts(b behavior, topics []string, cb rebalanceCallbacks) ([]kgo.Opt, error) {
+	opts, err := c.commonOpts(b)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +263,7 @@ func (c Config) consumerOpts(logger *slog.Logger, topics []string, cb rebalanceC
 		kgo.BlockRebalanceOnPoll(),
 	)
 
-	return append(opts, c.ExtraOpts...), nil
+	return append(opts, b.extraOpts...), nil
 }
 
 // rebalanceCallbacks — три колбэка ребаланса, которые консьюмер передаёт в

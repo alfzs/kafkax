@@ -52,7 +52,7 @@ func TestProducerOptsBuildValidClient(t *testing.T) {
 
 	cfg := testConfig(t)
 
-	opts, err := cfg.producerOpts(testLogger(t))
+	opts, err := cfg.producerOpts(testBehavior(t))
 	if err != nil {
 		t.Fatalf("producerOpts: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestConsumerOptsBuildValidClient(t *testing.T) {
 	cfg.Consumer.InitialOffset = OffsetLatest  // franz-go: с начала лога
 	cfg.Consumer.IsolationLevel = IsolationReadCommitted
 
-	opts, err := cfg.consumerOpts(testLogger(t), []string{testTopic}, optsNoopCallbacks())
+	opts, err := cfg.consumerOpts(testBehavior(t), []string{testTopic}, optsNoopCallbacks())
 	if err != nil {
 		t.Fatalf("consumerOpts: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestCompressionCodecRejectsUnknown(t *testing.T) {
 			cfg := testConfig(t)
 			cfg.Producer.CompressionType = in
 
-			if _, err := cfg.producerOpts(testLogger(t)); err == nil {
+			if _, err := cfg.producerOpts(testBehavior(t)); err == nil {
 				t.Fatal("producerOpts не отверг неизвестный compression_type")
 			}
 		})
@@ -263,7 +263,7 @@ func TestProducerOptsCompressionReachesClient(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Producer.CompressionType = CompressionZstd
 
-	opts, err := cfg.producerOpts(testLogger(t))
+	opts, err := cfg.producerOpts(testBehavior(t))
 	if err != nil {
 		t.Fatalf("producerOpts: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestProducerOptsIdempotenceInflight(t *testing.T) {
 			cfg.Producer.EnableIdempotence = tt.idempotence
 			cfg.Producer.MaxInflight = 5
 
-			opts, err := cfg.producerOpts(testLogger(t))
+			opts, err := cfg.producerOpts(testBehavior(t))
 			if err != nil {
 				t.Fatalf("producerOpts: %v", err)
 			}
@@ -344,7 +344,7 @@ func TestProducerOptsMaxBufferedBytes(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Producer.MaxBufferedBytes = 0
 
-	opts, err := cfg.producerOpts(testLogger(t))
+	opts, err := cfg.producerOpts(testBehavior(t))
 	if err != nil {
 		t.Fatalf("producerOpts: %v", err)
 	}
@@ -355,7 +355,7 @@ func TestProducerOptsMaxBufferedBytes(t *testing.T) {
 
 	cfg.Producer.MaxBufferedBytes = 1 << 20
 
-	opts, err = cfg.producerOpts(testLogger(t))
+	opts, err = cfg.producerOpts(testBehavior(t))
 	if err != nil {
 		t.Fatalf("producerOpts: %v", err)
 	}
@@ -377,9 +377,8 @@ func TestExtraOptsAppendedLast(t *testing.T) {
 		t.Parallel()
 
 		cfg := testConfig(t)
-		cfg.ExtraOpts = []kgo.Opt{kgo.ClientID(override)}
 
-		opts, err := cfg.producerOpts(testLogger(t))
+		opts, err := cfg.producerOpts(testBehavior(t, WithExtraOpts(kgo.ClientID(override))))
 		if err != nil {
 			t.Fatalf("producerOpts: %v", err)
 		}
@@ -393,9 +392,10 @@ func TestExtraOptsAppendedLast(t *testing.T) {
 		t.Parallel()
 
 		cfg := testConfig(t)
-		cfg.ExtraOpts = []kgo.Opt{kgo.ClientID(override)}
 
-		opts, err := cfg.consumerOpts(testLogger(t), []string{testTopic}, optsNoopCallbacks())
+		opts, err := cfg.consumerOpts(
+			testBehavior(t, WithExtraOpts(kgo.ClientID(override))),
+			[]string{testTopic}, optsNoopCallbacks())
 		if err != nil {
 			t.Fatalf("consumerOpts: %v", err)
 		}
@@ -412,10 +412,9 @@ func TestTLSConfigExplicitWinsOverSection(t *testing.T) {
 	explicit := &tls.Config{MinVersion: tls.VersionTLS13, ServerName: "explicit"}
 
 	cfg := testConfig(t)
-	cfg.TLSConfig = explicit
 	cfg.TLS = TLS{Enabled: true, ServerName: "from-section", CACertPath: "/nonexistent/ca.pem"}
 
-	got, err := cfg.tlsConfig(testLogger(t))
+	got, err := cfg.tlsConfig(testBehavior(t, WithTLSConfig(explicit)))
 	if err != nil {
 		t.Fatalf("tlsConfig: %v", err)
 	}
@@ -438,7 +437,7 @@ func TestTLSConfigFromSection(t *testing.T) {
 		cfg := testConfig(t)
 		cfg.TLS = TLS{ServerName: "ignored", CACertPath: "/nonexistent/ca.pem"}
 
-		got, err := cfg.tlsConfig(testLogger(t))
+		got, err := cfg.tlsConfig(testBehavior(t))
 		if err != nil {
 			t.Fatalf("tlsConfig: %v", err)
 		}
@@ -455,7 +454,7 @@ func TestTLSConfigFromSection(t *testing.T) {
 		cfg := testConfig(t)
 		cfg.TLS = TLS{Enabled: true, ServerName: "broker.example"}
 
-		got, err := cfg.tlsConfig(testLogger(t))
+		got, err := cfg.tlsConfig(testBehavior(t))
 		if err != nil {
 			t.Fatalf("tlsConfig: %v", err)
 		}
@@ -486,7 +485,7 @@ func TestTLSConfigFromSection(t *testing.T) {
 		cfg := testConfig(t)
 		cfg.TLS = TLS{Enabled: true, InsecureSkipVerify: true}
 
-		got, err := cfg.tlsConfig(testLogger(t))
+		got, err := cfg.tlsConfig(testBehavior(t))
 		if err != nil {
 			t.Fatalf("tlsConfig: %v", err)
 		}
@@ -526,7 +525,7 @@ func TestTLSConfigCACertErrors(t *testing.T) {
 			// Нечитаемый CA обязан валить сборку опций, а не тихо откатываться
 			// к системному trust store: иначе клиент пошёл бы проверять
 			// брокера не тем набором корней, чем указано в конфигурации.
-			_, err := cfg.producerOpts(testLogger(t))
+			_, err := cfg.producerOpts(testBehavior(t))
 			cfgWantErr(t, err, tt.want)
 		})
 	}
@@ -581,7 +580,7 @@ func TestCommonOptsAttachSASL(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.SASL = SASL{Mechanism: SASLMechanismScramSHA512, Username: "u", Password: "p"}
 
-	opts, err := cfg.producerOpts(testLogger(t))
+	opts, err := cfg.producerOpts(testBehavior(t))
 	if err != nil {
 		t.Fatalf("producerOpts: %v", err)
 	}
@@ -610,7 +609,7 @@ func TestCommonOptsAttachSASL(t *testing.T) {
 
 	cfg.SASL.Mechanism = "GSSAPI"
 
-	if _, err := cfg.producerOpts(testLogger(t)); err == nil {
+	if _, err := cfg.producerOpts(testBehavior(t)); err == nil {
 		t.Error("producerOpts принял неизвестный механизм SASL")
 	}
 }
@@ -636,6 +635,7 @@ func TestCommonOptsWarnsOnUnencryptedSASL(t *testing.T) {
 	tests := []struct {
 		name     string
 		mutate   func(*Config)
+		opts     []Option
 		wantWarn string
 	}{
 		{
@@ -659,14 +659,14 @@ func TestCommonOptsWarnsOnUnencryptedSASL(t *testing.T) {
 			},
 		},
 		{
-			// Готовый TLSConfig — тот же зашифрованный транспорт, просто собран
-			// не библиотекой. Предупреждение здесь означало бы, что проверка
-			// смотрит на поля, а не на соединение.
-			name: "SCRAM поверх готового TLSConfig",
+			// Готовый *tls.Config — тот же зашифрованный транспорт, просто
+			// собран не библиотекой. Предупреждение здесь означало бы, что
+			// проверка смотрит на поля, а не на соединение.
+			name: "SCRAM поверх готового WithTLSConfig",
 			mutate: func(c *Config) {
 				c.SASL.Mechanism = SASLMechanismScramSHA512
-				c.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13}
 			},
+			opts: []Option{WithTLSConfig(&tls.Config{MinVersion: tls.VersionTLS13})},
 		},
 		{
 			name:   "SASL выключен",
@@ -685,7 +685,9 @@ func TestCommonOptsWarnsOnUnencryptedSASL(t *testing.T) {
 			tt.mutate(&cfg)
 
 			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-			if _, err := cfg.producerOpts(logger); err != nil {
+
+			b := optsBehavior(t, append([]Option{WithLogger(logger)}, tt.opts...)...)
+			if _, err := cfg.producerOpts(b); err != nil {
 				t.Fatalf("producerOpts: %v", err)
 			}
 
@@ -733,6 +735,7 @@ func TestCommonOptsWarnsOnInsecureTLS(t *testing.T) {
 	tests := []struct {
 		name     string
 		mutate   func(*Config)
+		opts     []Option
 		wantWarn bool
 	}{
 		{
@@ -741,10 +744,10 @@ func TestCommonOptsWarnsOnInsecureTLS(t *testing.T) {
 			wantWarn: true,
 		},
 		{
-			name: "готовый TLSConfig с InsecureSkipVerify",
-			mutate: func(c *Config) {
-				c.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true} //nolint:gosec // ровно то, о чём тест
-			},
+			name:   "готовый WithTLSConfig с InsecureSkipVerify",
+			mutate: func(*Config) {},
+			//nolint:gosec // ровно то, о чём тест
+			opts:     []Option{WithTLSConfig(&tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true})},
 			wantWarn: true,
 		},
 		{
@@ -752,8 +755,9 @@ func TestCommonOptsWarnsOnInsecureTLS(t *testing.T) {
 			mutate: func(c *Config) { c.TLS = TLS{Enabled: true} },
 		},
 		{
-			name:   "готовый TLSConfig с проверкой",
-			mutate: func(c *Config) { c.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS13} },
+			name:   "готовый WithTLSConfig с проверкой",
+			mutate: func(*Config) {},
+			opts:   []Option{WithTLSConfig(&tls.Config{MinVersion: tls.VersionTLS13})},
 		},
 		{
 			name:   "TLS выключен",
@@ -771,7 +775,9 @@ func TestCommonOptsWarnsOnInsecureTLS(t *testing.T) {
 			tt.mutate(&cfg)
 
 			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-			if _, err := cfg.producerOpts(logger); err != nil {
+
+			b := optsBehavior(t, append([]Option{WithLogger(logger)}, tt.opts...)...)
+			if _, err := cfg.producerOpts(b); err != nil {
 				t.Fatalf("producerOpts: %v", err)
 			}
 
@@ -794,6 +800,20 @@ func TestCommonOptsWarnsOnInsecureTLS(t *testing.T) {
 			}
 		})
 	}
+}
+
+// optsBehavior разбирает опции для роли продюсера и валит тест на отказе:
+// таблицы ниже передают только законные опции, и ошибка здесь означала бы
+// опечатку в самом тесте.
+func optsBehavior(t *testing.T, opts ...Option) behavior {
+	t.Helper()
+
+	b, err := newBehavior(roleProducer, opts...)
+	if err != nil {
+		t.Fatalf("newBehavior: %v", err)
+	}
+
+	return b
 }
 
 func TestInitialOffsetMapping(t *testing.T) {
@@ -910,7 +930,7 @@ func TestUnlimitedRetriesReachClientAsCeiling(t *testing.T) {
 			cfg := testConfig(t, "127.0.0.1:9092")
 			cfg.Producer.MaxRetries = tc.maxRetries
 
-			opts, err := cfg.producerOpts(slog.New(slog.DiscardHandler))
+			opts, err := cfg.producerOpts(behavior{logger: slog.New(slog.DiscardHandler)})
 			if err != nil {
 				t.Fatalf("сборка опций продюсера: %v", err)
 			}

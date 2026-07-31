@@ -167,10 +167,10 @@ func consDrainFresh(t *testing.T, cfg Config, prod *consProducer, topic string, 
 	prod.send(t, topic, partition, consMarkerValue)
 
 	// Хуки исходного теста свежему консьюмеру не нужны: его задача — принять
-	// всё незакоммиченное и не застрять на нём самому.
+	// всё незакоммиченное и не застрять на нём самому. Обнулять их больше
+	// нечем и незачем: хуки уехали из Config в опции конструктора, и сюда
+	// приезжает только конфигурация.
 	fresh := cfg
-	fresh.OnMessageSkipped = nil
-	fresh.OnPanic = nil
 	fresh.Consumer.HandlerRetries = 0
 
 	h := &mockHandler{}

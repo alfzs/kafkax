@@ -134,6 +134,20 @@ var (
 	// errors.Unwrap() []error — сам сентинел в этот список не входит,
 	// см. Config.Validate.
 	ErrInvalidConfig = errors.New("kafkax: invalid configuration")
+
+	// ErrInapplicableOption — опция передана конструктору роли, к которой она
+	// не относится: WithPanicHook или WithSkipHook в NewProducer.
+	//
+	// Отказ, а не тихий пропуск: опция, которую никто не применит, выглядит
+	// настроенной. WithSkipHook у продюсера читается как «отравленные
+	// сообщения уходят в DLQ», а не делает ничего — и разница вскрылась бы
+	// ровно тогда, когда сообщение потребовалось бы спасать.
+	ErrInapplicableOption = errors.New("kafkax: option is not applicable to this role")
+
+	// ErrNilOption — в конструктор передан nil вместо опции. Обычно это
+	// результат вызова, вернувшего nil в срез опций; пропустить такой элемент
+	// молча значило бы потерять настройку без следа.
+	ErrNilOption = errors.New("kafkax: option must not be nil")
 )
 
 // DeliveryError — отказ доставки, описанный в терминах этого пакета, а не

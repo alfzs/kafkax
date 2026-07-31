@@ -163,13 +163,14 @@ func TestKafkaLoggerKeepsThresholdAcrossWithAttrsAndGroup(t *testing.T) {
 	}
 }
 
-// TestConfigLoggerFallsBackToSlogDefault — при Logger == nil библиотека берёт
+// TestConfigLoggerFallsBackToSlogDefault — без WithLogger библиотека берёт
 // slog.Default().
 //
 // Ветка по покрытию не исполнялась ни разу: все тесты пакета передают логгер
 // явно. Снятие fallback компилируется и роняет первую же запись паникой по
-// nil-логгеру — притом что godoc поля обещает ровно обратное, а Config без
-// Logger'а это самый обычный способ собрать конфигурацию из окружения.
+// nil-логгеру — притом что godoc WithLogger обещает ровно обратное, а
+// конструктор без опций это самый обычный способ поднять клиент из
+// конфигурации окружения.
 //
 //nolint:paralleltest // подменяет глобальный slog.Default(): параллельный сосед писал бы в тот же буфер
 func TestConfigLoggerFallsBackToSlogDefault(t *testing.T) {
@@ -180,10 +181,13 @@ func TestConfigLoggerFallsBackToSlogDefault(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 	slog.SetDefault(bufferLogger(&buf))
 
-	cfg := testConfig(t)
-	cfg.Logger = nil
+	// Пустой набор опций — то же, что конструктор без WithLogger.
+	b, err := newBehavior(roleProducer)
+	if err != nil {
+		t.Fatalf("newBehavior: %v", err)
+	}
 
-	cfg.logger("producer").Info(logCanary)
+	componentLogger(b.logger, "producer").Info(logCanary)
 
 	got := buf.String()
 	if !strings.Contains(got, logCanary) {

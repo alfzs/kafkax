@@ -275,10 +275,10 @@ func TestStopReportsStuckPollLoopAndLeavesClientOpen(t *testing.T) {
 	// Логи уходят в никуда намеренно: клиент этого консьюмера останется открытым
 	// по условию сценария, его горутины переживут тест, а запись в t.Output()
 	// после завершения теста роняет прогон.
-	cfg.Logger = slog.New(consBlockingLogHandler{
+	logger := WithLogger(slog.New(consBlockingLogHandler{
 		inner: slog.DiscardHandler,
 		gate:  gate,
-	})
+	}))
 	// Мягкий и жёсткий бюджеты ожидания цикла опроса: Stop обязан вернуться
 	// примерно за их сумму, а не висеть вместе с циклом.
 	cfg.GracefulTimeout = 200 * time.Millisecond
@@ -298,7 +298,7 @@ func TestStopReportsStuckPollLoopAndLeavesClientOpen(t *testing.T) {
 		return resp, nil, true
 	})
 
-	c := mustConsumer(t, cfg)
+	c := mustConsumer(t, cfg, logger)
 	mustAddHandler(t, c, topic, &mockHandler{})
 	consStart(t, c)
 

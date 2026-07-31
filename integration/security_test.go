@@ -213,12 +213,7 @@ func TestSASLOverTLSRequiredByBroker(t *testing.T) {
 func requireRoundTrip(t *testing.T, cfg kafkax.Config, topic, value string) {
 	t.Helper()
 
-	producer, err := kafkax.NewProducer(cfg)
-	if err != nil {
-		t.Fatalf("NewProducer: %v", err)
-	}
-
-	closeProducer(t, producer)
+	producer := openProducer(t, cfg)
 
 	if err := producer.SendMessage(t.Context(), kafkax.PublishRequest{
 		Topic: topic,
@@ -264,7 +259,7 @@ func requireNeverDelivered(t *testing.T, cfg kafkax.Config, topic, wantReason st
 
 	cfg.Producer.MessageTimeout = rejectBudget
 
-	producer, err := kafkax.NewProducer(cfg)
+	producer, err := kafkax.NewProducer(cfg, testOptions(t)...)
 	if err != nil {
 		t.Fatalf("NewProducer: %v", err)
 	}

@@ -15,22 +15,6 @@ import (
 // кто её ищет, а пропавшее поле не ломает ни сборку, ни чтение записи — она
 // остаётся валидной, просто беднее на одну настройку.
 
-// configOpaqueLogFields — поля Config, значение которых в лог не помещается, и
-// ключ, которым LogValue заменяет каждое из них; пустой ключ означает «в
-// записи отсутствует полностью».
-//
-// Список ручной намеренно: он и есть решение «это поле в лог не идёт». Новое
-// поле с yaml:"-" в нём не окажется, и TestConfigLogValueCoversEveryField
-// потребует принять решение явно, вместо того чтобы унаследовать умолчание
-// «пропустить».
-var configOpaqueLogFields = map[string]string{
-	"Logger":           "",
-	"TLSConfig":        "tls_config_set",
-	"ExtraOpts":        "extra_opts",
-	"OnPanic":          "on_panic_set",
-	"OnMessageSkipped": "on_message_skipped_set",
-}
-
 // TestConfigLogValueCoversEveryField — в записи Config.LogValue есть каждое
 // поле структуры.
 //
@@ -42,9 +26,14 @@ var configOpaqueLogFields = map[string]string{
 // обещает конфигурацию целиком. Проверки состава не существовало вовсе, так
 // что удаление ещё и graceful_timeout набор тоже не заметил.
 //
-// Ключ выводится из тега yaml, а не берётся из третьего списка: yaml-ключ —
+// Ключ выводится из тега yaml, а не берётся из второго списка: yaml-ключ —
 // то же имя настройки, что в конфигурационном файле, и запись в логе,
 // названная иначе, заставляла бы читателя переводить одно в другое.
+//
+// Списка исключений больше нет, и это часть проверки: после разделения данных
+// и поведения в Config не осталось ни одного поля с yaml:"-", а godoc
+// структуры обещает, что и не появится. Поле, добавленное с таким тегом,
+// провалит тест здесь же — вместе с требованием унести его в Option.
 func TestConfigLogValueCoversEveryField(t *testing.T) {
 	t.Parallel()
 
@@ -56,28 +45,15 @@ func TestConfigLogValueCoversEveryField(t *testing.T) {
 	for field := range reflect.TypeFor[Config]().Fields() {
 		yamlKey, _, _ := strings.Cut(field.Tag.Get("yaml"), ",")
 
-		if yamlKey != "" && yamlKey != "-" {
-			if _, ok := attrs[yamlKey]; !ok {
-				t.Errorf("поле %s не попало в Config.LogValue: ожидался ключ %q", field.Name, yamlKey)
-			}
+		if yamlKey == "" || yamlKey == "-" {
+			t.Errorf("у поля %s нет yaml-ключа (тег %q): Config — только сериализуемые данные, "+
+				"а поведение задаётся опциями конструктора", field.Name, field.Tag.Get("yaml"))
 
 			continue
 		}
 
-		key, decided := configOpaqueLogFields[field.Name]
-		if !decided {
-			t.Errorf("поле %s не размечено: решите, идёт ли оно в LogValue, "+
-				"и внесите его в configOpaqueLogFields", field.Name)
-
-			continue
-		}
-
-		if key == "" {
-			continue
-		}
-
-		if _, ok := attrs[key]; !ok {
-			t.Errorf("признак наличия %q для поля %s пропал из Config.LogValue", key, field.Name)
+		if _, ok := attrs[yamlKey]; !ok {
+			t.Errorf("поле %s не попало в Config.LogValue: ожидался ключ %q", field.Name, yamlKey)
 		}
 	}
 

@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -41,8 +42,8 @@ func TestRetiredEnvKeyFailsEveryValidationEntry(t *testing.T) {
 
 			entries := map[string]error{
 				"Validate":         cfg.Validate(),
-				"validateProducer": cfg.validateProducer(),
-				"validateConsumer": cfg.validateConsumer(),
+				"validateProducer": cfg.validateProducer(behavior{}),
+				"validateConsumer": cfg.validateConsumer(behavior{}),
 			}
 
 			for name, err := range entries {
@@ -253,9 +254,13 @@ func TestYAMLDecodeAppliesLiveKeys(t *testing.T) {
 		"  message_queue_batches: 7\n" +
 		"  handler_retries: 5\n"
 
-	// Логгер выставлен до разбора: файл его задать не может (yaml:"-"), и
-	// метод обязан достраивать переданное значение, а не подменять нулевым.
-	cfg := Config{Logger: testLogger(t)}
+	// Значение выставлено до разбора, и в файле его нет: метод обязан
+	// достраивать переданный Config, а не подменять его нулевым. Раньше
+	// свидетелем был Logger, но он уехал из Config в опции (WithLogger), и
+	// свидетеля пришлось сменить на поле, которого нет в этом файле.
+	const presetTimeout = 42 * time.Second
+
+	cfg := Config{GracefulTimeout: presetTimeout}
 	if err := yaml.Unmarshal([]byte(src), &cfg); err != nil {
 		t.Fatalf("разбор валидного файла провалился: %v", err)
 	}
@@ -276,8 +281,9 @@ func TestYAMLDecodeAppliesLiveKeys(t *testing.T) {
 		t.Errorf("Brokers = %v, в файле [kafka:9092]", cfg.Brokers)
 	}
 
-	if cfg.Logger == nil {
-		t.Error("Logger, выставленный до разбора, потерян")
+	if cfg.GracefulTimeout != presetTimeout {
+		t.Errorf("GracefulTimeout = %v, выставленное до разбора значение %v потеряно",
+			cfg.GracefulTimeout, presetTimeout)
 	}
 }
 

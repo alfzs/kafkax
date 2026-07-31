@@ -172,14 +172,14 @@ func TestSkipHookAdvancesOffset(t *testing.T) {
 		skips  []string
 	)
 
-	cfg.OnMessageSkipped = func(_ context.Context, msg kafkax.IncomingMessage, _ error) error {
+	skipHook := kafkax.WithSkipHook(func(_ context.Context, msg kafkax.IncomingMessage, _ error) error {
 		skipMu.Lock()
 		defer skipMu.Unlock()
 
 		skips = append(skips, string(msg.Value))
 
 		return nil
-	}
+	})
 
 	producer := openProducer(t, cfg)
 	publishValues(t, producer, topic, "before", poison, "after")
@@ -191,7 +191,7 @@ func TestSkipHookAdvancesOffset(t *testing.T) {
 
 		return nil
 	}}
-	consumer := startConsumer(t, cfg, topic, first)
+	consumer := startConsumer(t, cfg, topic, first, skipHook)
 
 	// Запись ЗА отравленной — единственное прямое свидетельство, что партиция
 	// не встала: в теме одна партиция, и обработать «after» можно только
